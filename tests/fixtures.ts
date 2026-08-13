@@ -1,0 +1,31 @@
+import type { Config } from '../src/config.js'
+
+/** Complete deterministic plugin config for unit tests. */
+export function testConfig(overrides: Partial<Config> = {}): Config {
+  return {
+    botId: 'test-bot',
+    secretRef: 'WECOM_BOT_SECRET',
+    accountId: 'default',
+    cwd: '/tmp/wecom-test',
+    websocketUrl: 'wss://openws.work.weixin.qq.com',
+    scene: 1,
+    singlePolicy: 'open',
+    singleAllowFrom: [],
+    groupPolicy: 'open',
+    groupAllowFrom: [],
+    imageInputMode: 'auto',
+    welcomeText: '',
+    startupTimeoutMs: 1_000,
+    responseTimeoutMs: 1_000,
+    mediaDownloadTimeoutMs: 1_000,
+    sendTimeoutMs: 1_000,
+    reconnectIntervalMs: 100,
+    maxReconnectAttempts: 1,
+    maxAuthFailureAttempts: 1,
+    sendRetries: 0,
+    maxReplyBytes: 20_000,
+    maxSeenMessageIds: 100,
+    systemPrompt: 'WeCom test instructions',
+    ...overrides,
+  }
+}

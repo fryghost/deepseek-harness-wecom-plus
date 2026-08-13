@@ -1,0 +1,7 @@
+- insert:
+    - id: wecom-channel
+      name: deepseek-harness-wecom
+      config:
+        botId: !!js process.env.WECOM_BOT_ID
+        secretRef: WECOM_BOT_SECRET
+        cwd: !!js process.env.DSH_WECOM_CWD ?? process.cwd()

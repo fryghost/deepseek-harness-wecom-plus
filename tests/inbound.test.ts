@@ -1,8 +1,22 @@
-import { describe, expect, it, vi } from 'vitest'
+import { mkdtemp, readFile, rm } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
+import { afterEach, describe, expect, it, vi } from 'vitest'
 import { detectImageMediaType, inboundContent } from '../src/inbound.js'
 import { testConfig } from './fixtures.js'
 
 const PNG = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 1, 2, 3])
+const cleanup: string[] = []
+
+async function inboundDirectory(): Promise<string> {
+  const path = await mkdtemp(join(tmpdir(), 'dsh-wecom-inbound-content-'))
+  cleanup.push(path)
+  return path
+}
+
+afterEach(async () => {
+  await Promise.all(cleanup.splice(0).map(path => rm(path, { recursive: true, force: true })))
+})
 
 describe('detectImageMediaType', () => {
   it('recognizes Harness-supported image formats by magic bytes', () => {
@@ -73,5 +87,57 @@ describe('inboundContent', () => {
       msgid: 'm3', aibotid: 'bot', chattype: 'single', from: { userid: 'u1' }, msgtype: 'image',
       image: { url: 'https://wecom.test/encrypted' },
     } as never)).rejects.toThrow('attachment limit')
+  })
+
+  it('downloads and decrypts an inbound file to a model-readable local path', async () => {
+    const root = await inboundDirectory()
+    const data = Buffer.from('notes from WeCom\n')
+    const downloadFile = vi.fn(async () => ({ buffer: data, filename: '../notes.txt' }))
+    const ctx = {
+      attachments: {
+        imageLimits: { maxImagesPerMessage: 4, maxMessageImageBytes: 10_000, maxImageBytes: 10_000 },
+      },
+    } as never
+
+    const blocks = await inboundContent(ctx, testConfig({ inboundFileDirectory: root }), { downloadFile }, {
+      msgid: 'm-file', aibotid: 'bot', chattype: 'single', from: { userid: 'u-file' }, msgtype: 'file',
+      file: { url: 'https://wecom.test/encrypted-file', aeskey: 'file-key' },
+    } as never)
+
+    expect(downloadFile).toHaveBeenCalledWith('https://wecom.test/encrypted-file', 'file-key')
+    const text = (blocks[0] as { text: string }).text
+    expect(text).toContain('WeCom file received: "notes.txt"')
+    expect(text).not.toContain('handles text and images only')
+    const encodedPath = text.match(/local path ("(?:[^"\\]|\\.)*")/u)?.[1]
+    expect(encodedPath).toBeDefined()
+    const path = JSON.parse(encodedPath as string) as string
+    expect(path.startsWith(root)).toBe(true)
+    expect(await readFile(path)).toEqual(data)
+  })
+
+  it('downloads a quoted file and enforces the configured inbound limit', async () => {
+    const root = await inboundDirectory()
+    const ctx = {
+      attachments: {
+        imageLimits: { maxImagesPerMessage: 4, maxMessageImageBytes: 10_000, maxImageBytes: 10_000 },
+      },
+    } as never
+    const message = {
+      msgid: 'm-quote-file', aibotid: 'bot', chattype: 'single', from: { userid: 'u-file' },
+      msgtype: 'text', text: { content: '分析引用文件' },
+      quote: { msgtype: 'file', file: { url: 'https://wecom.test/quoted-file', aeskey: 'quote-key' } },
+    } as never
+
+    await expect(inboundContent(ctx, testConfig({
+      inboundFileDirectory: root,
+      maxInboundFileBytes: 4,
+    }), {
+      downloadFile: vi.fn(async () => ({ buffer: Buffer.from('12345'), filename: 'quoted.txt' })),
+    }, message)).rejects.toThrow('configured inbound limit is 4 bytes')
+
+    const blocks = await inboundContent(ctx, testConfig({ inboundFileDirectory: root }), {
+      downloadFile: vi.fn(async () => ({ buffer: Buffer.from('ok'), filename: 'quoted.txt' })),
+    }, message)
+    expect((blocks[0] as { text: string }).text).toContain('Quoted WeCom file received')
   })
 })

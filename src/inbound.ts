@@ -1,13 +1,20 @@
 import type { Context } from '@deepseek-ai/cordis'
 import type { ImageMediaType } from '@deepseek-ai/dsh-attachment'
 import type { ContentBlock } from '@deepseek-ai/dsh-llm'
-import type { BaseMessage, ImageContent, MixedMsgItem } from '@wecom/aibot-node-sdk'
+import type { BaseMessage, FileContent, ImageContent, MixedMsgItem, VideoContent } from '@wecom/aibot-node-sdk'
 import type { Config } from './config.js'
-import { withTimeout } from './util.js'
+import { saveInboundFile } from './inbound-file.js'
+import { sessionIdFor, withTimeout } from './util.js'
 
 /** Minimal official-SDK media download surface used by inbound conversion. */
 export interface WeComDownloadPort {
   downloadFile(url: string, aesKey?: string): Promise<{ buffer: Buffer; filename?: string }>
+}
+
+interface PendingInboundFile {
+  content: FileContent | VideoContent
+  kind: 'file' | 'video'
+  quoted: boolean
 }
 
 /** Build durable DSH content blocks from one WeCom message. */
@@ -21,8 +28,9 @@ export async function inboundContent(
   const scope = message.chattype === 'group' ? 'WeCom group' : 'WeCom private chat'
   const textParts = [`[${scope} message from WeCom user ${shortId(message.from.userid)}]`]
   const images: ImageContent[] = []
-  collectMessageContent(message, textParts, images)
-  collectQuotedContent(message, textParts, images)
+  const files: PendingInboundFile[] = []
+  collectMessageContent(message, textParts, images, files)
+  collectQuotedContent(message, textParts, images, files)
 
   const selectedImages = images.slice(0, ctx.attachments.imageLimits.maxImagesPerMessage)
   const imageBlocks: ContentBlock[] = []
@@ -58,13 +66,39 @@ export async function inboundContent(
     }
   }
 
+  for (const pending of files) {
+    const downloaded = await withTimeout(
+      client.downloadFile(pending.content.url, pending.content.aeskey),
+      config.mediaDownloadTimeoutMs,
+      `WeCom encrypted ${pending.kind} download`,
+    )
+    const stored = await saveInboundFile(
+      config.inboundFileDirectory,
+      sessionIdFor(config.accountId, message),
+      downloaded.buffer,
+      downloaded.filename,
+      config.maxInboundFileBytes,
+    )
+    const label = pending.quoted ? `Quoted WeCom ${pending.kind}` : `WeCom ${pending.kind}`
+    textParts.push([
+      `[${label} received: ${JSON.stringify(stored.name)}; ${stored.bytes} bytes.`,
+      `Downloaded and decrypted to local path ${JSON.stringify(stored.path)}.`,
+      'Use the available file or shell tools to inspect this attachment when needed.]',
+    ].join(' '))
+  }
+
   if (textParts.length === 1 && imageBlocks.length === 0) {
     textParts.push(`[Unsupported WeCom message type: ${message.msgtype}]`)
   }
   return [{ type: 'text', text: textParts.join('\n') }, ...imageBlocks]
 }
 
-function collectMessageContent(message: BaseMessage, text: string[], images: ImageContent[]): void {
+function collectMessageContent(
+  message: BaseMessage,
+  text: string[],
+  images: ImageContent[],
+  files: PendingInboundFile[],
+): void {
   switch (message.msgtype) {
     case 'text':
       pushText(text, message.text?.content)
@@ -79,23 +113,31 @@ function collectMessageContent(message: BaseMessage, text: string[], images: Ima
       if (message.voice?.content?.trim()) text.push(`[Voice transcription]\n${message.voice.content.trim()}`)
       break
     case 'file':
-      text.push('[WeCom file received; this plugin version handles text and images only.]')
+      if (message.file?.url) files.push({ content: message.file, kind: 'file', quoted: false })
       break
     case 'video':
-      text.push('[WeCom video received; this plugin version handles text and images only.]')
+      if (message.video?.url) files.push({ content: message.video, kind: 'video', quoted: false })
       break
     default:
       break
   }
 }
 
-function collectQuotedContent(message: BaseMessage, text: string[], images: ImageContent[]): void {
+function collectQuotedContent(
+  message: BaseMessage,
+  text: string[],
+  images: ImageContent[],
+  files: PendingInboundFile[],
+): void {
   const quote = message.quote
   if (quote === undefined) return
   if (quote.msgtype === 'text') pushText(text, quote.text?.content, '[Quoted text]\n')
   if (quote.msgtype === 'image' && quote.image !== undefined) images.push(quote.image)
   if (quote.msgtype === 'mixed') collectMixed(quote.mixed?.msg_item ?? [], text, images, '[Quoted text]\n')
   if (quote.msgtype === 'voice') pushText(text, quote.voice?.content, '[Quoted voice transcription]\n')
+  if (quote.msgtype === 'file' && quote.file?.url) {
+    files.push({ content: quote.file, kind: 'file', quoted: true })
+  }
 }
 
 function collectMixed(

@@ -1,4 +1,5 @@
 import { describe, expect, it, vi } from 'vitest'
+import type { ToolDefinition } from '@deepseek-ai/dsh-tools'
 import { ConversationManager } from '../src/conversations.js'
 import { sessionIdFor } from '../src/util.js'
 import { testConfig } from './fixtures.js'
@@ -42,8 +43,9 @@ describe('ConversationManager', () => {
     }
     const dispose = vi.fn(async () => undefined)
     const mount = vi.fn(async () => ({ id: 'standard' }))
+    const register = vi.fn(() => vi.fn())
     const create = vi.fn(async (options: { setup?: (ctx: never) => Promise<void> }) => {
-      await options.setup?.({ systemPrompt: { section } } as never)
+      await options.setup?.({ systemPrompt: { section }, tools: { register } } as never)
       return { agent, dispose }
     })
     const ctx = {
@@ -56,7 +58,7 @@ describe('ConversationManager', () => {
         imageLimits: { maxImagesPerMessage: 4, maxMessageImageBytes: 10_000, maxImageBytes: 10_000 },
       },
     } as never
-    const manager = new ConversationManager(ctx, config)
+    const manager = new ConversationManager(ctx, config, vi.fn(async () => undefined))
     await manager.initialize()
 
     const reply = await manager.process(textMessage('u1', 'm1'), downloadPort)
@@ -67,6 +69,7 @@ describe('ConversationManager', () => {
     }))
     expect(mount).toHaveBeenCalledWith(expect.anything(), 'standard')
     expect(section).toHaveBeenCalledWith(expect.objectContaining({ name: 'channel:wecom', order: 190 }))
+    expect(register).toHaveBeenCalledWith(expect.objectContaining({ name: 'wecom_send_file' }))
     expect(promptDuringTurn).toBe(config.systemPrompt)
     expect(promptText?.()).toBe('')
     expect(agent.followup).toHaveBeenCalledOnce()
@@ -96,8 +99,9 @@ describe('ConversationManager', () => {
     const dispose = vi.fn(async () => undefined)
     const mount = vi.fn(async () => ({ id: 'minimal' }))
     const section = vi.fn(() => vi.fn())
+    const register = vi.fn(() => vi.fn())
     const resume = vi.fn(async (options: { setup?: (ctx: never) => Promise<void> }) => {
-      await options.setup?.({ systemPrompt: { section } } as never)
+      await options.setup?.({ systemPrompt: { section }, tools: { register } } as never)
       return { agent, dispose }
     })
     const inspect = vi.fn(async () => ({
@@ -114,7 +118,7 @@ describe('ConversationManager', () => {
         imageLimits: { maxImagesPerMessage: 4, maxMessageImageBytes: 10_000, maxImageBytes: 10_000 },
       },
     } as never
-    const manager = new ConversationManager(ctx, config)
+    const manager = new ConversationManager(ctx, config, vi.fn(async () => undefined))
     await manager.initialize()
 
     await expect(manager.process(message, downloadPort)).resolves.toEqual({ text: 'Resumed reply', images: [] })
@@ -133,14 +137,16 @@ describe('ConversationManager', () => {
     const id = sessionIdFor(config.accountId, message)
     const events: unknown[] = []
     const disposeInstructions = vi.fn()
+    const disposeTool = vi.fn()
     const section = vi.fn(() => disposeInstructions)
+    const register = vi.fn(() => disposeTool)
     let idleCalls = 0
     const agent = {
       id,
       status: 'idle',
       options: { provider: 'deepseek', model: 'deepseek-chat' },
       session: { events },
-      ctx: { systemPrompt: { section } },
+      ctx: { systemPrompt: { section }, tools: { register } },
       followup: vi.fn(() => {
         events.push({
           type: 'assistant/message',
@@ -172,7 +178,7 @@ describe('ConversationManager', () => {
         imageLimits: { maxImagesPerMessage: 4, maxMessageImageBytes: 10_000, maxImageBytes: 10_000 },
       },
     } as never
-    const manager = new ConversationManager(ctx, config)
+    const manager = new ConversationManager(ctx, config, vi.fn(async () => undefined))
     await manager.initialize()
 
     await expect(manager.process(message, downloadPort)).resolves.toEqual({ text: 'WeCom reply', images: [] })
@@ -183,6 +189,73 @@ describe('ConversationManager', () => {
     expect(create).not.toHaveBeenCalled()
     expect(agent.whenIdle).toHaveBeenCalledTimes(2)
     await manager.dispose()
+    expect(disposeTool).toHaveBeenCalledOnce()
     expect(disposeInstructions).toHaveBeenCalledOnce()
+  })
+
+  it('registers wecom_send_file and uploads only during the active WeCom turn', async () => {
+    const config = testConfig({ cwd: process.cwd() })
+    let fileTool: ToolDefinition | undefined
+    let runningUpload: Promise<unknown> | undefined
+    const events: unknown[] = []
+    const sendFile = vi.fn(async () => undefined)
+    const agent = {
+      status: 'idle',
+      options: { provider: 'deepseek', model: 'deepseek-chat' },
+      session: { events },
+      followup: vi.fn(() => {
+        if (fileTool === undefined) throw new Error('wecom_send_file was not registered')
+        runningUpload = fileTool.execute(
+          { path: 'README.md' },
+          { signal: new AbortController().signal } as never,
+        )
+        events.push({
+          type: 'assistant/message',
+          data: { message: { content: [{ type: 'text', text: '文件已发送。' }] } },
+        })
+        events.push({ type: 'turn/end', data: { reason: { kind: 'stop' } } })
+      }),
+      whenIdle: vi.fn(async () => runningUpload),
+    }
+    const register = vi.fn((definition: ToolDefinition) => {
+      fileTool = definition
+      return vi.fn()
+    })
+    const ctx = {
+      sessionPersistence: { list: vi.fn(async () => []) },
+      agentDefaultModel: { currentSelection: vi.fn(() => ({ provider: 'deepseek', model: 'deepseek-chat' })) },
+      agentPresets: { defaultId: 'standard', mount: vi.fn(async () => ({ id: 'standard' })) },
+      llm: { resolveModelInfo: vi.fn(async () => ({ inputModalities: ['text'] })) },
+      agents: {
+        create: vi.fn(async (options: { setup?: (ctx: never) => Promise<void> }) => {
+          await options.setup?.({
+            systemPrompt: { section: vi.fn(() => vi.fn()) },
+            tools: { register },
+          } as never)
+          return { agent, dispose: vi.fn(async () => undefined) }
+        }),
+        get: vi.fn(),
+      },
+      attachments: {
+        imageLimits: { maxImagesPerMessage: 4, maxMessageImageBytes: 10_000, maxImageBytes: 10_000 },
+      },
+    } as never
+    const manager = new ConversationManager(ctx, config, sendFile)
+    await manager.initialize()
+
+    await expect(manager.process(textMessage('u3', 'm3', '把 README.md 发给我'), downloadPort))
+      .resolves.toEqual({ text: '文件已发送。', images: [] })
+
+    expect(register).toHaveBeenCalledWith(expect.objectContaining({ name: 'wecom_send_file' }))
+    expect(sendFile).toHaveBeenCalledWith('u3', expect.objectContaining({
+      name: 'README.md',
+      bytes: expect.any(Number),
+    }))
+    if (fileTool === undefined) throw new Error('wecom_send_file was not registered')
+    await expect(fileTool.execute(
+      { path: 'README.md' },
+      { signal: new AbortController().signal } as never,
+    )).rejects.toThrow('no active WeCom turn')
+    await manager.dispose()
   })
 })

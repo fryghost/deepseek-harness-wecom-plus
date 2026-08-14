@@ -1,4 +1,5 @@
 import { createHash } from 'node:crypto'
+import { readFile } from 'node:fs/promises'
 import { isAbsolute } from 'node:path'
 import type { Context } from '@deepseek-ai/cordis'
 import { credentialRef } from '@deepseek-ai/dsh-credentials'
@@ -12,19 +13,24 @@ import {
   type EventMessageWith,
   type Logger,
   type ReplyMsgItem,
+  type UploadMediaOptions,
   type WSClientOptions,
+  type WeComMediaType,
   type WsFrame,
   type WsFrameHeaders,
 } from '@wecom/aibot-node-sdk'
 import type { Config } from './config.js'
 import { ConversationManager, type ConversationReply } from './conversations.js'
 import type { WeComDownloadPort } from './inbound.js'
+import type { OutboundFile } from './outbound-file.js'
 import { chatTarget, SeenMessageIds, truncateUtf8, withTimeout } from './util.js'
 
 const OUTBOUND_TEST_PNG = Buffer.from(
   'iVBORw0KGgoAAAANSUhEUgAAAMgAAABkCAYAAADDhn8LAAAACXBIWXMAAAPoAAAD6AG1e1JrAAACn0lEQVR4nO3XsZFCQRDEUDIhxA28g1gS4JwrCmQ8QwmoR/vh8Ty74MAN7K2DBzHicAP704FABCKQIxBH4CG4/3HgC+JwPB5HII7AQ3B9QRyBh+B81oGfWKIS1RGII/AQXF8QR+AhOH5iOQIPwf2WA/9BHJsH5wjEEXgIri+II/AQHD+xHIGH4PoP4gg8BOf3DvxJD4yAZR0IJDAClnUgkMAIWNaBQAIjYFkHAgmMgGUdCCQwApZ1IJDACFjWgUACI2BZBwIJjIBlHQgkMAKWdSCQwAhY1oFAAiNgWQcCCYyAZR0IJDAClnUgkMAIWNaBQAIjYFkHAgmMgGUdCCQwApZ1IJDACFjWgUACI2BZBwIJjIBlHQgkMAKWdSCQwAhY1oFAAiNgWQcCCYyAZR0IJDAClnUgkMAIWNaBQAIjYFkHAgmMgGUdCCQwApZ1IJDACFjWgUACI2BZBwIJjIBlHQgkMAKWdSCQwAhY1oFAAiNgWQcCCYyAZR0IJDAClnUgkMAIWNaBQAIjYFkHAgmMgGUdCCQwApZ1IJDACFjWgUACI2BZBwIJjIBlHQgkMAKWdSCQwAhY1oFAAiNgWQcCCYyAZR0IJDAClnUgkMAIWNaBQAIjYFkHAgmMgGUdCCQwAroOBBIYAcs6EEhgBCzrQCCBEbCsA4EERsCyDgQSGAHLOhBIYAQs60AggRGwrAOBBEbAsg4EEhgByzoQSGAELOtAIIERsKwDgQRGwLIOBBIYAcs6EEhgBCzrQCCBEbCsA4EERsCyDgQSGAHLOhBIYAQs6+AFcF3qQZOWm4IAAAAASUVORK5CYII=',
   'base64',
 )
+
+const OUTBOUND_TEST_FILE = Buffer.from('DeepSeek Harness WeCom file upload test\n', 'utf8')
 
 interface WeComClientPort extends WeComDownloadPort {
   readonly isConnected: boolean
@@ -53,9 +59,9 @@ interface WeComClientPort extends WeComDownloadPort {
   ): Promise<unknown>
   uploadMedia(
     fileBuffer: Buffer,
-    options: { type: 'image'; filename: string },
+    options: UploadMediaOptions,
   ): Promise<{ media_id: string }>
-  sendMediaMessage(chatid: string, mediaType: 'image', mediaId: string): Promise<unknown>
+  sendMediaMessage(chatid: string, mediaType: WeComMediaType, mediaId: string): Promise<unknown>
 }
 
 export type WeComClientFactory = (options: WSClientOptions) => WeComClientPort
@@ -74,8 +80,13 @@ export class WeComHarnessBridge {
     private readonly clientFactory: WeComClientFactory = options => new WSClient(options),
   ) {
     if (!isAbsolute(config.cwd)) throw new Error(`wecom-channel: cwd must be absolute, got ${JSON.stringify(config.cwd)}`)
+    if (!isAbsolute(config.inboundFileDirectory)) {
+      throw new Error(
+        `wecom-channel: inboundFileDirectory must be absolute, got ${JSON.stringify(config.inboundFileDirectory)}`,
+      )
+    }
     this.log = ctx.logger('deepseek-harness-wecom')
-    this.conversations = new ConversationManager(ctx, config)
+    this.conversations = new ConversationManager(ctx, config, (target, file) => this.sendLocalFile(target, file))
     this.seen = new SeenMessageIds(config.maxSeenMessageIds)
   }
 
@@ -188,6 +199,7 @@ export class WeComHarnessBridge {
           'DeepSeek Harness 企微机器人',
           '/bot-ping — 检查连通性',
           '/bot-image-test — 发送一张蓝色图片，检查图片出站链路',
+          '/bot-file-test — 发送一个文本附件，检查文件出站链路',
           '/bot-status — 查看当前会话状态',
           '/bot-cancel — 取消当前生成',
           '其他消息会交给当前 Harness 默认模型处理。',
@@ -201,6 +213,17 @@ export class WeComHarnessBridge {
         text: '蓝色测试图片发送成功。',
         images: [{ data: OUTBOUND_TEST_PNG, mediaType: 'image/png', name: 'wecom-image-test.png' }],
       })
+      return
+    }
+    if (command === '/bot-file-test') {
+      await this.sendMedia(
+        chatTarget(message),
+        OUTBOUND_TEST_FILE,
+        'file',
+        'wecom-file-test.txt',
+        'WeCom file',
+      )
+      await this.sendReply(frame, { text: '文本附件发送成功。', images: [] })
       return
     }
     if (command === '/bot-cancel') {
@@ -266,17 +289,37 @@ export class WeComHarnessBridge {
 
     for (const image of active) {
       const filename = image.name?.trim() || imageFilename(image.mediaType)
-      const uploaded = await this.retry(async () => withTimeout(
-        this.requireClient().uploadMedia(Buffer.from(image.data), { type: 'image', filename }),
-        this.config.sendTimeoutMs,
-        'WeCom image upload',
-      ))
-      await this.retry(async () => withTimeout(
-        this.requireClient().sendMediaMessage(chatTarget(message), 'image', uploaded.media_id),
-        this.config.sendTimeoutMs,
-        'WeCom image send',
-      ))
+      await this.sendMedia(chatTarget(message), Buffer.from(image.data), 'image', filename, 'WeCom image')
     }
+  }
+
+  private async sendLocalFile(target: string, file: OutboundFile): Promise<void> {
+    const data = await readFile(file.path)
+    if (data.byteLength > this.config.maxOutboundFileBytes) {
+      throw new Error(
+        `wecom_send_file: file is ${data.byteLength} bytes; configured limit is ${this.config.maxOutboundFileBytes} bytes`,
+      )
+    }
+    await this.sendMedia(target, data, 'file', file.name, 'WeCom file')
+  }
+
+  private async sendMedia(
+    target: string,
+    data: Buffer,
+    mediaType: 'file' | 'image',
+    filename: string,
+    operation: string,
+  ): Promise<void> {
+    const uploaded = await this.retry(async () => withTimeout(
+      this.requireClient().uploadMedia(data, { type: mediaType, filename }),
+      this.config.sendTimeoutMs,
+      `${operation} upload`,
+    ))
+    await this.retry(async () => withTimeout(
+      this.requireClient().sendMediaMessage(target, mediaType, uploaded.media_id),
+      this.config.sendTimeoutMs,
+      `${operation} send`,
+    ))
   }
 
   private async retry<T>(operation: () => Promise<T>): Promise<T> {

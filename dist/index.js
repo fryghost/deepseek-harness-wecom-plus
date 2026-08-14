@@ -1,6 +1,7 @@
 // src/bridge.ts
-import { createHash as createHash2 } from "crypto";
-import { isAbsolute } from "path";
+import { createHash as createHash3 } from "crypto";
+import { readFile as readFile2 } from "fs/promises";
+import { isAbsolute as isAbsolute3 } from "path";
 import { credentialRef } from "@deepseek-ai/dsh-credentials";
 import {
   generateReqId,
@@ -13,14 +14,68 @@ import {
 import { resolveSessionPreset } from "@deepseek-ai/dsh-agent-presets";
 import { createUserMessage } from "@deepseek-ai/dsh-llm";
 import { SessionId } from "@deepseek-ai/dsh-session";
+import { defineTool } from "@deepseek-ai/dsh-tools";
+
+// src/inbound-file.ts
+import { createHash } from "crypto";
+import { chmod, mkdir, readFile, realpath, writeFile } from "fs/promises";
+import { isAbsolute, join, relative, sep } from "path";
+var MAX_STORED_FILENAME_BYTES = 180;
+function isExists(error) {
+  return typeof error === "object" && error !== null && "code" in error && error.code === "EEXIST";
+}
+function isOutside(root, candidate) {
+  const pathFromRoot = relative(root, candidate);
+  return pathFromRoot === ".." || pathFromRoot.startsWith(`..${sep}`) || isAbsolute(pathFromRoot);
+}
+function safeFilename(filename, digest) {
+  const leaf = (filename ?? "").replaceAll("\\", "/").split("/").at(-1)?.trim() ?? "";
+  const cleaned = leaf.replace(/[\u0000-\u001f\u007f<>:"|?*]/gu, "_").replace(/[. ]+$/u, "");
+  const fallback = `wecom-file-${digest.slice(0, 12)}.bin`;
+  const source = cleaned.length === 0 || cleaned === "." || cleaned === ".." ? fallback : cleaned;
+  let bounded = "";
+  for (const codePoint of source) {
+    if (Buffer.byteLength(bounded + codePoint) > MAX_STORED_FILENAME_BYTES) break;
+    bounded += codePoint;
+  }
+  return bounded || fallback;
+}
+async function saveInboundFile(root, conversationId, data, filename, maxBytes) {
+  if (!isAbsolute(root)) throw new Error(`wecom-channel: inboundFileDirectory must be absolute, got ${JSON.stringify(root)}`);
+  if (data.byteLength > maxBytes) {
+    throw new Error(`WeCom file is ${data.byteLength} bytes; configured inbound limit is ${maxBytes} bytes`);
+  }
+  await mkdir(root, { recursive: true, mode: 448 });
+  const canonicalRoot = await realpath(root);
+  await chmod(canonicalRoot, 448);
+  const conversationKey = createHash("sha256").update(conversationId).digest("hex").slice(0, 32);
+  const digest = createHash("sha256").update(data).digest("hex");
+  const directory = join(canonicalRoot, conversationKey, digest);
+  await mkdir(directory, { recursive: true, mode: 448 });
+  const canonicalDirectory = await realpath(directory);
+  if (isOutside(canonicalRoot, canonicalDirectory)) {
+    throw new Error("wecom-channel: inbound file directory resolves outside its configured root");
+  }
+  await chmod(canonicalDirectory, 448);
+  const name2 = safeFilename(filename, digest);
+  const path = join(canonicalDirectory, name2);
+  try {
+    await writeFile(path, data, { flag: "wx", mode: 384 });
+  } catch (error) {
+    if (!isExists(error)) throw error;
+    const existing = await readFile(path);
+    if (!existing.equals(data)) throw new Error("wecom-channel: existing inbound file does not match its content digest");
+  }
+  return { path, name: name2, bytes: data.byteLength };
+}
 
 // src/util.ts
-import { createHash } from "crypto";
+import { createHash as createHash2 } from "crypto";
 function sessionIdFor(accountId, message) {
   const scope = message.chattype === "group" ? "group" : "single";
   const peer = scope === "group" ? message.chatid : message.from.userid;
   if (peer === void 0 || peer.length === 0) throw new Error(`WeCom ${scope} message has no peer identifier`);
-  const digest = createHash("sha256").update(`${accountId}\0${scope}\0${peer}`).digest("hex").slice(0, 32);
+  const digest = createHash2("sha256").update(`${accountId}\0${scope}\0${peer}`).digest("hex").slice(0, 32);
   return `wecom-v2-${scope}-${digest}`;
 }
 function chatTarget(message) {
@@ -80,8 +135,9 @@ async function inboundContent(ctx, config, client, message, includeImages = true
   const scope = message.chattype === "group" ? "WeCom group" : "WeCom private chat";
   const textParts = [`[${scope} message from WeCom user ${shortId(message.from.userid)}]`];
   const images = [];
-  collectMessageContent(message, textParts, images);
-  collectQuotedContent(message, textParts, images);
+  const files = [];
+  collectMessageContent(message, textParts, images, files);
+  collectQuotedContent(message, textParts, images, files);
   const selectedImages = images.slice(0, ctx.attachments.imageLimits.maxImagesPerMessage);
   const imageBlocks = [];
   let totalImageBytes = 0;
@@ -115,12 +171,32 @@ async function inboundContent(ctx, config, client, message, includeImages = true
       ].join(" "));
     }
   }
+  for (const pending of files) {
+    const downloaded = await withTimeout(
+      client.downloadFile(pending.content.url, pending.content.aeskey),
+      config.mediaDownloadTimeoutMs,
+      `WeCom encrypted ${pending.kind} download`
+    );
+    const stored = await saveInboundFile(
+      config.inboundFileDirectory,
+      sessionIdFor(config.accountId, message),
+      downloaded.buffer,
+      downloaded.filename,
+      config.maxInboundFileBytes
+    );
+    const label = pending.quoted ? `Quoted WeCom ${pending.kind}` : `WeCom ${pending.kind}`;
+    textParts.push([
+      `[${label} received: ${JSON.stringify(stored.name)}; ${stored.bytes} bytes.`,
+      `Downloaded and decrypted to local path ${JSON.stringify(stored.path)}.`,
+      "Use the available file or shell tools to inspect this attachment when needed.]"
+    ].join(" "));
+  }
   if (textParts.length === 1 && imageBlocks.length === 0) {
     textParts.push(`[Unsupported WeCom message type: ${message.msgtype}]`);
   }
   return [{ type: "text", text: textParts.join("\n") }, ...imageBlocks];
 }
-function collectMessageContent(message, text, images) {
+function collectMessageContent(message, text, images, files) {
   switch (message.msgtype) {
     case "text":
       pushText(text, message.text?.content);
@@ -136,22 +212,25 @@ function collectMessageContent(message, text, images) {
 ${message.voice.content.trim()}`);
       break;
     case "file":
-      text.push("[WeCom file received; this plugin version handles text and images only.]");
+      if (message.file?.url) files.push({ content: message.file, kind: "file", quoted: false });
       break;
     case "video":
-      text.push("[WeCom video received; this plugin version handles text and images only.]");
+      if (message.video?.url) files.push({ content: message.video, kind: "video", quoted: false });
       break;
     default:
       break;
   }
 }
-function collectQuotedContent(message, text, images) {
+function collectQuotedContent(message, text, images, files) {
   const quote = message.quote;
   if (quote === void 0) return;
   if (quote.msgtype === "text") pushText(text, quote.text?.content, "[Quoted text]\n");
   if (quote.msgtype === "image" && quote.image !== void 0) images.push(quote.image);
   if (quote.msgtype === "mixed") collectMixed(quote.mixed?.msg_item ?? [], text, images, "[Quoted text]\n");
   if (quote.msgtype === "voice") pushText(text, quote.voice?.content, "[Quoted voice transcription]\n");
+  if (quote.msgtype === "file" && quote.file?.url) {
+    files.push({ content: quote.file, kind: "file", quoted: true });
+  }
 }
 function collectMixed(items, text, images, prefix = "") {
   for (const item of items) {
@@ -177,18 +256,64 @@ function startsWith(data, prefix) {
   return prefix.every((byte, index) => data[index] === byte);
 }
 
+// src/outbound-file.ts
+import { realpath as realpath2, stat } from "fs/promises";
+import { basename, isAbsolute as isAbsolute2, relative as relative2, resolve, sep as sep2 } from "path";
+function isMissing(error) {
+  return typeof error === "object" && error !== null && "code" in error && error.code === "ENOENT";
+}
+function isOutside2(root, candidate) {
+  const pathFromRoot = relative2(root, candidate);
+  return pathFromRoot === ".." || pathFromRoot.startsWith(`..${sep2}`) || isAbsolute2(pathFromRoot);
+}
+async function resolveOutboundFile(cwd, requestedPath, maxBytes) {
+  if (requestedPath.trim().length === 0) throw new Error("wecom_send_file: path must not be empty");
+  let root;
+  try {
+    root = await realpath2(cwd);
+  } catch (error) {
+    if (isMissing(error)) throw new Error(`wecom_send_file: configured cwd does not exist: ${JSON.stringify(cwd)}`);
+    throw error;
+  }
+  const rootInfo = await stat(root);
+  if (!rootInfo.isDirectory()) {
+    throw new Error(`wecom_send_file: configured cwd is not a directory: ${JSON.stringify(cwd)}`);
+  }
+  const unresolved = isAbsolute2(requestedPath) ? requestedPath : resolve(root, requestedPath);
+  let path;
+  try {
+    path = await realpath2(unresolved);
+  } catch (error) {
+    if (isMissing(error)) {
+      throw new Error(`wecom_send_file: file does not exist: ${JSON.stringify(requestedPath)}`);
+    }
+    throw error;
+  }
+  if (isOutside2(root, path)) {
+    throw new Error(`wecom_send_file: file resolves outside configured cwd: ${JSON.stringify(requestedPath)}`);
+  }
+  const info = await stat(path);
+  if (!info.isFile()) throw new Error(`wecom_send_file: path is not a regular file: ${JSON.stringify(requestedPath)}`);
+  if (info.size > maxBytes) {
+    throw new Error(`wecom_send_file: file is ${info.size} bytes; configured limit is ${maxBytes} bytes`);
+  }
+  return { path, name: basename(path), bytes: info.size };
+}
+
 // src/conversations.ts
 var ConversationManager = class {
-  constructor(ctx, config) {
+  constructor(ctx, config, sendFile) {
     this.ctx = ctx;
     this.config = config;
+    this.sendFile = sendFile;
   }
   ctx;
   config;
+  sendFile;
   bindings = /* @__PURE__ */ new Map();
   creations = /* @__PURE__ */ new Map();
   queues = /* @__PURE__ */ new Map();
-  activeTurns = /* @__PURE__ */ new Set();
+  activeTurns = /* @__PURE__ */ new Map();
   persistedIds = /* @__PURE__ */ new Set();
   /** Snapshot persisted identities once before accepting traffic. */
   async initialize() {
@@ -227,7 +352,7 @@ var ConversationManager = class {
     const content = await inboundContent(this.ctx, this.config, client, message, await this.includeImages(agent));
     await withTimeout(agent.whenIdle(), this.config.responseTimeoutMs, "DeepSeek Harness conversation availability");
     const start = agent.session.events.length;
-    this.activeTurns.add(id);
+    this.activeTurns.set(id, chatTarget(message));
     try {
       agent.followup(createUserMessage({ content, source: { kind: "user" } }));
       await withTimeout(agent.whenIdle(), this.config.responseTimeoutMs, "DeepSeek Harness response");
@@ -306,12 +431,14 @@ var ConversationManager = class {
   }
   borrowAgent(agent, id) {
     const disposeInstructions = this.registerWeComInstructions(agent.ctx, id);
+    const disposeTool = this.registerFileTool(agent.ctx, id);
     let released = false;
     return {
       agent,
       release: async () => {
         if (released) return;
         released = true;
+        disposeTool();
         disposeInstructions();
       }
     };
@@ -322,6 +449,7 @@ var ConversationManager = class {
   async setupAgent(agentCtx, agentPreset, id) {
     await this.ctx.agentPresets.mount(agentCtx, agentPreset);
     this.registerWeComInstructions(agentCtx, id);
+    this.registerFileTool(agentCtx, id);
   }
   registerWeComInstructions(agentCtx, id) {
     return agentCtx.systemPrompt.section({
@@ -329,6 +457,51 @@ var ConversationManager = class {
       order: 190,
       text: () => this.activeTurns.has(id) ? this.config.systemPrompt : ""
     });
+  }
+  registerFileTool(agentCtx, id) {
+    return agentCtx.tools.register(defineTool({
+      name: "wecom_send_file",
+      description: "Send one existing regular file from the configured workspace to the user who initiated the current WeCom turn. Use this when the WeCom user asks to receive or download a local file. The path may be absolute or relative to the workspace; paths outside the workspace and files over the configured size limit are rejected. Never use it for credentials or secrets.",
+      parameters: {
+        path: {
+          type: "string",
+          required: true,
+          description: "Absolute path within the configured workspace, or a path relative to that workspace."
+        }
+      },
+      output: {
+        schema: {
+          type: "object",
+          additionalProperties: false,
+          properties: {
+            name: { type: "string", required: true },
+            bytes: { type: "number", required: true }
+          }
+        },
+        render: (_args, value) => [{
+          type: "text",
+          text: `Sent ${JSON.stringify(value.name)} (${value.bytes} bytes) to the current WeCom conversation.`
+        }]
+      },
+      execute: async (args, exec) => {
+        const target = this.activeTurns.get(id);
+        if (target === void 0) {
+          throw new Error("wecom_send_file: no active WeCom turn; this tool cannot send files from another channel");
+        }
+        exec.signal.throwIfAborted();
+        const file = await resolveOutboundFile(this.config.cwd, args.path, this.config.maxOutboundFileBytes);
+        exec.signal.throwIfAborted();
+        await this.sendFile(target, file);
+        return { name: file.name, bytes: file.bytes };
+      },
+      presentCall: (args) => ({
+        card: "generic",
+        title: `Send file ${args.path}`,
+        kind: "execute",
+        rawInput: args.path,
+        locations: [{ path: args.path }]
+      })
+    }));
   }
   async collectReply(agent, events) {
     const texts = [];
@@ -363,14 +536,20 @@ var OUTBOUND_TEST_PNG = Buffer.from(
   "iVBORw0KGgoAAAANSUhEUgAAAMgAAABkCAYAAADDhn8LAAAACXBIWXMAAAPoAAAD6AG1e1JrAAACn0lEQVR4nO3XsZFCQRDEUDIhxA28g1gS4JwrCmQ8QwmoR/vh8Ty74MAN7K2DBzHicAP704FABCKQIxBH4CG4/3HgC+JwPB5HII7AQ3B9QRyBh+B81oGfWKIS1RGII/AQXF8QR+AhOH5iOQIPwf2WA/9BHJsH5wjEEXgIri+II/AQHD+xHIGH4PoP4gg8BOf3DvxJD4yAZR0IJDAClnUgkMAIWNaBQAIjYFkHAgmMgGUdCCQwApZ1IJDACFjWgUACI2BZBwIJjIBlHQgkMAKWdSCQwAhY1oFAAiNgWQcCCYyAZR0IJDAClnUgkMAIWNaBQAIjYFkHAgmMgGUdCCQwApZ1IJDACFjWgUACI2BZBwIJjIBlHQgkMAKWdSCQwAhY1oFAAiNgWQcCCYyAZR0IJDAClnUgkMAIWNaBQAIjYFkHAgmMgGUdCCQwApZ1IJDACFjWgUACI2BZBwIJjIBlHQgkMAKWdSCQwAhY1oFAAiNgWQcCCYyAZR0IJDAClnUgkMAIWNaBQAIjYFkHAgmMgGUdCCQwApZ1IJDACFjWgUACI2BZBwIJjIBlHQgkMAKWdSCQwAhY1oFAAiNgWQcCCYyAZR0IJDAClnUgkMAIWNaBQAIjYFkHAgmMgGUdCCQwAroOBBIYAcs6EEhgBCzrQCCBEbCsA4EERsCyDgQSGAHLOhBIYAQs60AggRGwrAOBBEbAsg4EEhgByzoQSGAELOtAIIERsKwDgQRGwLIOBBIYAcs6EEhgBCzrQCCBEbCsA4EERsCyDgQSGAHLOhBIYAQs6+AFcF3qQZOWm4IAAAAASUVORK5CYII=",
   "base64"
 );
+var OUTBOUND_TEST_FILE = Buffer.from("DeepSeek Harness WeCom file upload test\n", "utf8");
 var WeComHarnessBridge = class {
   constructor(ctx, config, clientFactory = (options) => new WSClient(options)) {
     this.ctx = ctx;
     this.config = config;
     this.clientFactory = clientFactory;
-    if (!isAbsolute(config.cwd)) throw new Error(`wecom-channel: cwd must be absolute, got ${JSON.stringify(config.cwd)}`);
+    if (!isAbsolute3(config.cwd)) throw new Error(`wecom-channel: cwd must be absolute, got ${JSON.stringify(config.cwd)}`);
+    if (!isAbsolute3(config.inboundFileDirectory)) {
+      throw new Error(
+        `wecom-channel: inboundFileDirectory must be absolute, got ${JSON.stringify(config.inboundFileDirectory)}`
+      );
+    }
     this.log = ctx.logger("deepseek-harness-wecom");
-    this.conversations = new ConversationManager(ctx, config);
+    this.conversations = new ConversationManager(ctx, config, (target, file) => this.sendLocalFile(target, file));
     this.seen = new SeenMessageIds(config.maxSeenMessageIds);
   }
   ctx;
@@ -484,6 +663,7 @@ var WeComHarnessBridge = class {
           "DeepSeek Harness \u4F01\u5FAE\u673A\u5668\u4EBA",
           "/bot-ping \u2014 \u68C0\u67E5\u8FDE\u901A\u6027",
           "/bot-image-test \u2014 \u53D1\u9001\u4E00\u5F20\u84DD\u8272\u56FE\u7247\uFF0C\u68C0\u67E5\u56FE\u7247\u51FA\u7AD9\u94FE\u8DEF",
+          "/bot-file-test \u2014 \u53D1\u9001\u4E00\u4E2A\u6587\u672C\u9644\u4EF6\uFF0C\u68C0\u67E5\u6587\u4EF6\u51FA\u7AD9\u94FE\u8DEF",
           "/bot-status \u2014 \u67E5\u770B\u5F53\u524D\u4F1A\u8BDD\u72B6\u6001",
           "/bot-cancel \u2014 \u53D6\u6D88\u5F53\u524D\u751F\u6210",
           "\u5176\u4ED6\u6D88\u606F\u4F1A\u4EA4\u7ED9\u5F53\u524D Harness \u9ED8\u8BA4\u6A21\u578B\u5904\u7406\u3002"
@@ -497,6 +677,17 @@ var WeComHarnessBridge = class {
         text: "\u84DD\u8272\u6D4B\u8BD5\u56FE\u7247\u53D1\u9001\u6210\u529F\u3002",
         images: [{ data: OUTBOUND_TEST_PNG, mediaType: "image/png", name: "wecom-image-test.png" }]
       });
+      return;
+    }
+    if (command === "/bot-file-test") {
+      await this.sendMedia(
+        chatTarget(message),
+        OUTBOUND_TEST_FILE,
+        "file",
+        "wecom-file-test.txt",
+        "WeCom file"
+      );
+      await this.sendReply(frame, { text: "\u6587\u672C\u9644\u4EF6\u53D1\u9001\u6210\u529F\u3002", images: [] });
       return;
     }
     if (command === "/bot-cancel") {
@@ -545,7 +736,7 @@ var WeComHarnessBridge = class {
       msgtype: "image",
       image: {
         base64: Buffer.from(image.data).toString("base64"),
-        md5: createHash2("md5").update(image.data).digest("hex")
+        md5: createHash3("md5").update(image.data).digest("hex")
       }
     }));
     const fallback = reply.images.length > 0 ? "\u56FE\u7247\u56DE\u590D" : "\u5904\u7406\u5B8C\u6210\u3002";
@@ -558,17 +749,29 @@ var WeComHarnessBridge = class {
     ));
     for (const image of active) {
       const filename = image.name?.trim() || imageFilename(image.mediaType);
-      const uploaded = await this.retry(async () => withTimeout(
-        this.requireClient().uploadMedia(Buffer.from(image.data), { type: "image", filename }),
-        this.config.sendTimeoutMs,
-        "WeCom image upload"
-      ));
-      await this.retry(async () => withTimeout(
-        this.requireClient().sendMediaMessage(chatTarget(message), "image", uploaded.media_id),
-        this.config.sendTimeoutMs,
-        "WeCom image send"
-      ));
+      await this.sendMedia(chatTarget(message), Buffer.from(image.data), "image", filename, "WeCom image");
     }
+  }
+  async sendLocalFile(target, file) {
+    const data = await readFile2(file.path);
+    if (data.byteLength > this.config.maxOutboundFileBytes) {
+      throw new Error(
+        `wecom_send_file: file is ${data.byteLength} bytes; configured limit is ${this.config.maxOutboundFileBytes} bytes`
+      );
+    }
+    await this.sendMedia(target, data, "file", file.name, "WeCom file");
+  }
+  async sendMedia(target, data, mediaType, filename, operation) {
+    const uploaded = await this.retry(async () => withTimeout(
+      this.requireClient().uploadMedia(data, { type: mediaType, filename }),
+      this.config.sendTimeoutMs,
+      `${operation} upload`
+    ));
+    await this.retry(async () => withTimeout(
+      this.requireClient().sendMediaMessage(target, mediaType, uploaded.media_id),
+      this.config.sendTimeoutMs,
+      `${operation} send`
+    ));
   }
   async retry(operation) {
     let lastError;
@@ -577,7 +780,7 @@ var WeComHarnessBridge = class {
         return await operation();
       } catch (error) {
         lastError = error;
-        if (attempt < this.config.sendRetries) await new Promise((resolve) => setTimeout(resolve, 250 * (attempt + 1)));
+        if (attempt < this.config.sendRetries) await new Promise((resolve2) => setTimeout(resolve2, 250 * (attempt + 1)));
       }
     }
     throw lastError;
@@ -603,7 +806,15 @@ function imageFilename(mediaType) {
 }
 
 // src/config.ts
+import { tmpdir } from "os";
+import { join as join2 } from "path";
 import z from "@deepseek-ai/schemastery";
+var WECOM_FILE_MAX_BYTES = 20 * 1024 * 1024;
+var DEFAULT_WECOM_INBOUND_FILE_DIRECTORY = join2(
+  tmpdir(),
+  `deepseek-harness-wecom-${typeof process.getuid === "function" ? process.getuid() : "current-user"}`,
+  "inbound"
+);
 var Config = z.object({
   botId: z.string().required(),
   secretRef: z.string().default("WECOM_BOT_SECRET"),
@@ -617,6 +828,7 @@ var Config = z.object({
   groupPolicy: z.union(["open", "allowlist", "disabled"]).default("open"),
   groupAllowFrom: z.array(z.string()).default([]),
   imageInputMode: z.union(["auto", "always", "never"]).default("auto"),
+  inboundFileDirectory: z.string().default(DEFAULT_WECOM_INBOUND_FILE_DIRECTORY),
   welcomeText: z.string().default(""),
   startupTimeoutMs: z.number().step(1).min(1).default(3e4),
   responseTimeoutMs: z.number().step(1).min(1).default(3e5),
@@ -628,8 +840,10 @@ var Config = z.object({
   sendRetries: z.number().step(1).min(0).max(5).default(2),
   maxReplyBytes: z.number().step(1).min(100).max(20480).default(2e4),
   maxSeenMessageIds: z.number().step(1).min(100).max(1e5).default(5e3),
+  maxInboundFileBytes: z.number().step(1).min(1).max(WECOM_FILE_MAX_BYTES).default(WECOM_FILE_MAX_BYTES),
+  maxOutboundFileBytes: z.number().step(1).min(1).max(WECOM_FILE_MAX_BYTES).default(WECOM_FILE_MAX_BYTES),
   systemPrompt: z.string().default(
-    "You are replying through WeCom. Keep replies clear and suitable for enterprise chat. Use WeCom-compatible Markdown for headings, lists, links, emphasis, quotes, and code when structure helps. Do not reveal credentials or internal system data. When a request needs an interactive approval that WeCom cannot provide, explain what approval is needed instead of waiting indefinitely."
+    "You are replying through WeCom. Keep replies clear and suitable for enterprise chat. Use WeCom-compatible Markdown for headings, lists, links, emphasis, quotes, and code when structure helps. When the WeCom user asks to receive an existing workspace file, use wecom_send_file instead of claiming that file attachments are unavailable or pasting the whole file. Inbound WeCom files are already downloaded and decrypted; their absolute local paths appear in the user message. Use the available file or shell tools to inspect those paths when the user asks you to process an attachment. Do not reveal credentials or internal system data. When a request needs an interactive approval that WeCom cannot provide, explain what approval is needed instead of waiting indefinitely."
   )
 });
 

@@ -6,16 +6,21 @@ import { createUserMessage } from '@deepseek-ai/dsh-llm'
 import { SessionId, type SessionEvent } from '@deepseek-ai/dsh-session'
 import type {} from '@deepseek-ai/dsh-session-persistence'
 import type {} from '@deepseek-ai/dsh-system-prompt'
+import { defineTool } from '@deepseek-ai/dsh-tools'
 import type { BaseMessage } from '@wecom/aibot-node-sdk'
 import type { Config } from './config.js'
 import { inboundContent, type WeComDownloadPort } from './inbound.js'
-import { sessionIdFor, withTimeout } from './util.js'
+import { resolveOutboundFile, type OutboundFile } from './outbound-file.js'
+import { chatTarget, sessionIdFor, withTimeout } from './util.js'
 
 /** Completed response from one WeCom-triggered Harness turn. */
 export interface ConversationReply {
   text: string
   images: Array<{ data: Uint8Array; mediaType: string; name?: string }>
 }
+
+/** Upload one validated local file to the active WeCom reply target. */
+export type ConversationFileSender = (target: string, file: OutboundFile) => Promise<void>
 
 /** One live agent plus only the lifecycle capability this manager owns. */
 interface ConversationAgentBinding {
@@ -28,10 +33,14 @@ export class ConversationManager {
   private readonly bindings = new Map<string, ConversationAgentBinding>()
   private readonly creations = new Map<string, Promise<ConversationAgentBinding>>()
   private readonly queues = new Map<string, Promise<unknown>>()
-  private readonly activeTurns = new Set<string>()
+  private readonly activeTurns = new Map<string, string>()
   private persistedIds = new Set<string>()
 
-  constructor(private readonly ctx: Context, private readonly config: Config) {}
+  constructor(
+    private readonly ctx: Context,
+    private readonly config: Config,
+    private readonly sendFile: ConversationFileSender,
+  ) {}
 
   /** Snapshot persisted identities once before accepting traffic. */
   async initialize(): Promise<void> {
@@ -78,7 +87,7 @@ export class ConversationManager {
     const content = await inboundContent(this.ctx, this.config, client, message, await this.includeImages(agent))
     await withTimeout(agent.whenIdle(), this.config.responseTimeoutMs, 'DeepSeek Harness conversation availability')
     const start = agent.session.events.length
-    this.activeTurns.add(id)
+    this.activeTurns.set(id, chatTarget(message))
     try {
       agent.followup(createUserMessage({ content, source: { kind: 'user' } }))
       await withTimeout(agent.whenIdle(), this.config.responseTimeoutMs, 'DeepSeek Harness response')
@@ -165,12 +174,14 @@ export class ConversationManager {
 
   private borrowAgent(agent: Agent, id: string): ConversationAgentBinding {
     const disposeInstructions = this.registerWeComInstructions(agent.ctx, id)
+    const disposeTool = this.registerFileTool(agent.ctx, id)
     let released = false
     return {
       agent,
       release: async () => {
         if (released) return
         released = true
+        disposeTool()
         disposeInstructions()
       },
     }
@@ -183,6 +194,7 @@ export class ConversationManager {
   private async setupAgent(agentCtx: Context, agentPreset: string, id: string): Promise<void> {
     await this.ctx.agentPresets.mount(agentCtx, agentPreset)
     this.registerWeComInstructions(agentCtx, id)
+    this.registerFileTool(agentCtx, id)
   }
 
   private registerWeComInstructions(agentCtx: Context, id: string): () => void {
@@ -191,6 +203,54 @@ export class ConversationManager {
       order: 190,
       text: () => this.activeTurns.has(id) ? this.config.systemPrompt : '',
     })
+  }
+
+  private registerFileTool(agentCtx: Context, id: string): () => void {
+    return agentCtx.tools.register(defineTool({
+      name: 'wecom_send_file',
+      description: 'Send one existing regular file from the configured workspace to the user who initiated the current WeCom turn. '
+        + 'Use this when the WeCom user asks to receive or download a local file. The path may be absolute or relative to the workspace; '
+        + 'paths outside the workspace and files over the configured size limit are rejected. Never use it for credentials or secrets.',
+      parameters: {
+        path: {
+          type: 'string',
+          required: true,
+          description: 'Absolute path within the configured workspace, or a path relative to that workspace.',
+        },
+      },
+      output: {
+        schema: {
+          type: 'object',
+          additionalProperties: false,
+          properties: {
+            name: { type: 'string', required: true },
+            bytes: { type: 'number', required: true },
+          },
+        },
+        render: (_args, value) => [{
+          type: 'text',
+          text: `Sent ${JSON.stringify(value.name)} (${value.bytes} bytes) to the current WeCom conversation.`,
+        }],
+      },
+      execute: async (args, exec) => {
+        const target = this.activeTurns.get(id)
+        if (target === undefined) {
+          throw new Error('wecom_send_file: no active WeCom turn; this tool cannot send files from another channel')
+        }
+        exec.signal.throwIfAborted()
+        const file = await resolveOutboundFile(this.config.cwd, args.path, this.config.maxOutboundFileBytes)
+        exec.signal.throwIfAborted()
+        await this.sendFile(target, file)
+        return { name: file.name, bytes: file.bytes }
+      },
+      presentCall: args => ({
+        card: 'generic',
+        title: `Send file ${args.path}`,
+        kind: 'execute',
+        rawInput: args.path,
+        locations: [{ path: args.path }],
+      }),
+    }))
   }
 
   private async collectReply(agent: Agent, events: readonly SessionEvent[]): Promise<ConversationReply> {

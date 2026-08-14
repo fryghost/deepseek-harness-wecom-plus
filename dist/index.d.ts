@@ -1,7 +1,7 @@
 import * as z from '@deepseek-ai/schemastery';
 import z__default from '@deepseek-ai/schemastery';
 import { Context } from '@deepseek-ai/cordis';
-import { BaseMessage, WSClientOptions, WsFrame, EventMessageWith, EnterChatEvent, WsFrameHeaders, ReplyMsgItem } from '@wecom/aibot-node-sdk';
+import { BaseMessage, WSClientOptions, WsFrame, EventMessageWith, EnterChatEvent, WsFrameHeaders, ReplyMsgItem, UploadMediaOptions, WeComMediaType } from '@wecom/aibot-node-sdk';
 import { ImageMediaType } from '@deepseek-ai/dsh-attachment';
 import { ContentBlock } from '@deepseek-ai/dsh-llm';
 
@@ -23,6 +23,7 @@ interface Config {
     groupPolicy: AccessMode;
     groupAllowFrom: string[];
     imageInputMode: ImageInputMode;
+    inboundFileDirectory: string;
     welcomeText: string;
     startupTimeoutMs: number;
     responseTimeoutMs: number;
@@ -34,6 +35,8 @@ interface Config {
     sendRetries: number;
     maxReplyBytes: number;
     maxSeenMessageIds: number;
+    maxInboundFileBytes: number;
+    maxOutboundFileBytes: number;
     systemPrompt: string;
 }
 /** Runtime-validated plugin configuration. */
@@ -69,13 +72,10 @@ interface WeComClientPort extends WeComDownloadPort {
             content: string;
         };
     }): Promise<unknown>;
-    uploadMedia(fileBuffer: Buffer, options: {
-        type: 'image';
-        filename: string;
-    }): Promise<{
+    uploadMedia(fileBuffer: Buffer, options: UploadMediaOptions): Promise<{
         media_id: string;
     }>;
-    sendMediaMessage(chatid: string, mediaType: 'image', mediaId: string): Promise<unknown>;
+    sendMediaMessage(chatid: string, mediaType: WeComMediaType, mediaId: string): Promise<unknown>;
 }
 type WeComClientFactory = (options: WSClientOptions) => WeComClientPort;
 /** Live WeCom WebSocket ↔ DeepSeek Harness bridge. */
@@ -98,6 +98,8 @@ declare class WeComHarnessBridge {
     private handleMessage;
     private allowed;
     private sendReply;
+    private sendLocalFile;
+    private sendMedia;
     private retry;
     private requireClient;
 }

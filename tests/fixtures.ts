@@ -14,6 +14,7 @@ export function testConfig(overrides: Partial<Config> = {}): Config {
     groupPolicy: 'open',
     groupAllowFrom: [],
     imageInputMode: 'auto',
+    inboundFileDirectory: '/tmp/deepseek-harness-wecom-test/inbound',
     welcomeText: '',
     startupTimeoutMs: 1_000,
     responseTimeoutMs: 1_000,
@@ -25,6 +26,8 @@ export function testConfig(overrides: Partial<Config> = {}): Config {
     sendRetries: 0,
     maxReplyBytes: 20_000,
     maxSeenMessageIds: 100,
+    maxInboundFileBytes: 20 * 1024 * 1024,
+    maxOutboundFileBytes: 20 * 1024 * 1024,
     systemPrompt: 'WeCom test instructions',
     ...overrides,
   }

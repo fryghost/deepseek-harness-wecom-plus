@@ -1,4 +1,16 @@
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 import z from '@deepseek-ai/schemastery'
+
+/** WeCom's protocol limit for a generic file upload. */
+export const WECOM_FILE_MAX_BYTES = 20 * 1024 * 1024
+
+/** Default storage outside the agent workspace for decrypted inbound files. */
+export const DEFAULT_WECOM_INBOUND_FILE_DIRECTORY = join(
+  tmpdir(),
+  `deepseek-harness-wecom-${typeof process.getuid === 'function' ? process.getuid() : 'current-user'}`,
+  'inbound',
+)
 
 /** Access policy for one WeCom chat scope. */
 export type AccessMode = 'open' | 'allowlist' | 'disabled'
@@ -20,6 +32,7 @@ export interface Config {
   groupPolicy: AccessMode
   groupAllowFrom: string[]
   imageInputMode: ImageInputMode
+  inboundFileDirectory: string
   welcomeText: string
   startupTimeoutMs: number
   responseTimeoutMs: number
@@ -31,6 +44,8 @@ export interface Config {
   sendRetries: number
   maxReplyBytes: number
   maxSeenMessageIds: number
+  maxInboundFileBytes: number
+  maxOutboundFileBytes: number
   systemPrompt: string
 }
 
@@ -48,6 +63,7 @@ export const Config: z<Config> = z.object({
   groupPolicy: z.union(['open', 'allowlist', 'disabled']).default('open'),
   groupAllowFrom: z.array(z.string()).default([]),
   imageInputMode: z.union(['auto', 'always', 'never']).default('auto'),
+  inboundFileDirectory: z.string().default(DEFAULT_WECOM_INBOUND_FILE_DIRECTORY),
   welcomeText: z.string().default(''),
   startupTimeoutMs: z.number().step(1).min(1).default(30_000),
   responseTimeoutMs: z.number().step(1).min(1).default(300_000),
@@ -59,9 +75,15 @@ export const Config: z<Config> = z.object({
   sendRetries: z.number().step(1).min(0).max(5).default(2),
   maxReplyBytes: z.number().step(1).min(100).max(20_480).default(20_000),
   maxSeenMessageIds: z.number().step(1).min(100).max(100_000).default(5_000),
+  maxInboundFileBytes: z.number().step(1).min(1).max(WECOM_FILE_MAX_BYTES).default(WECOM_FILE_MAX_BYTES),
+  maxOutboundFileBytes: z.number().step(1).min(1).max(WECOM_FILE_MAX_BYTES).default(WECOM_FILE_MAX_BYTES),
   systemPrompt: z.string().default(
     'You are replying through WeCom. Keep replies clear and suitable for enterprise chat. '
     + 'Use WeCom-compatible Markdown for headings, lists, links, emphasis, quotes, and code when structure helps. '
+    + 'When the WeCom user asks to receive an existing workspace file, use wecom_send_file instead of '
+    + 'claiming that file attachments are unavailable or pasting the whole file. '
+    + 'Inbound WeCom files are already downloaded and decrypted; their absolute local paths appear in the user message. '
+    + 'Use the available file or shell tools to inspect those paths when the user asks you to process an attachment. '
     + 'Do not reveal credentials or internal system data. When a request needs an interactive approval '
     + 'that WeCom cannot provide, explain what approval is needed instead of waiting indefinitely.',
   ),

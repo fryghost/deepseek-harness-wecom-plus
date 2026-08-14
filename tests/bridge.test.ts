@@ -1,5 +1,12 @@
 import { describe, expect, it, vi } from 'vitest'
-import type { BaseMessage, ReplyMsgItem, WSClientOptions, WsFrameHeaders } from '@wecom/aibot-node-sdk'
+import type {
+  BaseMessage,
+  ReplyMsgItem,
+  UploadMediaOptions,
+  WSClientOptions,
+  WeComMediaType,
+  WsFrameHeaders,
+} from '@wecom/aibot-node-sdk'
 import { WeComHarnessBridge } from '../src/bridge.js'
 import { testConfig } from './fixtures.js'
 
@@ -13,7 +20,7 @@ class FakeClient {
   isConnected = false
   readonly replies: SentReply[] = []
   readonly uploads: Array<{ data: Buffer; type: string; filename: string }> = []
-  readonly activeImages: Array<{ chatid: string; mediaId: string }> = []
+  readonly activeMedia: Array<{ chatid: string; type: WeComMediaType; mediaId: string }> = []
   readonly welcomes: string[] = []
   private readonly handlers = new Map<string, Array<(...args: never[]) => unknown>>()
 
@@ -49,13 +56,13 @@ class FakeClient {
     this.welcomes.push(body.text.content)
   }
 
-  async uploadMedia(data: Buffer, options: { type: 'image'; filename: string }): Promise<{ media_id: string }> {
+  async uploadMedia(data: Buffer, options: UploadMediaOptions): Promise<{ media_id: string }> {
     this.uploads.push({ data, ...options })
     return { media_id: `media-${this.uploads.length}` }
   }
 
-  async sendMediaMessage(chatid: string, _type: 'image', mediaId: string): Promise<void> {
-    this.activeImages.push({ chatid, mediaId })
+  async sendMediaMessage(chatid: string, type: WeComMediaType, mediaId: string): Promise<void> {
+    this.activeMedia.push({ chatid, type, mediaId })
   }
 
   async downloadFile(): Promise<{ buffer: Buffer }> {
@@ -113,7 +120,10 @@ function agentContext(): never {
     llm: { resolveModelInfo: vi.fn(async () => ({ inputModalities: ['text'] })) },
     agents: {
       create: vi.fn(async (options: { setup?: (ctx: never) => Promise<void> }) => {
-        await options.setup?.({ systemPrompt: { section: vi.fn(() => vi.fn()) } } as never)
+        await options.setup?.({
+          systemPrompt: { section: vi.fn(() => vi.fn()) },
+          tools: { register: vi.fn(() => vi.fn()) },
+        } as never)
         return { agent, dispose: vi.fn(async () => undefined) }
       }),
       get: vi.fn(),
@@ -175,6 +185,22 @@ describe('WeComHarnessBridge', () => {
     expect(Buffer.from(item?.image.base64 ?? '', 'base64').subarray(0, 8))
       .toEqual(Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]))
     expect(item?.image.md5).toMatch(/^[0-9a-f]{32}$/)
+    await bridge.stop()
+  })
+
+  it('uploads and actively sends a generic file through the official media API', async () => {
+    const client = new FakeClient()
+    const bridge = new WeComHarnessBridge(commandContext('resolved-secret'), testConfig(), () => client as never)
+    await bridge.start()
+    await client.message(textMessage('/bot-file-test', 'm-file'))
+
+    expect(client.uploads).toEqual([expect.objectContaining({
+      data: Buffer.from('DeepSeek Harness WeCom file upload test\n', 'utf8'),
+      type: 'file',
+      filename: 'wecom-file-test.txt',
+    })])
+    expect(client.activeMedia).toEqual([{ chatid: 'u1', type: 'file', mediaId: 'media-1' }])
+    expect(client.replies[0]?.content).toContain('文本附件发送成功')
     await bridge.stop()
   })
 

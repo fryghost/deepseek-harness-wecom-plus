@@ -97,6 +97,7 @@ export class WeComHarnessBridge {
   private readonly allowedHarnessCommands: ReadonlySet<string>
   private client: WeComClientPort | undefined
   private stopping = false
+  private lastError: string | undefined
 
   constructor(
     private readonly ctx: Context,
@@ -113,6 +114,16 @@ export class WeComHarnessBridge {
     this.conversations = new ConversationManager(ctx, config, (target, file) => this.sendLocalFile(target, file))
     this.seen = new SeenMessageIds(config.maxSeenMessageIds)
     this.allowedHarnessCommands = new Set(config.allowedHarnessCommands)
+  }
+
+  /** Latest channel fact for configuration surfaces. */
+  status(): { state: 'inactive' | 'connecting' | 'connected'; detail?: string } {
+    const client = this.client
+    if (client === undefined) {
+      return { state: 'inactive', ...(this.lastError === undefined ? {} : { detail: this.lastError }) }
+    }
+    if (client.isConnected) return { state: 'connected' }
+    return { state: 'connecting', ...(this.lastError === undefined ? {} : { detail: this.lastError }) }
   }
 
   /** Stay dormant without credentials, or authenticate and wait for WeCom readiness. */
@@ -157,6 +168,7 @@ export class WeComHarnessBridge {
     })
     client.on('reconnecting', attempt => this.log.warn('WeCom WebSocket reconnect attempt %d', attempt))
     client.on('error', error => {
+      this.lastError = error.message
       if (error instanceof WSAuthFailureError || error instanceof WSReconnectExhaustedError) {
         rejectReady(error)
       }
@@ -204,7 +216,7 @@ export class WeComHarnessBridge {
       maxReconnectAttempts: this.config.maxReconnectAttempts,
       maxAuthFailureAttempts: this.config.maxAuthFailureAttempts,
       requestTimeout: this.config.sendTimeoutMs,
-      plug_version: 'deepseek-harness-wecom-plus/0.2.0',
+      plug_version: 'deepseek-harness-wecom-plus/0.3.0',
     })
   }
 

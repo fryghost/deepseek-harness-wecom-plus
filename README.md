@@ -9,6 +9,7 @@ An out-of-tree [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harnes
 - **Template cards out**: the model can send `text_notice`, `news_notice`, `button_interaction`, `vote_interaction`, or `multiple_interaction` cards through the `wecom_send_card` tool, with protocol-aware text truncation.
 - **Adaptive paired messages (`cardMode: auto`, default)**: one reply renders as *one Markdown message + one interaction card* — replies that end in an option list or a confirm question automatically get a button card (Markdown keeps the full option details, buttons keep the short labels), while informational replies get no card.
 - **Card button clicks in**: official `template_card_event` handling — a 5-second local card acknowledgement, key → label resolution back to the chosen option, then the click injected as a user message and the model's reply pushed proactively (Markdown + card).
+- **Web Settings page**: a dedicated "WeCom 企微" section in the DSH Settings panel — Bot ID, Secret (credentials seam, write-only), card mode, access policies, and welcome text are all UI-editable; saving reconnects the channel live, and the page shows the connection state and the latest error.
 - **`/bot-card-test`** self-check command and `cardMode`, `cardTaskIdPrefix`, `cardClickAckTitle`, `cardClickAckSubtitle` configuration.
 
 ## Features
@@ -58,23 +59,16 @@ For a local checkout:
 pnpm dsh plugin --profile web add /absolute/path/to/deepseek-harness-wecom-plus
 ```
 
-## Configure
+## Configure (recommended: the Web Settings page)
 
-Set the Bot ID in the launch environment and store the Secret under the credential reference `WECOM_BOT_SECRET`. Environment injection is also supported for development:
+After installing and restarting DSH, open **Settings → WeCom 企微** and configure everything in the UI:
 
-```sh
-export WECOM_BOT_ID='your-bot-id'
-export WECOM_BOT_SECRET='your-bot-secret'
-pnpm dsh --profile web
-```
+- **Bot ID**: paste the bot id from the WeCom admin console's Smart Bot page;
+- **Secret**: paste it into the credential input and press "保存 Secret" — the value goes through the DSH credentials seam (write-only, never returned to the browser);
+- **card mode / single-chat policy / group policy / welcome text**: dropdowns that apply **live** — saving restarts the channel immediately, no DSH restart needed;
+- the page shows the live connection state (inactive / connecting / connected) and the latest error.
 
-The bundle reads `WECOM_BOT_ID`, resolves `WECOM_BOT_SECRET` through `ctx.credentials`, and uses the launch directory as the agent working directory. `DSH_WECOM_CWD` can override the working directory.
-
-Installing the bundle does not require configuring credentials immediately. If the Bot ID is empty or the referenced Secret is absent or blank, the channel logs that it is inactive and lets DSH finish starting. Configure both values and reload or restart DSH to connect. A non-empty but invalid credential still fails during WeCom authentication.
-
-For a durable setup, put `WECOM_BOT_ID` in `~/.dsh/.env` and store `WECOM_BOT_SECRET` with the Harness credential settings surface. Never commit either value.
-
-Override the plugin row in `~/.dsh/profiles/web/cordis.patch.yml` to change policy or connection behavior:
+Saved values land in the DSH settings document (`settings.yaml`) and survive restarts. The plugin row in `~/.dsh/profiles/web/cordis.patch.yml` remains the composition **baseline** (UI-saved values override it):
 
 ```yaml
 - id: wecom-channel
@@ -176,7 +170,7 @@ pnpm install
 pnpm run check
 ```
 
-Built `dist/` artifacts are committed so GitHub installs do not require executing a dependency build script.
+`pnpm run check` runs host typecheck, client typecheck, tests, and build. The client typecheck/build pin their types to a **sibling `deepseek-harness` checkout** (`../deepseek-harness`, the same convention as deepseek-eyes); without the sibling, `pnpm test` still runs. Built `dist/` artifacts — including the Web plugin bundle `dist/client.js` — are committed so GitHub installs do not require executing a dependency build script.
 
 ## License
 

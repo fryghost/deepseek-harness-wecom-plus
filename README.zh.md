@@ -9,6 +9,7 @@
 - **模板卡片（template_card）完整支持**：模型可通过 `wecom_send_card` 工具发送 `text_notice` / `news_notice` / `button_interaction` / `vote_interaction` / `multiple_interaction` 五种卡片，卡片文本按协议上限自动截断。
 - **自适应成对消息（`cardMode: auto`，默认）**：一次回复呈现为「一条 Markdown 消息 + 一张交互卡片」——回复以选项列表或确认类问句结尾时自动生成按钮卡片（Markdown 承载完整选项说明、按钮承载短标签）；普通陈述回复不配卡，日常对话保持干净。
 - **按钮点击入站**：订阅官方 `template_card_event`，点击在 5 秒窗口内先由插件本地确认更新（"正在处理…"，不经过模型），随后通过 key → 标签注册表还原用户选中的选项文案，连同 `task_id` / `event_key` 注入对应会话，模型回复通过主动发送通道推送（Markdown + 卡片）。
+- **网页端设置页**：设置面板新增「WeCom 企微」页面，Bot ID / Secret / 卡片模式 / 访问策略 / 欢迎语全部界面化配置；Secret 走 DSH 凭据服务只写不读；保存即热重连（无需重启 DSH），页面实时显示连接状态与最近错误。
 - 新增 `/bot-card-test` 自检命令，无需模型即可验证卡片与按钮交互链路。
 - 新增 `cardMode`、`cardTaskIdPrefix`、`cardClickAckTitle`、`cardClickAckSubtitle` 配置项。
 
@@ -57,26 +58,19 @@ pnpm dsh plugin --profile web add github:fryghost/deepseek-harness-wecom-plus
 从本地检出安装：
 
 ```sh
-pnpm dsh plugin --profile web add /absolute/path/to/DeepSeek-harness-wecom
+pnpm dsh plugin --profile web add /absolute/path/to/deepseek-harness-wecom-plus
 ```
 
-## 配置
+## 配置（推荐：网页端界面配置）
 
-Bot ID 由启动环境提供，Secret 保存到 `WECOM_BOT_SECRET` 凭据引用。开发时也可以直接通过环境变量注入：
+安装并重启 DSH 后，打开 **设置 → WeCom 企微** 页面，即可在界面中完成全部配置：
 
-```sh
-export WECOM_BOT_ID='your-bot-id'
-export WECOM_BOT_SECRET='your-bot-secret'
-pnpm dsh --profile web
-```
+- **Bot ID**：企微管理后台「智能机器人」页面提供，粘贴进输入框；
+- **Secret**：粘贴进凭据输入框点「保存 Secret」——值经 DSH 凭据服务只写不读，不会回传浏览器；
+- **卡片模式 / 单聊策略 / 群聊策略 / 欢迎语**：下拉选择，保存后**立即生效**（通道自动重连，无需重启 DSH）；
+- 页面实时显示连接状态（未激活 / 连接中 / 已连接）与最近错误。
 
-组合包会读取 `WECOM_BOT_ID`，通过 `ctx.credentials` 解析 `WECOM_BOT_SECRET`，并默认让 agent 使用启动目录作为工作目录。可以用 `DSH_WECOM_CWD` 覆盖工作目录。
-
-安装组合包后不必立即配置凭据。Bot ID 为空，或引用的 Secret 不存在/为空时，通道会记录“未配置、保持休眠”的日志并允许 DSH 正常完成启动；补齐两项配置后重载或重启 DSH 即可连接。非空但错误的凭据仍会在企微鉴权阶段报错。
-
-长期使用时，建议把 `WECOM_BOT_ID` 放到 `~/.dsh/.env`，并通过 Harness 凭据设置界面保存 `WECOM_BOT_SECRET`。不要把任何真实凭据提交到 Git。
-
-如需修改权限策略或连接行为，在 `~/.dsh/profiles/web/cordis.patch.yml` 覆盖该插件行：
+保存的动作写入 DSH 设置文件（settings.yaml），重启后依然生效。也可以在 `~/.dsh/profiles/web/cordis.patch.yml` 里以组合配置作为**基线**覆盖（界面保存的值优先于基线）：
 
 ```yaml
 - id: wecom-channel
@@ -178,7 +172,7 @@ pnpm install
 pnpm run check
 ```
 
-仓库提交构建后的 `dist/`，因此从 GitHub 安装时不需要授权依赖执行构建脚本。
+`pnpm run check` = 宿主类型检查 + 客户端类型检查 + 测试 + 构建。客户端类型检查与构建需要**同级目录的 deepseek-harness 检出**（`../deepseek-harness`，与 deepseek-eyes 相同的约定）；没有检出时仍可运行 `pnpm test`。仓库提交构建后的 `dist/`（含网页插件 `dist/client.js`），因此从 GitHub 安装时不需要授权依赖执行构建脚本。
 
 ## 许可证
 

@@ -21,4 +21,27 @@ jobs:
           node-version: 22.19.0
           cache: pnpm
       - run: pnpm install --frozen-lockfile
-      - run: pnpm run check
+
+      # Unit tests are harness-free and always run here.
+      - run: pnpm test
+
+      # Host/client typecheck and build pin their types to a sibling
+      # deepseek-harness checkout (built lib/ declarations of the exact API
+      # line). They run locally — see the README — and here only when the
+      # sibling is present.
+      - name: Detect the deepseek-harness sibling
+        id: harness-sibling
+        run: |
+          if [ -f ../deepseek-harness/package.json ]; then
+            echo "present=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "present=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Typecheck (needs the deepseek-harness sibling)
+        if: steps.harness-sibling.outputs.present == 'true'
+        run: pnpm run typecheck && pnpm run typecheck:client
+
+      - name: Build (needs the deepseek-harness sibling)
+        if: steps.harness-sibling.outputs.present == 'true'
+        run: pnpm run build

@@ -1,3 +1,6 @@
+// src/index.ts
+import { installSettingsSection } from "@deepseek-ai/dsh-settings";
+
 // src/bridge.ts
 import { createHash as createHash3 } from "crypto";
 import { readFile as readFile2 } from "fs/promises";
@@ -1249,6 +1252,16 @@ var WeComHarnessBridge = class {
   allowedHarnessCommands;
   client;
   stopping = false;
+  lastError;
+  /** Latest channel fact for configuration surfaces. */
+  status() {
+    const client = this.client;
+    if (client === void 0) {
+      return { state: "inactive", ...this.lastError === void 0 ? {} : { detail: this.lastError } };
+    }
+    if (client.isConnected) return { state: "connected" };
+    return { state: "connecting", ...this.lastError === void 0 ? {} : { detail: this.lastError } };
+  }
   /** Stay dormant without credentials, or authenticate and wait for WeCom readiness. */
   async start() {
     if (!this.config.botId.trim()) {
@@ -1290,6 +1303,7 @@ var WeComHarnessBridge = class {
     });
     client.on("reconnecting", (attempt) => this.log.warn("WeCom WebSocket reconnect attempt %d", attempt));
     client.on("error", (error) => {
+      this.lastError = error.message;
       if (error instanceof WSAuthFailureError || error instanceof WSReconnectExhaustedError) {
         rejectReady(error);
       }
@@ -1334,7 +1348,7 @@ var WeComHarnessBridge = class {
       maxReconnectAttempts: this.config.maxReconnectAttempts,
       maxAuthFailureAttempts: this.config.maxAuthFailureAttempts,
       requestTimeout: this.config.sendTimeoutMs,
-      plug_version: "deepseek-harness-wecom-plus/0.2.0"
+      plug_version: "deepseek-harness-wecom-plus/0.3.0"
     });
   }
   async handleWelcome(frame) {
@@ -1730,6 +1744,237 @@ var Config = z.object({
   )
 });
 
+// src/settings-web.ts
+import { credentialRef as credentialRef2 } from "@deepseek-ai/dsh-credentials";
+import {
+  SettingsConflictError,
+  settingsNamespace
+} from "@deepseek-ai/dsh-settings";
+
+// src/version.ts
+var PLUGIN_VERSION = "0.3.0";
+
+// src/settings-web.ts
+var SETTINGS_ROUTE = "/_dsh/deepseek-harness-wecom-plus/settings";
+var SETTINGS_NS = settingsNamespace("deepseek-harness-wecom-plus");
+var USER_SETTINGS_KEYS = ["botId", "cardMode", "singlePolicy", "groupPolicy", "welcomeText"];
+function isRecord(value) {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+function descriptorOf(ctx) {
+  const settings = ctx.get("settings");
+  if (settings === void 0) throw new Error("settings service is not available");
+  const descriptor = settings.describe().find((row) => row.ns === SETTINGS_NS);
+  if (descriptor === void 0) throw new Error("deepseek-harness-wecom-plus Settings namespace is not registered");
+  return descriptor;
+}
+function requireSettings(ctx) {
+  const settings = ctx.get("settings");
+  if (settings === void 0) throw new Error("settings service is not available");
+  return settings;
+}
+function userSettingsOf(config) {
+  const record = isRecord(config) ? config : {};
+  return {
+    botId: typeof record.botId === "string" ? record.botId : "",
+    cardMode: record.cardMode === "tool" || record.cardMode === "off" ? record.cardMode : "auto",
+    singlePolicy: record.singlePolicy === "allowlist" || record.singlePolicy === "disabled" ? record.singlePolicy : "open",
+    groupPolicy: record.groupPolicy === "allowlist" || record.groupPolicy === "disabled" ? record.groupPolicy : "open",
+    welcomeText: typeof record.welcomeText === "string" ? record.welcomeText : ""
+  };
+}
+function responseJson(res, status, body) {
+  const bytes = Buffer.from(JSON.stringify(body));
+  res.setHeader("Content-Type", "application/json; charset=utf-8");
+  res.setHeader("Content-Length", String(bytes.length));
+  res.setHeader("Cache-Control", "no-store");
+  res.setHeader("X-Content-Type-Options", "nosniff");
+  res.setHeader("Content-Security-Policy", "default-src 'none'; frame-ancestors 'none'");
+  res.writeHead(status);
+  res.end(bytes);
+}
+function requestError(res, status, code, message) {
+  responseJson(res, status, { ok: false, error: { code, message } });
+}
+function sameOriginPost(req) {
+  const fetchSite = req.headers["sec-fetch-site"];
+  if (fetchSite === "cross-site") return false;
+  const origin = req.headers.origin;
+  if (origin === void 0) return fetchSite === "same-origin" || fetchSite === "same-site" || fetchSite === "none";
+  const host = req.headers.host;
+  if (host === void 0) return false;
+  try {
+    const parsed = new URL(origin);
+    return (parsed.protocol === "http:" || parsed.protocol === "https:") && parsed.host === host;
+  } catch {
+    return false;
+  }
+}
+async function readJson(req, maxBytes = 64 * 1024) {
+  const contentType = req.headers["content-type"]?.split(";", 1)[0]?.trim().toLowerCase();
+  if (contentType !== "application/json") throw new TypeError("Content-Type must be application/json");
+  const chunks = [];
+  let bytes = 0;
+  for await (const chunk of req) {
+    const part = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+    bytes += part.length;
+    if (bytes > maxBytes) throw new RangeError(`request body exceeds ${maxBytes} bytes`);
+    chunks.push(part);
+  }
+  if (chunks.length === 0) throw new TypeError("request body is empty");
+  return JSON.parse(Buffer.concat(chunks).toString("utf8"));
+}
+function parseRequest(value) {
+  if (!isRecord(value) || typeof value.action !== "string") throw new TypeError("request action is required");
+  if (value.action === "save") {
+    if (!Number.isSafeInteger(value.expectedRevision) || value.expectedRevision < 0) {
+      throw new TypeError("save.expectedRevision must be a non-negative integer");
+    }
+    if (!isRecord(value.value)) throw new TypeError("save.value must be an object");
+    const patch = {};
+    for (const key of USER_SETTINGS_KEYS) {
+      const entry = value.value[key];
+      if (typeof entry !== "string") throw new TypeError(`save.value.${key} must be a string`);
+      patch[key] = entry;
+    }
+    return {
+      action: "save",
+      expectedRevision: value.expectedRevision,
+      value: patch
+    };
+  }
+  if (value.action === "set-key") {
+    if (typeof value.value !== "string" || value.value.trim().length === 0) {
+      throw new TypeError("set-key.value must be a non-empty string");
+    }
+    return { action: "set-key", value: value.value.trim() };
+  }
+  if (value.action === "clear-key") return { action: "clear-key" };
+  throw new TypeError(`unsupported action: ${String(value.action)}`);
+}
+function publicMessage(error) {
+  if (error instanceof Error) return error.message;
+  return String(error);
+}
+var WeComWebBackend = class {
+  constructor(ctx, status) {
+    this.ctx = ctx;
+    this.status = status;
+  }
+  ctx;
+  status;
+  async credential(config) {
+    const info = await this.ctx.credentials.describe(credentialRef2(config.secretRef));
+    return {
+      configured: info.configured,
+      ...info.source === void 0 ? {} : { source: info.source },
+      writable: info.writable
+    };
+  }
+  /** Build the current settings/credential/channel snapshot without secrets. */
+  async snapshot() {
+    const descriptor = descriptorOf(this.ctx);
+    const config = descriptor.value;
+    const credential = await this.credential(config);
+    return {
+      schemaVersion: 1,
+      writable: requireSettings(this.ctx).writable,
+      settings: {
+        value: userSettingsOf(config),
+        revision: descriptor.revision,
+        applies: "live"
+      },
+      credential: {
+        ref: config.secretRef,
+        configured: credential.configured,
+        ...credential.source === void 0 ? {} : { source: credential.source },
+        writable: credential.writable
+      },
+      channel: this.status(),
+      release: { pluginVersion: PLUGIN_VERSION }
+    };
+  }
+  /** Merge the UI-editable subset into the namespace's user layer. */
+  async save(request) {
+    const settings = requireSettings(this.ctx);
+    if (!settings.writable) throw new Error("settings provider is read-only");
+    await settings.update(SETTINGS_NS, request.value, request.expectedRevision);
+    return this.snapshot();
+  }
+  /**
+   * Store one pasted Secret under the configured credential reference. The
+   * credentials seam enforces writability and never lets the value back out.
+   */
+  async setKey(value) {
+    const config = descriptorOf(this.ctx).value;
+    await this.ctx.credentials.set(credentialRef2(config.secretRef), value);
+    return this.snapshot();
+  }
+  /** Remove the stored Secret; an absent credential is a no-op. */
+  async clearKey() {
+    const config = descriptorOf(this.ctx).value;
+    await this.ctx.credentials.unset(credentialRef2(config.secretRef));
+    return this.snapshot();
+  }
+  /** Handle the exact Settings route. */
+  async handle(req, res) {
+    if (req.method === "GET") {
+      try {
+        responseJson(res, 200, { ok: true, value: await this.snapshot() });
+      } catch (error) {
+        this.ctx.logger.warn("deepseek-harness-wecom-plus Settings snapshot failed: %s", publicMessage(error));
+        requestError(res, 503, "settings-unavailable", "WeCom channel Settings are unavailable");
+      }
+      return;
+    }
+    if (req.method !== "POST") {
+      res.setHeader("Allow", "GET, POST");
+      requestError(res, 405, "method-not-allowed", "Use GET or POST");
+      return;
+    }
+    if (!sameOriginPost(req)) {
+      requestError(res, 403, "origin-rejected", "The request must originate from this DSH Web application");
+      return;
+    }
+    let parsed;
+    try {
+      parsed = parseRequest(await readJson(req));
+    } catch (error) {
+      requestError(res, error instanceof RangeError ? 413 : 400, "invalid-request", publicMessage(error));
+      return;
+    }
+    try {
+      if (parsed.action === "set-key") {
+        responseJson(res, 200, { ok: true, value: await this.setKey(parsed.value) });
+      } else if (parsed.action === "clear-key") {
+        responseJson(res, 200, { ok: true, value: await this.clearKey() });
+      } else {
+        responseJson(res, 200, { ok: true, value: await this.save(parsed) });
+      }
+    } catch (error) {
+      const conflict = error instanceof SettingsConflictError;
+      const code = conflict ? "settings-conflict" : parsed.action === "set-key" || parsed.action === "clear-key" ? "key-rejected" : "settings-rejected";
+      const status = conflict ? 409 : 400;
+      this.ctx.logger.warn("deepseek-harness-wecom-plus Web action=%s failed: %s", parsed.action, publicMessage(error));
+      requestError(res, status, code, publicMessage(error));
+    }
+  }
+};
+function installWeComSettingsWeb(ctx, backend) {
+  ctx.inject(["webServer"], (webCtx) => {
+    webCtx.effect(() => {
+      const dispose = webCtx.webServer.register({
+        kind: "exact",
+        path: SETTINGS_ROUTE,
+        handler: (req, res) => backend.handle(req, res)
+      });
+      return () => {
+        dispose();
+      };
+    }, "deepseek-harness-wecom-plus: Web Settings route");
+  });
+}
+
 // src/index.ts
 var name = "deepseek-harness-wecom-plus";
 var inject = [
@@ -1745,34 +1990,75 @@ var inject = [
 ];
 async function apply(ctx, config) {
   const log = ctx.logger(name);
+  let current = () => config;
   let bridge;
-  try {
-    bridge = new WeComHarnessBridge(ctx, config);
-  } catch (error) {
-    log.error("WeCom channel configuration is invalid and stays inactive: %s", String(error));
-    return;
-  }
-  await ctx.effect(async function* () {
-    yield async () => bridge.stop();
+  let restarting;
+  let lastResolved;
+  const stopBridge = async () => {
+    const previous = bridge;
+    bridge = void 0;
+    if (previous !== void 0) await previous.stop();
+  };
+  const restartBridge = async () => {
+    let resolved;
     try {
-      await bridge.start();
+      resolved = Config(current());
+    } catch (error) {
+      log.error("WeCom channel configuration is invalid and stays inactive: %s", String(error));
+      return;
+    }
+    const fingerprint = JSON.stringify(resolved);
+    if (bridge !== void 0 && fingerprint === lastResolved) return;
+    await stopBridge();
+    lastResolved = fingerprint;
+    const next = new WeComHarnessBridge(ctx, resolved);
+    bridge = next;
+    try {
+      await next.start();
     } catch (error) {
       log.error("WeCom channel failed to start and stays inactive: %s", String(error));
     }
+  };
+  const scheduleRestart = () => {
+    restarting = (restarting ?? Promise.resolve()).then(restartBridge, restartBridge);
+    restarting.catch(() => void 0);
+  };
+  installWeComSettingsWeb(ctx, new WeComWebBackend(ctx, () => bridge?.status() ?? { state: "inactive" }));
+  installSettingsSection(ctx, SETTINGS_NS, Config, Config(config), {
+    setSource: (source) => {
+      current = source;
+    },
+    onChange: () => {
+      scheduleRestart();
+    },
+    validate: (value) => {
+      Config(value);
+    }
+  });
+  await ctx.effect(async function* () {
+    yield async () => {
+      await stopBridge();
+      if (restarting !== void 0) await restarting;
+    };
   }, "deepseek-harness-wecom-plus.websocket");
+  scheduleRestart();
 }
-var index_default = { name, inject, Config, apply };
+var src_default = { name, inject, Config, apply };
 export {
   Config,
+  SETTINGS_NS,
+  SETTINGS_ROUTE,
   SeenMessageIds,
   WeComHarnessBridge,
+  WeComWebBackend,
   apply,
   chatTarget,
-  index_default as default,
+  src_default as default,
   detectImageMediaType,
   inboundContent,
   inject,
   name,
+  parseRequest,
   sessionIdFor,
   truncateUtf8
 };

@@ -4,7 +4,7 @@ import type { BaseMessage } from '@wecom/aibot-node-sdk'
 /** Deterministic, non-identifying DSH session id for one WeCom conversation. */
 export function sessionIdFor(
   accountId: string,
-  message: Pick<BaseMessage, 'chattype' | 'chatid' | 'from'>,
+  message: { chattype?: 'single' | 'group'; chatid?: string; from: { userid: string } },
 ): string {
   const scope = message.chattype === 'group' ? 'group' : 'single'
   const peer = scope === 'group' ? message.chatid : message.from.userid
@@ -14,7 +14,7 @@ export function sessionIdFor(
 }
 
 /** Target id accepted by WeCom proactive-send APIs. */
-export function chatTarget(message: Pick<BaseMessage, 'chattype' | 'chatid' | 'from'>): string {
+export function chatTarget(message: { chattype?: 'single' | 'group'; chatid?: string; from: { userid: string } }): string {
   const target = message.chattype === 'group' ? message.chatid : message.from.userid
   if (target === undefined || target.length === 0) throw new Error('WeCom message has no outbound chat target')
   return target

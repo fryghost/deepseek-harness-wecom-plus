@@ -4,7 +4,7 @@ import type { Context } from '@deepseek-ai/cordis'
 import { WeComHarnessBridge } from './bridge.js'
 import { Config, type Config as WeComConfig } from './config.js'
 
-export const name = 'deepseek-harness-wecom'
+export const name = 'deepseek-harness-wecom-plus'
 export const inject = [
   'agentDefaultModel',
   'agentPresets',

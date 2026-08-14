@@ -1,8 +1,15 @@
-# DeepSeek Harness 企微插件
+# DeepSeek Harness 企微增强插件（deepseek-harness-wecom-plus）
 
 中文 | [English](README.md)
 
-这是一个独立的树外 [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) 通道插件，通过企业微信官方 WebSocket 长连接 SDK，把企微智能机器人连接到可持久化的 Harness agent。
+这是 [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) 的树外企微通道插件，fork 自 [sliverp/DeepSeek-harness-wecom](https://github.com/sliverp/DeepSeek-harness-wecom)（v0.1.4）并在此基础上增强，通过企业微信官方 WebSocket 长连接 SDK，把企微智能机器人连接到可持久化的 Harness agent。
+
+## 与上游的区别（plus 增强）
+
+- **模板卡片（template_card）完整支持**：模型可通过 `wecom_send_card` 工具发送 `text_notice` / `news_notice` / `button_interaction` 卡片；`cardMode: auto` 时每条模型回复自动配一张摘要卡片 —— 一次对话呈现为「一条 Markdown 消息 + 一张卡片」的成对消息（针对模板卡片行数、字数限制多且容易变丑的问题，卡片文本按协议上限自动截断）。
+- **按钮点击入站**：订阅官方 `template_card_event`，点击在 5 秒窗口内先由插件本地确认更新（"正在处理…"，不经过模型），随后作为带 `task_id` / `event_key` 上下文的用户消息注入对应会话，模型回复通过主动发送通道推送（Markdown + 卡片）。
+- 新增 `/bot-card-test` 自检命令，无需模型即可验证卡片与按钮交互链路。
+- 新增 `cardMode`、`cardTaskIdPrefix`、`cardClickAckTitle`、`cardClickAckSubtitle` 配置项。
 
 ## 功能
 
@@ -15,6 +22,8 @@
 - 把解密后的入站文件保存到工作区之外，并通过绝对路径交给 Agent 工具
 - 当前模型不支持图片输入时自动降级为文本元数据，不让整轮失败
 - 支持文本、内联图片回复；其他图片格式通过临时素材上传后主动发送
+- 支持模板卡片：模型调用 `wecom_send_card` 发送文本/图文/按钮交互卡片，或 `cardMode: auto` 自动配摘要卡片，一条回复呈现为「Markdown + 卡片」成对消息
+- 支持模板卡片按钮点击入站（`template_card_event`），点击后 5 秒内本地确认更新，并把点击作为用户消息交给模型
 - 提供仅当前企微回合可用的 `wecom_send_file` 工具，并校验工作目录范围和文件大小
 - 通过官方流式回复字段发送企微 Markdown
 - 每个单聊或群聊对应一个独立、可恢复的 Harness 会话
@@ -24,7 +33,7 @@
 - 可配置转发当前 agent preset 注册的 Harness 斜杠命令，默认开放 `/compact`、`/goal`、`/plan`
 - 同会话消息串行处理、消息排重、发送重试和超时保护
 - 单聊/群聊可分别配置开放、白名单或禁用
-- 内置 `/bot-ping`、`/bot-image-test`、`/bot-file-test`、`/bot-help`、`/bot-status`、`/bot-cancel`
+- 内置 `/bot-ping`、`/bot-image-test`、`/bot-card-test`、`/bot-file-test`、`/bot-help`、`/bot-status`、`/bot-cancel`
 - 可为企微 `enter_chat` 事件配置欢迎语
 - Secret 通过 Harness 凭据服务解析，不进入插件配置
 - 未配置 Bot ID 或 Secret 时保持休眠，单独安装插件不会阻断 DSH 启动
@@ -38,10 +47,10 @@
 
 ## 安装
 
-从 GitHub 安装到 web profile：
+从 GitHub 安装到 web profile（fork 后换成你的仓库地址）：
 
 ```sh
-pnpm dsh plugin --profile web add github:sliverp/DeepSeek-harness-wecom
+pnpm dsh plugin --profile web add github:<your-account>/deepseek-harness-wecom-plus
 ```
 
 从本地检出安装：
@@ -70,7 +79,7 @@ pnpm dsh --profile web
 
 ```yaml
 - id: wecom-channel
-  name: deepseek-harness-wecom
+  name: deepseek-harness-wecom-plus
   config:
     botId: !!js process.env.WECOM_BOT_ID
     secretRef: WECOM_BOT_SECRET
@@ -82,7 +91,11 @@ pnpm dsh --profile web
     groupPolicy: open
     allowedHarnessCommands: [compact, goal, plan]
     imageInputMode: auto
-    inboundFileDirectory: /var/tmp/deepseek-harness-wecom/inbound
+    cardMode: auto
+    cardTaskIdPrefix: dshp
+    cardClickAckTitle: 正在处理…
+    cardClickAckSubtitle: 已收到按钮点击，正在处理，请稍候。
+    inboundFileDirectory: /var/tmp/deepseek-harness-wecom-plus/inbound
     maxInboundFileBytes: 20971520
     maxOutboundFileBytes: 20971520
     welcomeText: 您好，我是 DeepSeek Harness 助手。
@@ -90,9 +103,25 @@ pnpm dsh --profile web
 
 `imageInputMode` 默认为 `auto`：支持视觉的模型会收到持久图片块；纯文本模型会收到附件元数据，避免整轮失败。只有确认模型支持图片时才使用 `always`；使用 `never` 可强制文本降级。
 
-收到文件或视频后，插件会在模型回合开始前通过官方 SDK 下载并完成 AES 解密，以仅当前用户可读写的权限保存到 `inboundFileDirectory`，并把安全文件名、字节数和本地绝对路径记录到 session 消息中；所选 preset 的文件或 shell 工具可以直接处理该路径。默认目录位于操作系统临时目录下的 `deepseek-harness-wecom-<uid>/inbound`；如果文件需要跨越临时目录清理长期保留，请配置一个绝对的持久目录。`maxInboundFileBytes` 默认为企微文件上限 20,971,520 字节（20 MiB）。
+收到文件或视频后，插件会在模型回合开始前通过官方 SDK 下载并完成 AES 解密，以仅当前用户可读写的权限保存到 `inboundFileDirectory`，并把安全文件名、字节数和本地绝对路径记录到 session 消息中；所选 preset 的文件或 shell 工具可以直接处理该路径。默认目录位于操作系统临时目录下的 `deepseek-harness-wecom-plus-<uid>/inbound`（上游的 `deepseek-harness-wecom-<uid>/inbound` 目录不会自动迁移，升级时请一并调整持久目录配置）；如果文件需要跨越临时目录清理长期保留，请配置一个绝对的持久目录。`maxInboundFileBytes` 默认为企微文件上限 20,971,520 字节（20 MiB）。
 
 企微官方 SDK 明确定义 `replyStream` 的内容字段支持 Markdown。插件会原样传递 assistant 生成的 Markdown，包括标题、列表、链接、强调、引用和代码；最终负载仍受 `maxReplyBytes` 限制，默认上限为 20,000 字节。
+
+## 模板卡片与按钮交互
+
+模板卡片协议对行数、字数限制很多，单卡片直接承载长回复容易变丑。本插件的默认呈现方式（`cardMode: auto`）是一次模型回复 = **一条 Markdown 消息 + 一张摘要卡片** 的成对消息：Markdown 承载完整内容，卡片只放标题与摘要（标题 26 字、副标题 112 字自动截断），让聊天流整洁、重点突出。
+
+- `cardMode: auto`（默认）：每条模型回复自动配一张 `text_notice` 摘要卡片；若模型已用 `wecom_send_card` 显式发卡则不重复配卡。
+- `cardMode: tool`：只有模型调用 `wecom_send_card` 时才发卡，内容完全由模型控制（`text_notice` / `news_notice` / `button_interaction`）。
+- `cardMode: off`：完全关闭卡片，`wecom_send_card` 会返回明确的禁用错误。
+
+模型可以调用会话范围内的 `wecom_send_card` 工具发送 `button_interaction` 卡片（1~6 个按钮，按钮文案 10 字上限，`key` 最长 1024 字节）。用户点击按钮后，企微推送 `template_card_event`，插件会：
+
+1. 在协议要求的 **5 秒窗口内**先用插件本地文案原位更新卡片（`cardClickAckTitle` / `cardClickAckSubtitle`，默认"正在处理…"），**不经过模型**，保证点击立即有反馈；
+2. 把点击作为一条带 `task_id` 与 `event_key` 上下文的用户消息注入该单聊/群聊的持久会话，交给模型；
+3. 模型回复通过主动发送通道推送（Markdown 消息 + 卡片），因此一次点击同样得到成对消息。
+
+注意：模型一轮推理通常超过 5 秒，所以按钮点击后的卡片更新只能由插件本地完成；模型结果以新消息呈现，而不是原位改写卡片。
 
 `agentPreset` 默认使用当前 Harness 部署选择的默认 preset（通常是 `standard`）。插件会把 preset 写入 session header，并在恢复时重新挂载，使模型工具调用交给 Harness Agent Loop 处理，而不是把原始 DSML 文本暴露给用户。修复前创建的会话使用 `wecom-v1-` 命名空间；正确组合后的会话使用 `wecom-v2-`，旧历史保留不动。如果网页已经打开同一个修复后会话，企微 bridge 会借用该 Agent、等待当前活动结束，不会再启动第二个 session writer。
 
@@ -112,9 +141,11 @@ pong — DeepSeek Harness 企微机器人已连接。
 
 发送 `/bot-image-test` 可以直接验证官方内联图片回复字段，不依赖模型生成图片。机器人应回复一张蓝色 PNG 和发送成功提示。
 
+发送 `/bot-card-test` 可以验证模板卡片与按钮交互链路，不依赖模型：机器人先发一条说明，再发一张带「确认收到 / 再想想」按钮的 `button_interaction` 卡片。点击按钮后，卡片应先在数秒内原位变为"正在处理…"，随后收到模型的回复消息（含摘要卡片，除非 `cardMode` 关闭）。
+
 发送 `/bot-file-test` 可以在不调用模型的情况下验证官方临时素材上传和主动文件发送接口。机器人应先发送 `wecom-file-test.txt`，再回复发送成功。随后可以要求 agent 发送工作目录中已有的文件，例如“把 README.md 作为文件发给我”；对应会话中应出现 `wecom_send_file` 调用，企微应收到附件。
 
-然后发送普通文本、图片或图文混排消息。插件会把消息追加到对应的 Harness 持久会话，并把当前默认模型的回复发回企微。
+然后发送普通文本、图片或图文混排消息。插件会把消息追加到对应的 Harness 持久会话，并把当前默认模型的回复发回企微。`cardMode: auto` 时，模型回复应呈现为「Markdown 消息 + 摘要卡片」两条消息；让模型做选择题（例如"给我两个选项：继续/暂停"）时，会话中应出现 `wecom_send_card` 调用和一张带按钮的卡片。
 
 发送 `/new` 后，机器人应确认已经开启新对话；随后询问旧对话中的细节，Agent 不应继续使用旧上下文。发送 `/compact`、`/goal` 或 `/plan` 时，插件应直接显示 Harness 命令结果，回复中不应出现模型对斜杠命令的解释。未知或未开放的斜杠命令应被明确拒绝，不能送入模型。
 

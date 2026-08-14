@@ -1,7 +1,7 @@
 {
-  "name": "deepseek-harness-wecom",
-  "version": "0.1.4",
-  "description": "WeCom AI Bot text, image, and file channel bridge for DeepSeek Harness",
+  "name": "deepseek-harness-wecom-plus",
+  "version": "0.2.0",
+  "description": "WeCom AI Bot channel bridge for DeepSeek Harness with template card support (text, image, file, Markdown + card pairing, button interactions)",
   "type": "module",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
@@ -35,20 +35,13 @@
     "deepseek-harness",
     "wecom",
     "wework",
-    "cordis"
+    "cordis",
+    "template-card"
   ],
   "license": "MIT",
-  "repository": {
-    "type": "git",
-    "url": "git+https://github.com/sliverp/DeepSeek-harness-wecom.git"
-  },
-  "homepage": "https://github.com/sliverp/DeepSeek-harness-wecom#readme",
-  "bugs": {
-    "url": "https://github.com/sliverp/DeepSeek-harness-wecom/issues"
-  },
   "dependencies": {
     "@deepseek-ai/schemastery": "^3.18.1",
-    "@wecom/aibot-node-sdk": "^1.0.6"
+    "@wecom/aibot-node-sdk": "^1.0.7"
   },
   "peerDependencies": {
     "@deepseek-ai/cordis": ">=4.0.1",

@@ -1,8 +1,14 @@
-# DeepSeek Harness WeCom
+# DeepSeek Harness WeCom Plus
 
 [中文](README.zh.md) | English
 
-An independent out-of-tree [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) channel plugin that connects a WeCom AI Bot to persistent Harness agents through the official WebSocket long-connection SDK.
+An out-of-tree [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) channel plugin that connects a WeCom AI Bot to persistent Harness agents through the official WebSocket long-connection SDK. Forked from [sliverp/DeepSeek-harness-wecom](https://github.com/sliverp/DeepSeek-harness-wecom) (v0.1.4) and enhanced with full template-card support.
+
+## What plus adds
+
+- **Template cards out**: the model can send `text_notice`, `news_notice`, or `button_interaction` cards through the `wecom_send_card` tool; with `cardMode: auto` (default), every model reply is paired with a derived summary card, so one turn renders as *one Markdown message + one card*.
+- **Card button clicks in**: official `template_card_event` handling — the click is acknowledged locally inside the protocol's 5-second update window (no model involved), then injected into the conversation as a user message carrying `task_id`/`event_key`; the model's reply is pushed proactively (Markdown + card).
+- **`/bot-card-test`** self-check command and `cardMode`, `cardTaskIdPrefix`, `cardClickAckTitle`, `cardClickAckSubtitle` configuration.
 
 ## Features
 
@@ -16,6 +22,9 @@ An independent out-of-tree [DeepSeek Harness](https://github.com/deepseek-ai/dee
 - Automatic text-only fallback when the selected model cannot accept images
 - Text and inline image replies, plus uploaded active image sends for other image formats
 - A WeCom-turn-scoped `wecom_send_file` tool with workspace containment and file-size checks
+- A WeCom-turn-scoped `wecom_send_card` tool for text/news/button template cards, delivered right after the Markdown reply
+- `cardMode: auto` Markdown+card pairing with protocol-aware text truncation (title 26, subtitle 112, button text 10 characters)
+- `template_card_event` button clicks with a 5-second local card acknowledgement and a proactive model reply
 - WeCom Markdown replies through the official stream response fields
 - One persistent Harness session per single or group conversation
 - Harness agent-preset composition for the same tools, prompts, and skills as Web sessions
@@ -24,7 +33,7 @@ An independent out-of-tree [DeepSeek Harness](https://github.com/deepseek-ai/dee
 - Configurable forwarding of Harness commands registered by the current agent preset; `/compact`, `/goal`, and `/plan` are enabled by default
 - Per-conversation ordering, duplicate suppression, retries, and bounded timeouts
 - Open, allowlist, or disabled access policies for single and group traffic
-- `/bot-ping`, `/bot-image-test`, `/bot-file-test`, `/bot-help`, `/bot-status`, and `/bot-cancel`
+- `/bot-ping`, `/bot-image-test`, `/bot-card-test`, `/bot-file-test`, `/bot-help`, `/bot-status`, and `/bot-cancel`
 - Optional welcome text for the WeCom `enter_chat` event
 - Secret resolution through the Harness credential service instead of plugin configuration
 - Dormant startup when Bot ID or Secret is not configured, so installation alone never blocks DSH
@@ -39,13 +48,13 @@ An independent out-of-tree [DeepSeek Harness](https://github.com/deepseek-ai/dee
 ## Install from GitHub
 
 ```sh
-pnpm dsh plugin --profile web add github:sliverp/DeepSeek-harness-wecom
+pnpm dsh plugin --profile web add github:<your-account>/deepseek-harness-wecom-plus
 ```
 
 For a local checkout:
 
 ```sh
-pnpm dsh plugin --profile web add /absolute/path/to/DeepSeek-harness-wecom
+pnpm dsh plugin --profile web add /absolute/path/to/deepseek-harness-wecom-plus
 ```
 
 ## Configure
@@ -68,7 +77,7 @@ Override the plugin row in `~/.dsh/profiles/web/cordis.patch.yml` to change poli
 
 ```yaml
 - id: wecom-channel
-  name: deepseek-harness-wecom
+  name: deepseek-harness-wecom-plus
   config:
     botId: !!js process.env.WECOM_BOT_ID
     secretRef: WECOM_BOT_SECRET
@@ -80,7 +89,11 @@ Override the plugin row in `~/.dsh/profiles/web/cordis.patch.yml` to change poli
     groupPolicy: open
     allowedHarnessCommands: [compact, goal, plan]
     imageInputMode: auto
-    inboundFileDirectory: /var/tmp/deepseek-harness-wecom/inbound
+    cardMode: auto
+    cardTaskIdPrefix: dshp
+    cardClickAckTitle: 正在处理…
+    cardClickAckSubtitle: 已收到按钮点击，正在处理，请稍候。
+    inboundFileDirectory: /var/tmp/deepseek-harness-wecom-plus/inbound
     maxInboundFileBytes: 20971520
     maxOutboundFileBytes: 20971520
     welcomeText: 您好，我是 DeepSeek Harness 助手。
@@ -88,9 +101,25 @@ Override the plugin row in `~/.dsh/profiles/web/cordis.patch.yml` to change poli
 
 `imageInputMode` defaults to `auto`: image-capable models receive a durable image block, while text-only models receive attachment metadata instead of failing the turn. Use `always` only with a route known to accept images, or `never` to force the text fallback.
 
-Inbound files and videos are downloaded and AES-decrypted through the official SDK before the model turn begins. The plugin saves them with owner-only permissions under `inboundFileDirectory`, records the safe filename, byte count, and absolute local path in the session message, and lets the selected preset's file or shell tools inspect that path. The default directory is the operating system's temporary directory under `deepseek-harness-wecom-<uid>/inbound`; set an absolute persistent directory if files must survive temporary-directory cleanup. `maxInboundFileBytes` defaults to the WeCom file limit of 20,971,520 bytes (20 MiB).
+Inbound files and videos are downloaded and AES-decrypted through the official SDK before the model turn begins. The plugin saves them with owner-only permissions under `inboundFileDirectory`, records the safe filename, byte count, and absolute local path in the session message, and lets the selected preset's file or shell tools inspect that path. The default directory is the operating system's temporary directory under `deepseek-harness-wecom-plus-<uid>/inbound` (the upstream `deepseek-harness-wecom-<uid>/inbound` directory is not migrated automatically, so adjust any persistent-directory configuration when upgrading); set an absolute persistent directory if files must survive temporary-directory cleanup. `maxInboundFileBytes` defaults to the WeCom file limit of 20,971,520 bytes (20 MiB).
 
 WeCom's official SDK defines the `replyStream` content field as Markdown-capable. The plugin passes assistant Markdown through unchanged, including headings, lists, links, emphasis, quotes, and code. The final payload remains bounded by `maxReplyBytes`, which defaults to 20,000 bytes.
+
+## Template cards and button interactions
+
+Template cards have strict row and character limits, and cramming a long reply into one card renders poorly. The default presentation (`cardMode: auto`) pairs every model reply as *one Markdown message + one summary card*: the Markdown carries the full answer while the `text_notice` card carries only the condensed summary, with title (26) and subtitle (112) characters auto-truncated.
+
+- `cardMode: auto` (default): every model reply gets a derived summary card, unless the model already sent an explicit card through `wecom_send_card`.
+- `cardMode: tool`: cards are sent only when the model calls `wecom_send_card` (`text_notice`, `news_notice`, or `button_interaction`).
+- `cardMode: off`: cards are disabled; `wecom_send_card` fails with a teaching error.
+
+The turn-scoped `wecom_send_card` tool can send a `button_interaction` card with 1–6 buttons (labels capped at 10 characters, keys at 1024 bytes). When a user clicks a button, WeCom pushes `template_card_event` and the plugin:
+
+1. updates the card in place within the protocol's **5-second window** using local acknowledgement text (`cardClickAckTitle`/`cardClickAckSubtitle`, default "正在处理…"), without involving the model;
+2. injects the click into the conversation's durable session as a user message carrying `task_id` and `event_key`;
+3. pushes the model's reply proactively as Markdown + card, keeping the same paired-message presentation.
+
+Because one model turn usually exceeds the 5-second window, click-time card updates are always plugin-local; the model's answer arrives as new messages rather than rewriting the card in place.
 
 `agentPreset` defaults to the Harness deployment's selected default (normally `standard`). The preset is recorded in the session header and mounted again on resume, so model tool calls are handled by the Harness Agent Loop instead of being exposed as raw DSML text. Sessions created before preset composition use the `wecom-v1-` namespace; corrected sessions use `wecom-v2-`, leaving old history untouched. If Web already has the same corrected session live, the WeCom bridge borrows that Agent, waits for its current activity to finish, and does not open a second session writer.
 
@@ -110,9 +139,11 @@ pong — DeepSeek Harness 企微机器人已连接。
 
 Send `/bot-image-test` to exercise the official inline-image reply fields without depending on model-generated media. The bot should return a blue PNG and a success message.
 
+Send `/bot-card-test` to exercise the template-card and button-interaction path without invoking a model. The bot should send a `button_interaction` card with "确认收到 / 再想想" buttons. Clicking a button should first update the card in place to the acknowledgement text within seconds, then deliver the model's reply (with a summary card unless `cardMode` is off).
+
 Send `/bot-file-test` to exercise the official temporary-media upload and active file-send APIs without invoking a model. The bot should send `wecom-file-test.txt` followed by a success message. Then ask the agent to send an existing workspace file, such as `Send README.md as a file`; the session should contain a `wecom_send_file` call and WeCom should receive the attachment.
 
-Then send ordinary text, an image, or a mixed text/image message. The plugin appends it to the conversation's durable Harness session and returns the selected default model's response.
+Then send ordinary text, an image, or a mixed text/image message. The plugin appends it to the conversation's durable Harness session and returns the selected default model's response. With `cardMode: auto`, the reply should render as a Markdown message plus a summary card; asking for choices should produce a `wecom_send_card` call and a button card.
 
 Send `/new` and verify that the bot confirms a fresh conversation. A subsequent question about details from the old conversation must not reuse that context. `/compact`, `/goal`, and `/plan` should display the direct Harness command result instead of a model explanation. Unknown or disabled slash commands must be rejected without reaching the model.
 

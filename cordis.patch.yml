@@ -1,6 +1,6 @@
 - insert:
     - id: wecom-channel
-      name: deepseek-harness-wecom
+      name: deepseek-harness-wecom-plus
       config:
         botId: !!js process.env.WECOM_BOT_ID
         secretRef: WECOM_BOT_SECRET

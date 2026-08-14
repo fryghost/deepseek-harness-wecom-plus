@@ -10,6 +10,139 @@ import {
   WSReconnectExhaustedError
 } from "@wecom/aibot-node-sdk";
 
+// src/card.ts
+import { randomBytes } from "crypto";
+var CARD_LIMITS = {
+  title: 26,
+  titleDesc: 30,
+  subtitle: 112,
+  sourceDesc: 13,
+  buttonText: 10,
+  buttonKeyBytes: 1024,
+  maxButtons: 6,
+  taskIdBytes: 128
+};
+var TASK_ID_PATTERN = /^[0-9A-Za-z_@-]{1,128}$/u;
+function truncateChars(text, maxChars, suffix = "\u2026") {
+  const normalized = text.trim();
+  if (normalized.length <= maxChars) return normalized;
+  const available = Math.max(0, maxChars - suffix.length);
+  let result = "";
+  for (const codePoint of normalized) {
+    if (result.length + codePoint.length > available) break;
+    result += codePoint;
+  }
+  return result + (suffix.length <= maxChars ? suffix : "");
+}
+function generateTaskId(prefix) {
+  const safePrefix = prefix.replace(/[^0-9A-Za-z_@-]/gu, "").slice(0, 24) || "dshp";
+  const suffix = `${Date.now().toString(36)}-${randomBytes(4).toString("hex")}`;
+  return `${safePrefix}-${suffix}`.slice(0, 128);
+}
+function requireTitle(value) {
+  const title = truncateChars(value?.trim() || "", CARD_LIMITS.title);
+  if (title.length === 0) throw new Error("wecom_send_card: title must not be empty");
+  return title;
+}
+function optionalChars(value, max) {
+  const normalized = value?.trim();
+  return normalized ? truncateChars(normalized, max) : void 0;
+}
+function normalizeTaskId(input, prefix) {
+  const candidate = input?.trim();
+  return candidate !== void 0 && TASK_ID_PATTERN.test(candidate) ? candidate : generateTaskId(prefix);
+}
+function normalizeButtons(value) {
+  if (value === void 0 || value === null) return void 0;
+  if (!Array.isArray(value) || value.length === 0) {
+    throw new Error("wecom_send_card: button_interaction requires a non-empty buttons array");
+  }
+  if (value.length > CARD_LIMITS.maxButtons) {
+    throw new Error(`wecom_send_card: at most ${CARD_LIMITS.maxButtons} buttons are supported`);
+  }
+  const buttons = value.map((entry) => {
+    if (typeof entry !== "object" || entry === null) {
+      throw new Error("wecom_send_card: each button must be an object with text and key");
+    }
+    const item = entry;
+    const text = truncateChars(typeof item.text === "string" ? item.text : "", CARD_LIMITS.buttonText);
+    const key = typeof item.key === "string" ? item.key.trim() : "";
+    if (text.length === 0 || key.length === 0) {
+      throw new Error("wecom_send_card: each button needs a non-empty text and key");
+    }
+    if (Buffer.byteLength(key) > CARD_LIMITS.buttonKeyBytes) {
+      throw new Error(`wecom_send_card: button key exceeds ${CARD_LIMITS.buttonKeyBytes} bytes`);
+    }
+    const numeric = typeof item.style === "number" ? Math.trunc(item.style) : 1;
+    const style = numeric >= 1 && numeric <= 4 ? numeric : 1;
+    return { text, key, style };
+  });
+  const keys = /* @__PURE__ */ new Set();
+  for (let index = 0; index < buttons.length; index += 1) {
+    const button = buttons[index];
+    if (button === void 0) continue;
+    let key = button.key;
+    let suffix = 2;
+    while (keys.has(key)) key = `${button.key}-${suffix++}`;
+    keys.add(key);
+    button.key = key;
+  }
+  return buttons;
+}
+function buildTemplateCard(input, taskIdPrefix) {
+  const title = requireTitle(input.title);
+  const desc = optionalChars(input.desc, CARD_LIMITS.titleDesc);
+  const subtitle = optionalChars(input.subtitle, CARD_LIMITS.subtitle);
+  const taskId = normalizeTaskId(input.taskId, taskIdPrefix);
+  const base = {
+    card_type: input.cardType,
+    ...subtitle === void 0 ? {} : { sub_title_text: subtitle },
+    task_id: taskId
+  };
+  switch (input.cardType) {
+    case "text_notice":
+      return { ...base, main_title: { title, ...desc === void 0 ? {} : { desc } } };
+    case "news_notice": {
+      const imageUrl = input.imageUrl?.trim();
+      if (imageUrl === void 0 || imageUrl.length === 0) {
+        throw new Error("wecom_send_card: news_notice requires image_url");
+      }
+      const jumpUrl = input.jumpUrl?.trim();
+      return {
+        ...base,
+        main_title: { title, ...desc === void 0 ? {} : { desc } },
+        card_image: { url: imageUrl },
+        ...jumpUrl === void 0 ? {} : { card_action: { type: 1, url: jumpUrl } }
+      };
+    }
+    case "button_interaction": {
+      const buttons = normalizeButtons(input.buttons);
+      if (buttons === void 0) {
+        throw new Error("wecom_send_card: button_interaction requires a non-empty buttons array");
+      }
+      return {
+        ...base,
+        main_title: { title, ...desc === void 0 ? {} : { desc } },
+        button_list: buttons
+      };
+    }
+  }
+}
+function deriveSummaryCard(text, taskIdPrefix) {
+  const trimmed = text.trim();
+  if (trimmed.length === 0) return void 0;
+  const [first, ...rest] = trimmed.split("\n");
+  const title = truncateChars((first ?? "").replace(/^[#>+\-*]\s*/u, ""), CARD_LIMITS.title);
+  if (title.length === 0) return void 0;
+  const subtitle = optionalChars(rest.join("\n"), CARD_LIMITS.subtitle);
+  return {
+    card_type: "text_notice",
+    main_title: { title },
+    ...subtitle === void 0 ? {} : { sub_title_text: subtitle },
+    task_id: generateTaskId(taskIdPrefix)
+  };
+}
+
 // src/conversations.ts
 import { resolveSessionPreset } from "@deepseek-ai/dsh-agent-presets";
 import { createUserMessage } from "@deepseek-ai/dsh-llm";
@@ -314,6 +447,7 @@ var ConversationManager = class {
   creations = /* @__PURE__ */ new Map();
   queues = /* @__PURE__ */ new Map();
   activeTurns = /* @__PURE__ */ new Map();
+  pendingCards = /* @__PURE__ */ new Map();
   generations = /* @__PURE__ */ new Map();
   persistedIds = /* @__PURE__ */ new Set();
   /** Snapshot persisted identities once before accepting traffic. */
@@ -326,12 +460,18 @@ var ConversationManager = class {
     const baseId = sessionIdFor(this.config.accountId, message);
     return this.enqueue(baseId, () => this.processNow(this.currentSessionId(baseId), message, client));
   }
+  /** Process one template card button click as a user message into the same conversation. */
+  processCardEvent(message) {
+    const baseId = sessionIdFor(this.config.accountId, message);
+    return this.enqueue(baseId, () => this.processCardEventNow(this.currentSessionId(baseId), message));
+  }
   /** End the current WeCom conversation session while retaining its history. */
   async reset(message) {
     const baseId = sessionIdFor(this.config.accountId, message);
     this.cancel(message);
     await this.enqueue(baseId, async () => {
       const id = this.currentSessionId(baseId);
+      this.pendingCards.delete(id);
       const binding = this.bindings.get(id);
       if (binding !== void 0) {
         this.bindings.delete(id);
@@ -363,10 +503,13 @@ var ConversationManager = class {
       this.activeTurns.set(id, chatTarget(message));
       try {
         const execution = await this.ctx.commands.execute(agent, line, controller.signal);
-        if (execution === void 0) return { execution, response: void 0 };
+        if (execution === void 0) {
+          this.takeCards(id);
+          return { execution, response: void 0 };
+        }
         await withTimeout(agent.whenIdle(), this.config.responseTimeoutMs, "DeepSeek Harness command response");
         const events = agent.session.events.slice(start);
-        const response = events.some((event) => event.type === "assistant/message") ? await this.collectReply(agent, events) : void 0;
+        const response = events.some((event) => event.type === "assistant/message") ? this.finalizeReply(id, await this.collectReply(agent, events)) : (this.takeCards(id), void 0);
         return { execution, response };
       } finally {
         clearTimeout(timer);
@@ -389,6 +532,7 @@ var ConversationManager = class {
     await Promise.allSettled([...this.bindings.values()].map((binding) => binding.release()));
     this.bindings.clear();
     this.activeTurns.clear();
+    this.pendingCards.clear();
   }
   enqueue(baseId, operation) {
     const previous = this.queues.get(baseId) ?? Promise.resolve();
@@ -428,10 +572,57 @@ var ConversationManager = class {
     try {
       agent.followup(createUserMessage({ content, source: { kind: "user" } }));
       await withTimeout(agent.whenIdle(), this.config.responseTimeoutMs, "DeepSeek Harness response");
-      return await this.collectReply(agent, agent.session.events.slice(start));
+      const collected = await this.collectReply(agent, agent.session.events.slice(start));
+      return this.finalizeReply(id, collected);
     } finally {
       this.activeTurns.delete(id);
     }
+  }
+  async processCardEventNow(id, message) {
+    const binding = await this.getOrCreate(id);
+    const agent = binding.agent;
+    const scope = message.chattype === "group" ? "WeCom group" : "WeCom private chat";
+    const taskId = message.event.task_id?.trim() || "\uFF08\u65E0\uFF09";
+    const eventKey = message.event.event_key?.trim() || "\uFF08\u65E0\uFF09";
+    const content = [{
+      type: "text",
+      text: [
+        `[${scope} template card button click from WeCom user ${message.from.userid}]`,
+        `task_id: ${taskId}`,
+        `event_key: ${eventKey}`,
+        "The user clicked a button on a WeCom template card you sent earlier. Answer the click in your reply."
+      ].join("\n")
+    }];
+    await withTimeout(agent.whenIdle(), this.config.responseTimeoutMs, "DeepSeek Harness conversation availability");
+    const start = agent.session.events.length;
+    this.activeTurns.set(id, chatTarget(message));
+    try {
+      agent.followup(createUserMessage({ content, source: { kind: "user" } }));
+      await withTimeout(agent.whenIdle(), this.config.responseTimeoutMs, "DeepSeek Harness response");
+      const collected = await this.collectReply(agent, agent.session.events.slice(start));
+      return this.finalizeReply(id, collected);
+    } finally {
+      this.activeTurns.delete(id);
+    }
+  }
+  /**
+   * Attach the turn's queued cards to a collected reply. In "auto" mode a
+   * derived text_notice summary card accompanies the Markdown reply whenever
+   * the model did not send an explicit card first.
+   */
+  finalizeReply(id, collected) {
+    const cards = this.takeCards(id);
+    if (this.config.cardMode === "auto" && cards.length === 0 && collected.text.trim().length > 0) {
+      const derived = deriveSummaryCard(collected.text, this.config.cardTaskIdPrefix);
+      if (derived !== void 0) cards.push(derived);
+    }
+    return { ...collected, cards };
+  }
+  /** Drain and clear the template cards queued by one active turn's tools. */
+  takeCards(id) {
+    const cards = this.pendingCards.get(id) ?? [];
+    this.pendingCards.delete(id);
+    return cards;
   }
   async includeImages(agent) {
     if (this.config.imageInputMode === "always") return true;
@@ -503,14 +694,16 @@ var ConversationManager = class {
   }
   borrowAgent(agent, id) {
     const disposeInstructions = this.registerWeComInstructions(agent.ctx, id);
-    const disposeTool = this.registerFileTool(agent.ctx, id);
+    const disposeFileTool = this.registerFileTool(agent.ctx, id);
+    const disposeCardTool = this.registerCardTool(agent.ctx, id);
     let released = false;
     return {
       agent,
       release: async () => {
         if (released) return;
         released = true;
-        disposeTool();
+        disposeCardTool();
+        disposeFileTool();
         disposeInstructions();
       }
     };
@@ -522,6 +715,7 @@ var ConversationManager = class {
     await this.ctx.agentPresets.mount(agentCtx, agentPreset);
     this.registerWeComInstructions(agentCtx, id);
     this.registerFileTool(agentCtx, id);
+    this.registerCardTool(agentCtx, id);
   }
   registerWeComInstructions(agentCtx, id) {
     return agentCtx.systemPrompt.section({
@@ -575,6 +769,114 @@ var ConversationManager = class {
       })
     }));
   }
+  registerCardTool(agentCtx, id) {
+    return agentCtx.tools.register(defineTool({
+      name: "wecom_send_card",
+      description: "Send one WeCom template card to the user who initiated the current WeCom turn. The card is delivered as a second message right after the main Markdown reply, so one turn becomes one Markdown message plus one card. Use it for condensed summaries or selectable choices (button_interaction). Display text is truncated to the WeCom card limits (title 26, desc 30, subtitle 112, button text 10 characters), so keep it short instead of duplicating the full reply. Only valid during an active WeCom turn.",
+      parameters: {
+        card_type: {
+          type: "string",
+          required: true,
+          enum: ["text_notice", "news_notice", "button_interaction"],
+          description: "Card layout: text_notice (title + subtitle), news_notice (image card, needs image_url), button_interaction (buttons the user can click; clicks come back as WeCom messages carrying task_id and event_key)."
+        },
+        title: {
+          type: "string",
+          required: true,
+          description: "Card main title; capped at 26 characters, longer text is truncated."
+        },
+        desc: {
+          type: "string",
+          description: "Short helper text under the title; capped at 30 characters."
+        },
+        subtitle: {
+          type: "string",
+          description: "Secondary body text; capped at 112 characters."
+        },
+        buttons: {
+          type: "array",
+          items: {
+            type: "object",
+            additionalProperties: false,
+            properties: {
+              text: { type: "string", required: true, description: "Button label, capped at 10 characters." },
+              key: { type: "string", required: true, description: "Stable key echoed back on click (event_key), max 1024 bytes." },
+              style: { type: "integer", description: "Button style 1-4; defaults to 1." }
+            }
+          },
+          description: "Buttons for button_interaction cards; 1 to 6 entries."
+        },
+        image_url: {
+          type: "string",
+          description: "Image URL for news_notice cards (required for that card type)."
+        },
+        jump_url: {
+          type: "string",
+          description: "Whole-card click URL for news_notice cards."
+        },
+        task_id: {
+          type: "string",
+          description: 'Task id identifying this card (digits, letters, "_-@", max 128 bytes). Omit to auto-generate.'
+        }
+      },
+      output: {
+        schema: {
+          type: "object",
+          additionalProperties: false,
+          properties: {
+            task_id: { type: "string", required: true },
+            card_type: { type: "string", required: true },
+            title: { type: "string", required: true },
+            buttons: { type: "array", items: { type: "json" } }
+          }
+        },
+        render: (_args, value) => [{
+          type: "text",
+          text: `Queued WeCom ${value.card_type} card ${JSON.stringify(value.task_id)}; it will be delivered after this reply.`
+        }]
+      },
+      execute: async (args, exec) => {
+        const target = this.activeTurns.get(id);
+        if (target === void 0) {
+          throw new Error("wecom_send_card: no active WeCom turn; this tool cannot send cards from another channel");
+        }
+        if (this.config.cardMode === "off") {
+          throw new Error('wecom_send_card: cardMode is "off"; cards are disabled for this WeCom channel');
+        }
+        exec.signal.throwIfAborted();
+        const input = {
+          cardType: args.card_type,
+          title: args.title,
+          ...args.desc === void 0 ? {} : { desc: args.desc },
+          ...args.subtitle === void 0 ? {} : { subtitle: args.subtitle },
+          ...args.buttons === void 0 ? {} : { buttons: args.buttons },
+          ...args.image_url === void 0 ? {} : { imageUrl: args.image_url },
+          ...args.jump_url === void 0 ? {} : { jumpUrl: args.jump_url },
+          ...args.task_id === void 0 ? {} : { taskId: args.task_id }
+        };
+        const card = buildTemplateCard(input, this.config.cardTaskIdPrefix);
+        const cards = this.pendingCards.get(id) ?? [];
+        cards.push(card);
+        this.pendingCards.set(id, cards);
+        return {
+          task_id: card.task_id ?? "",
+          card_type: card.card_type,
+          title: card.main_title?.title ?? "",
+          buttons: (card.button_list ?? []).map((button) => ({
+            text: button.text,
+            key: button.key,
+            style: button.style ?? 1
+          }))
+        };
+      },
+      presentCall: (args) => ({
+        card: "generic",
+        title: `Send ${args.card_type} card`,
+        kind: "execute",
+        rawInput: args.title
+      })
+    }));
+  }
   async collectReply(agent, events) {
     const texts = [];
     const images = [];
@@ -620,7 +922,7 @@ var WeComHarnessBridge = class {
         `wecom-channel: inboundFileDirectory must be absolute, got ${JSON.stringify(config.inboundFileDirectory)}`
       );
     }
-    this.log = ctx.logger("deepseek-harness-wecom");
+    this.log = ctx.logger("deepseek-harness-wecom-plus");
     this.conversations = new ConversationManager(ctx, config, (target, file) => this.sendLocalFile(target, file));
     this.seen = new SeenMessageIds(config.maxSeenMessageIds);
     this.allowedHarnessCommands = new Set(config.allowedHarnessCommands);
@@ -685,6 +987,7 @@ var WeComHarnessBridge = class {
     });
     client.on("message", async (frame) => this.handleMessage(frame));
     client.on("event.enter_chat", async (frame) => this.handleWelcome(frame));
+    client.on("event.template_card_event", async (frame) => this.handleCardEvent(frame));
     try {
       client.connect();
       await withTimeout(ready.promise, this.config.startupTimeoutMs, "WeCom authentication");
@@ -718,7 +1021,7 @@ var WeComHarnessBridge = class {
       maxReconnectAttempts: this.config.maxReconnectAttempts,
       maxAuthFailureAttempts: this.config.maxAuthFailureAttempts,
       requestTimeout: this.config.sendTimeoutMs,
-      plug_version: "deepseek-harness-wecom/0.1.4"
+      plug_version: "deepseek-harness-wecom-plus/0.2.0"
     });
   }
   async handleWelcome(frame) {
@@ -736,31 +1039,94 @@ var WeComHarnessBridge = class {
       this.log.error("WeCom welcome reply failed: %s", String(error));
     }
   }
+  /**
+   * One template card button click: acknowledge the click locally inside the
+   * protocol's 5-second update window, then hand the click to the conversation
+   * as a user message and push the model's reply proactively.
+   */
+  async handleCardEvent(frame) {
+    const body = frame.body;
+    if (body === void 0 || this.seen.hasOrAdd(body.msgid) || !this.allowedEvent(body)) return;
+    const taskId = body.event.task_id?.trim();
+    if (taskId !== void 0 && taskId.length > 0) {
+      try {
+        await withTimeout(this.requireClient().updateTemplateCard(frame, {
+          card_type: "text_notice",
+          main_title: {
+            title: truncateChars(this.config.cardClickAckTitle, CARD_LIMITS.title),
+            desc: truncateChars(this.config.cardClickAckSubtitle, CARD_LIMITS.titleDesc)
+          },
+          task_id: taskId
+        }, [body.from.userid]), 4500, "WeCom card click acknowledgement");
+      } catch (error) {
+        this.log.warn("WeCom card click acknowledgement failed: %s", String(error));
+      }
+    }
+    try {
+      const reply = await this.conversations.processCardEvent(body);
+      await this.sendProactive(chatTarget(body), reply);
+    } catch (error) {
+      this.log.error("WeCom card click %s failed: %s", body.msgid, String(error));
+      try {
+        await this.sendProactive(chatTarget(body), {
+          text: "\u5904\u7406\u6309\u94AE\u70B9\u51FB\u65F6\u53D1\u751F\u9519\u8BEF\uFF0C\u8BF7\u7A0D\u540E\u91CD\u8BD5\u3002",
+          images: [],
+          cards: []
+        });
+      } catch (sendError) {
+        this.log.error("WeCom card click error reply failed: %s", String(sendError));
+      }
+    }
+  }
   async handleMessage(frame) {
     const message = frame.body;
     if (message === void 0 || this.seen.hasOrAdd(message.msgid) || !this.allowed(message)) return;
     try {
       const command = slashCommand(message);
       if (command?.name === "bot-ping") {
-        await this.sendReply(frame, { text: "pong \u2014 DeepSeek Harness \u4F01\u5FAE\u673A\u5668\u4EBA\u5DF2\u8FDE\u63A5\u3002", images: [] });
+        await this.sendReply(frame, { text: "pong \u2014 DeepSeek Harness \u4F01\u5FAE\u673A\u5668\u4EBA\u5DF2\u8FDE\u63A5\u3002", images: [], cards: [] });
         return;
       }
       if (command?.name === "help" || command?.name === "bot-help") {
-        await this.sendReply(frame, { text: this.helpText(), images: [] });
+        await this.sendReply(frame, { text: this.helpText(), images: [], cards: [] });
         return;
       }
       if (command?.name === "new" || command?.name === "reset") {
         await this.conversations.reset(message);
         await this.sendReply(frame, {
           text: "\u5DF2\u5F00\u542F\u65B0\u5BF9\u8BDD\u3002\u4E0B\u4E00\u6761\u6D88\u606F\u4F1A\u4F7F\u7528\u5168\u65B0\u7684 Harness \u4E0A\u4E0B\u6587\uFF0C\u65E7\u4F1A\u8BDD\u5386\u53F2\u4ECD\u4FDD\u7559\u5728\u7F51\u9875\u7AEF\u3002",
-          images: []
+          images: [],
+          cards: []
         });
         return;
       }
       if (command?.name === "bot-image-test") {
         await this.sendReply(frame, {
           text: "\u84DD\u8272\u6D4B\u8BD5\u56FE\u7247\u53D1\u9001\u6210\u529F\u3002",
-          images: [{ data: OUTBOUND_TEST_PNG, mediaType: "image/png", name: "wecom-image-test.png" }]
+          images: [{ data: OUTBOUND_TEST_PNG, mediaType: "image/png", name: "wecom-image-test.png" }],
+          cards: []
+        });
+        return;
+      }
+      if (command?.name === "bot-card-test") {
+        const card = buildTemplateCard({
+          cardType: "button_interaction",
+          title: "\u6A21\u677F\u5361\u7247\u6D4B\u8BD5",
+          subtitle: "\u70B9\u51FB\u4E0B\u65B9\u6309\u94AE\u9A8C\u8BC1\u5361\u7247\u4EA4\u4E92\u94FE\u8DEF\u3002",
+          buttons: [
+            { text: "\u786E\u8BA4\u6536\u5230", key: "bot-card-test-ok", style: 1 },
+            { text: "\u518D\u60F3\u60F3", key: "bot-card-test-retry", style: 2 }
+          ]
+        }, this.config.cardTaskIdPrefix);
+        await this.retry(async () => withTimeout(
+          this.requireClient().sendMessage(chatTarget(message), { msgtype: "template_card", template_card: card }),
+          this.config.sendTimeoutMs,
+          "WeCom card test send"
+        ));
+        await this.sendReply(frame, {
+          text: "\u6A21\u677F\u5361\u7247\u5DF2\u53D1\u9001\u3002\u70B9\u51FB\u5361\u7247\u6309\u94AE\u540E\uFF0C\u4F60\u4F1A\u5148\u770B\u5230\u5904\u7406\u786E\u8BA4\uFF0C\u968F\u540E\u6536\u5230\u6A21\u578B\u56DE\u590D\u3002",
+          images: [],
+          cards: []
         });
         return;
       }
@@ -772,28 +1138,31 @@ var WeComHarnessBridge = class {
           "wecom-file-test.txt",
           "WeCom file"
         );
-        await this.sendReply(frame, { text: "\u6587\u672C\u9644\u4EF6\u53D1\u9001\u6210\u529F\u3002", images: [] });
+        await this.sendReply(frame, { text: "\u6587\u672C\u9644\u4EF6\u53D1\u9001\u6210\u529F\u3002", images: [], cards: [] });
         return;
       }
       if (command?.name === "bot-cancel") {
         const cancelled = this.conversations.cancel(message);
         await this.sendReply(frame, {
           text: cancelled ? "\u5DF2\u8BF7\u6C42\u53D6\u6D88\u5F53\u524D\u751F\u6210\u3002" : "\u5F53\u524D\u6CA1\u6709\u6B63\u5728\u751F\u6210\u7684\u56DE\u590D\u3002",
-          images: []
+          images: [],
+          cards: []
         });
         return;
       }
       if (command?.name === "bot-status") {
         await this.sendReply(frame, {
           text: "\u4F01\u5FAE\u957F\u8FDE\u63A5\u6B63\u5E38\uFF0CDeepSeek Harness \u4F1A\u8BDD\u6309\u5355\u804A/\u7FA4\u804A\u72EC\u7ACB\u6301\u4E45\u5316\u3002",
-          images: []
+          images: [],
+          cards: []
         });
         return;
       }
       if (command?.name === "export") {
         await this.sendReply(frame, {
           text: "/export \u4F9D\u8D56\u7F51\u9875\u4E0B\u8F7D\u754C\u9762\uFF0C\u4F01\u5FAE\u6682\u4E0D\u652F\u6301\u3002\u4F1A\u8BDD\u5185\u5BB9\u6CA1\u6709\u53D1\u9001\u7ED9\u6A21\u578B\u3002",
-          images: []
+          images: [],
+          cards: []
         });
         return;
       }
@@ -805,7 +1174,8 @@ var WeComHarnessBridge = class {
       if (command !== void 0) {
         await this.sendReply(frame, {
           text: `\u672A\u77E5\u6216\u672A\u5F00\u653E\u7684\u547D\u4EE4 /${command.name}\u3002\u8BE5\u5185\u5BB9\u6CA1\u6709\u53D1\u9001\u7ED9\u6A21\u578B\uFF1B\u53D1\u9001 /help \u67E5\u770B\u53EF\u7528\u547D\u4EE4\u3002`,
-          images: []
+          images: [],
+          cards: []
         });
         return;
       }
@@ -814,7 +1184,7 @@ var WeComHarnessBridge = class {
     } catch (error) {
       this.log.error("WeCom message %s failed: %s", message.msgid, String(error));
       try {
-        await this.sendReply(frame, { text: "\u5904\u7406\u6D88\u606F\u65F6\u53D1\u751F\u9519\u8BEF\uFF0C\u8BF7\u7A0D\u540E\u91CD\u8BD5\u3002", images: [] });
+        await this.sendReply(frame, { text: "\u5904\u7406\u6D88\u606F\u65F6\u53D1\u751F\u9519\u8BEF\uFF0C\u8BF7\u7A0D\u540E\u91CD\u8BD5\u3002", images: [], cards: [] });
       } catch (sendError) {
         this.log.error("WeCom error reply failed: %s", String(sendError));
       }
@@ -829,6 +1199,7 @@ var WeComHarnessBridge = class {
       "/help\u3001/bot-help \u2014 \u663E\u793A\u672C\u5E2E\u52A9",
       "/bot-ping \u2014 \u68C0\u67E5\u8FDE\u901A\u6027",
       "/bot-image-test \u2014 \u53D1\u9001\u4E00\u5F20\u84DD\u8272\u56FE\u7247\uFF0C\u68C0\u67E5\u56FE\u7247\u51FA\u7AD9\u94FE\u8DEF",
+      "/bot-card-test \u2014 \u53D1\u9001\u4E00\u5F20\u6309\u94AE\u4EA4\u4E92\u6A21\u677F\u5361\u7247\uFF0C\u68C0\u67E5\u5361\u7247\u4E0E\u6309\u94AE\u70B9\u51FB\u94FE\u8DEF",
       "/bot-file-test \u2014 \u53D1\u9001\u4E00\u4E2A\u6587\u672C\u9644\u4EF6\uFF0C\u68C0\u67E5\u6587\u4EF6\u51FA\u7AD9\u94FE\u8DEF",
       "/bot-status \u2014 \u67E5\u770B\u5F53\u524D\u4F1A\u8BDD\u72B6\u6001",
       "/bot-cancel \u2014 \u53D6\u6D88\u5F53\u524D\u751F\u6210",
@@ -840,7 +1211,8 @@ var WeComHarnessBridge = class {
     if (outcome.execution === void 0) {
       return {
         text: `\u5F53\u524D\u4F1A\u8BDD\u7684 agent preset \u6CA1\u6709\u6CE8\u518C /${name2}\u3002\u8BE5\u5185\u5BB9\u6CA1\u6709\u53D1\u9001\u7ED9\u6A21\u578B\u3002`,
-        images: []
+        images: [],
+        cards: []
       };
     }
     const direct = outcome.execution.result.text?.trim() || (outcome.execution.result.kind === "success" ? `/${name2} \u5DF2\u6267\u884C\u3002` : `/${name2} \u6267\u884C\u5931\u8D25\u3002`);
@@ -849,15 +1221,23 @@ var WeComHarnessBridge = class {
 ${outcome.response.text}` : direct;
     return {
       text,
-      images: outcome.response?.images ?? []
+      images: outcome.response?.images ?? [],
+      cards: outcome.response?.cards ?? []
     };
   }
   allowed(message) {
     const group = message.chattype === "group";
+    return this.allowedScope(group, message.from.userid);
+  }
+  /** Access policy check for an event frame (its chattype is optional). */
+  allowedEvent(message) {
+    return this.allowedScope(message.chattype === "group", message.from.userid);
+  }
+  allowedScope(group, userid) {
     const policy = group ? this.config.groupPolicy : this.config.singlePolicy;
     const allow = group ? this.config.groupAllowFrom : this.config.singleAllowFrom;
     if (policy === "disabled") return false;
-    return policy === "open" || allow.includes(message.from.userid);
+    return policy === "open" || allow.includes(userid);
   }
   async sendReply(frame, reply) {
     const message = frame.body;
@@ -885,6 +1265,41 @@ ${outcome.response.text}` : direct;
     for (const image of active) {
       const filename = image.name?.trim() || imageFilename(image.mediaType);
       await this.sendMedia(chatTarget(message), Buffer.from(image.data), "image", filename, "WeCom image");
+    }
+    await this.sendCards(chatTarget(message), reply.cards);
+  }
+  /**
+   * Proactive outbound path for turns without a respondable frame (template
+   * card button clicks): one Markdown message, media uploads, then cards.
+   */
+  async sendProactive(target, reply) {
+    const fallback = reply.images.length > 0 ? "\u56FE\u7247\u56DE\u590D" : "\u5904\u7406\u5B8C\u6210\u3002";
+    await this.retry(async () => withTimeout(
+      this.requireClient().sendMessage(target, {
+        msgtype: "markdown",
+        markdown: { content: truncateUtf8(reply.text || fallback, this.config.maxReplyBytes) }
+      }),
+      this.config.sendTimeoutMs,
+      "WeCom proactive Markdown send"
+    ));
+    for (const image of reply.images) {
+      const filename = image.name?.trim() || imageFilename(image.mediaType);
+      await this.sendMedia(target, Buffer.from(image.data), "image", filename, "WeCom image");
+    }
+    await this.sendCards(target, reply.cards);
+  }
+  /** Deliver queued template cards as follow-up messages; failures only log, never retract the reply. */
+  async sendCards(target, cards) {
+    for (const card of cards) {
+      try {
+        await this.retry(async () => withTimeout(
+          this.requireClient().sendMessage(target, { msgtype: "template_card", template_card: card }),
+          this.config.sendTimeoutMs,
+          "WeCom template card send"
+        ));
+      } catch (error) {
+        this.log.error("WeCom template card send failed: %s", String(error));
+      }
     }
   }
   async sendLocalFile(target, file) {
@@ -958,7 +1373,7 @@ import z from "@deepseek-ai/schemastery";
 var WECOM_FILE_MAX_BYTES = 20 * 1024 * 1024;
 var DEFAULT_WECOM_INBOUND_FILE_DIRECTORY = join2(
   tmpdir(),
-  `deepseek-harness-wecom-${typeof process.getuid === "function" ? process.getuid() : "current-user"}`,
+  `deepseek-harness-wecom-plus-${typeof process.getuid === "function" ? process.getuid() : "current-user"}`,
   "inbound"
 );
 var COMMAND_NAME_PATTERN = /^[a-z][a-z0-9_-]*$/u;
@@ -976,6 +1391,10 @@ var Config = z.object({
   groupAllowFrom: z.array(z.string()).default([]),
   allowedHarnessCommands: z.array(z.string().pattern(COMMAND_NAME_PATTERN)).default(["compact", "goal", "plan"]),
   imageInputMode: z.union(["auto", "always", "never"]).default("auto"),
+  cardMode: z.union(["auto", "tool", "off"]).default("auto"),
+  cardTaskIdPrefix: z.string().default("dshp"),
+  cardClickAckTitle: z.string().default("\u6B63\u5728\u5904\u7406\u2026"),
+  cardClickAckSubtitle: z.string().default("\u5DF2\u6536\u5230\u6309\u94AE\u70B9\u51FB\uFF0C\u6B63\u5728\u5904\u7406\uFF0C\u8BF7\u7A0D\u5019\u3002"),
   inboundFileDirectory: z.string().default(DEFAULT_WECOM_INBOUND_FILE_DIRECTORY),
   welcomeText: z.string().default(""),
   startupTimeoutMs: z.number().step(1).min(1).default(3e4),
@@ -991,12 +1410,12 @@ var Config = z.object({
   maxInboundFileBytes: z.number().step(1).min(1).max(WECOM_FILE_MAX_BYTES).default(WECOM_FILE_MAX_BYTES),
   maxOutboundFileBytes: z.number().step(1).min(1).max(WECOM_FILE_MAX_BYTES).default(WECOM_FILE_MAX_BYTES),
   systemPrompt: z.string().default(
-    "You are replying through WeCom. Keep replies clear and suitable for enterprise chat. Use WeCom-compatible Markdown for headings, lists, links, emphasis, quotes, and code when structure helps. When the WeCom user asks to receive an existing workspace file, use wecom_send_file instead of claiming that file attachments are unavailable or pasting the whole file. Inbound WeCom files are already downloaded and decrypted; their absolute local paths appear in the user message. Use the available file or shell tools to inspect those paths when the user asks you to process an attachment. Do not reveal credentials or internal system data. When a request needs an interactive approval that WeCom cannot provide, explain what approval is needed instead of waiting indefinitely."
+    "You are replying through WeCom. Keep replies clear and suitable for enterprise chat. Use WeCom-compatible Markdown for headings, lists, links, emphasis, quotes, and code when structure helps. When the WeCom user asks to receive an existing workspace file, use wecom_send_file instead of claiming that file attachments are unavailable or pasting the whole file. When the reply benefits from a condensed summary or selectable choices, call wecom_send_card: the card is delivered as a second message right after your Markdown reply (one turn \u2192 one Markdown message + one card). Keep card text short \u2014 the title is capped at 26 characters, the subtitle at 112, and button text at 10 \u2014 and never duplicate the whole reply inside the card. When a user clicks a card button, the click arrives as a WeCom message containing its task_id and event_key; answer that click in your reply. Inbound WeCom files are already downloaded and decrypted; their absolute local paths appear in the user message. Use the available file or shell tools to inspect those paths when the user asks you to process an attachment. Do not reveal credentials or internal system data. When a request needs an interactive approval that WeCom cannot provide, explain what approval is needed instead of waiting indefinitely."
   )
 });
 
 // src/index.ts
-var name = "deepseek-harness-wecom";
+var name = "deepseek-harness-wecom-plus";
 var inject = [
   "agentDefaultModel",
   "agentPresets",

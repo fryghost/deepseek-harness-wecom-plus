@@ -35,7 +35,18 @@ describe('resolveOutboundFile', () => {
     const secret = join(parent, 'secret.txt')
     await mkdir(workspace)
     await writeFile(secret, 'secret')
-    await symlink(secret, join(workspace, 'link.txt'))
+    try {
+      await symlink(secret, join(workspace, 'link.txt'))
+    } catch (error) {
+      // Windows without Developer Mode denies symlink creation (EPERM);
+      // the traversal half of this test still runs everywhere.
+      if (typeof error === 'object' && error !== null && 'code' in error
+        && (error.code === 'EPERM' || error.code === 'EACCES')) {
+        await expect(resolveOutboundFile(workspace, '../secret.txt', 100)).rejects.toThrow('outside configured cwd')
+        return
+      }
+      throw error
+    }
 
     await expect(resolveOutboundFile(workspace, '../secret.txt', 100)).rejects.toThrow('outside configured cwd')
     await expect(resolveOutboundFile(workspace, 'link.txt', 100)).rejects.toThrow('outside configured cwd')

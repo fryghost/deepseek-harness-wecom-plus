@@ -8,7 +8,13 @@ import { SessionId, type SessionEvent } from '@deepseek-ai/dsh-session'
 import type {} from '@deepseek-ai/dsh-session-persistence'
 import type {} from '@deepseek-ai/dsh-system-prompt'
 import { defineTool } from '@deepseek-ai/dsh-tools'
-import type { BaseMessage } from '@wecom/aibot-node-sdk'
+import type {
+  BaseMessage,
+  EventMessageWith,
+  TemplateCard,
+  TemplateCardEventData,
+} from '@wecom/aibot-node-sdk'
+import { buildTemplateCard, deriveSummaryCard, type CardInput } from './card.js'
 import type { Config } from './config.js'
 import { inboundContent, type WeComDownloadPort } from './inbound.js'
 import { resolveOutboundFile, type OutboundFile } from './outbound-file.js'
@@ -18,6 +24,8 @@ import { chatTarget, sessionIdFor, withTimeout } from './util.js'
 export interface ConversationReply {
   text: string
   images: Array<{ data: Uint8Array; mediaType: string; name?: string }>
+  /** Template cards queued by the model, delivered after the Markdown reply. */
+  cards: TemplateCard[]
 }
 
 /** Direct command outcome plus any model reply triggered by that command. */
@@ -41,6 +49,7 @@ export class ConversationManager {
   private readonly creations = new Map<string, Promise<ConversationAgentBinding>>()
   private readonly queues = new Map<string, Promise<unknown>>()
   private readonly activeTurns = new Map<string, string>()
+  private readonly pendingCards = new Map<string, TemplateCard[]>()
   private readonly generations = new Map<string, number>()
   private persistedIds = new Set<string>()
 
@@ -62,12 +71,19 @@ export class ConversationManager {
     return this.enqueue(baseId, () => this.processNow(this.currentSessionId(baseId), message, client))
   }
 
+  /** Process one template card button click as a user message into the same conversation. */
+  processCardEvent(message: EventMessageWith<TemplateCardEventData>): Promise<ConversationReply> {
+    const baseId = sessionIdFor(this.config.accountId, message)
+    return this.enqueue(baseId, () => this.processCardEventNow(this.currentSessionId(baseId), message))
+  }
+
   /** End the current WeCom conversation session while retaining its history. */
   async reset(message: BaseMessage): Promise<void> {
     const baseId = sessionIdFor(this.config.accountId, message)
     this.cancel(message)
     await this.enqueue(baseId, async () => {
       const id = this.currentSessionId(baseId)
+      this.pendingCards.delete(id)
       const binding = this.bindings.get(id)
       if (binding !== undefined) {
         this.bindings.delete(id)
@@ -100,12 +116,15 @@ export class ConversationManager {
       this.activeTurns.set(id, chatTarget(message))
       try {
         const execution = await this.ctx.commands.execute(agent, line, controller.signal)
-        if (execution === undefined) return { execution, response: undefined }
+        if (execution === undefined) {
+          this.takeCards(id)
+          return { execution, response: undefined }
+        }
         await withTimeout(agent.whenIdle(), this.config.responseTimeoutMs, 'DeepSeek Harness command response')
         const events = agent.session.events.slice(start)
         const response = events.some(event => event.type === 'assistant/message')
-          ? await this.collectReply(agent, events)
-          : undefined
+          ? this.finalizeReply(id, await this.collectReply(agent, events))
+          : (this.takeCards(id), undefined)
         return { execution, response }
       } finally {
         clearTimeout(timer)
@@ -130,6 +149,7 @@ export class ConversationManager {
     await Promise.allSettled([...this.bindings.values()].map(binding => binding.release()))
     this.bindings.clear()
     this.activeTurns.clear()
+    this.pendingCards.clear()
   }
 
   private enqueue<T>(baseId: string, operation: () => Promise<T>): Promise<T> {
@@ -177,10 +197,63 @@ export class ConversationManager {
     try {
       agent.followup(createUserMessage({ content, source: { kind: 'user' } }))
       await withTimeout(agent.whenIdle(), this.config.responseTimeoutMs, 'DeepSeek Harness response')
-      return await this.collectReply(agent, agent.session.events.slice(start))
+      const collected = await this.collectReply(agent, agent.session.events.slice(start))
+      return this.finalizeReply(id, collected)
     } finally {
       this.activeTurns.delete(id)
     }
+  }
+
+  private async processCardEventNow(
+    id: string,
+    message: EventMessageWith<TemplateCardEventData>,
+  ): Promise<ConversationReply> {
+    const binding = await this.getOrCreate(id)
+    const agent = binding.agent
+    const scope = message.chattype === 'group' ? 'WeCom group' : 'WeCom private chat'
+    const taskId = message.event.task_id?.trim() || '（无）'
+    const eventKey = message.event.event_key?.trim() || '（无）'
+    const content = [{
+      type: 'text' as const,
+      text: [
+        `[${scope} template card button click from WeCom user ${message.from.userid}]`,
+        `task_id: ${taskId}`,
+        `event_key: ${eventKey}`,
+        'The user clicked a button on a WeCom template card you sent earlier. Answer the click in your reply.',
+      ].join('\n'),
+    }]
+    await withTimeout(agent.whenIdle(), this.config.responseTimeoutMs, 'DeepSeek Harness conversation availability')
+    const start = agent.session.events.length
+    this.activeTurns.set(id, chatTarget(message))
+    try {
+      agent.followup(createUserMessage({ content, source: { kind: 'user' } }))
+      await withTimeout(agent.whenIdle(), this.config.responseTimeoutMs, 'DeepSeek Harness response')
+      const collected = await this.collectReply(agent, agent.session.events.slice(start))
+      return this.finalizeReply(id, collected)
+    } finally {
+      this.activeTurns.delete(id)
+    }
+  }
+
+  /**
+   * Attach the turn's queued cards to a collected reply. In "auto" mode a
+   * derived text_notice summary card accompanies the Markdown reply whenever
+   * the model did not send an explicit card first.
+   */
+  private finalizeReply(id: string, collected: Omit<ConversationReply, 'cards'>): ConversationReply {
+    const cards = this.takeCards(id)
+    if (this.config.cardMode === 'auto' && cards.length === 0 && collected.text.trim().length > 0) {
+      const derived = deriveSummaryCard(collected.text, this.config.cardTaskIdPrefix)
+      if (derived !== undefined) cards.push(derived)
+    }
+    return { ...collected, cards }
+  }
+
+  /** Drain and clear the template cards queued by one active turn's tools. */
+  private takeCards(id: string): TemplateCard[] {
+    const cards = this.pendingCards.get(id) ?? []
+    this.pendingCards.delete(id)
+    return cards
   }
 
   private async includeImages(agent: Agent): Promise<boolean> {
@@ -260,14 +333,16 @@ export class ConversationManager {
 
   private borrowAgent(agent: Agent, id: string): ConversationAgentBinding {
     const disposeInstructions = this.registerWeComInstructions(agent.ctx, id)
-    const disposeTool = this.registerFileTool(agent.ctx, id)
+    const disposeFileTool = this.registerFileTool(agent.ctx, id)
+    const disposeCardTool = this.registerCardTool(agent.ctx, id)
     let released = false
     return {
       agent,
       release: async () => {
         if (released) return
         released = true
-        disposeTool()
+        disposeCardTool()
+        disposeFileTool()
         disposeInstructions()
       },
     }
@@ -281,6 +356,7 @@ export class ConversationManager {
     await this.ctx.agentPresets.mount(agentCtx, agentPreset)
     this.registerWeComInstructions(agentCtx, id)
     this.registerFileTool(agentCtx, id)
+    this.registerCardTool(agentCtx, id)
   }
 
   private registerWeComInstructions(agentCtx: Context, id: string): () => void {
@@ -339,7 +415,122 @@ export class ConversationManager {
     }))
   }
 
-  private async collectReply(agent: Agent, events: readonly SessionEvent[]): Promise<ConversationReply> {
+  private registerCardTool(agentCtx: Context, id: string): () => void {
+    return agentCtx.tools.register(defineTool({
+      name: 'wecom_send_card',
+      description: 'Send one WeCom template card to the user who initiated the current WeCom turn. '
+        + 'The card is delivered as a second message right after the main Markdown reply, so one turn becomes '
+        + 'one Markdown message plus one card. Use it for condensed summaries or selectable choices '
+        + '(button_interaction). Display text is truncated to the WeCom card limits (title 26, desc 30, '
+        + 'subtitle 112, button text 10 characters), so keep it short instead of duplicating the full reply. '
+        + 'Only valid during an active WeCom turn.',
+      parameters: {
+        card_type: {
+          type: 'string',
+          required: true,
+          enum: ['text_notice', 'news_notice', 'button_interaction'],
+          description: 'Card layout: text_notice (title + subtitle), news_notice (image card, needs image_url), '
+            + 'button_interaction (buttons the user can click; clicks come back as WeCom messages carrying task_id and event_key).',
+        },
+        title: {
+          type: 'string',
+          required: true,
+          description: 'Card main title; capped at 26 characters, longer text is truncated.',
+        },
+        desc: {
+          type: 'string',
+          description: 'Short helper text under the title; capped at 30 characters.',
+        },
+        subtitle: {
+          type: 'string',
+          description: 'Secondary body text; capped at 112 characters.',
+        },
+        buttons: {
+          type: 'array',
+          items: {
+            type: 'object',
+            additionalProperties: false,
+            properties: {
+              text: { type: 'string', required: true, description: 'Button label, capped at 10 characters.' },
+              key: { type: 'string', required: true, description: 'Stable key echoed back on click (event_key), max 1024 bytes.' },
+              style: { type: 'integer', description: 'Button style 1-4; defaults to 1.' },
+            },
+          },
+          description: 'Buttons for button_interaction cards; 1 to 6 entries.',
+        },
+        image_url: {
+          type: 'string',
+          description: 'Image URL for news_notice cards (required for that card type).',
+        },
+        jump_url: {
+          type: 'string',
+          description: 'Whole-card click URL for news_notice cards.',
+        },
+        task_id: {
+          type: 'string',
+          description: 'Task id identifying this card (digits, letters, "_-@", max 128 bytes). Omit to auto-generate.',
+        },
+      },
+      output: {
+        schema: {
+          type: 'object',
+          additionalProperties: false,
+          properties: {
+            task_id: { type: 'string', required: true },
+            card_type: { type: 'string', required: true },
+            title: { type: 'string', required: true },
+            buttons: { type: 'array', items: { type: 'json' } },
+          },
+        },
+        render: (_args, value) => [{
+          type: 'text',
+          text: `Queued WeCom ${value.card_type} card ${JSON.stringify(value.task_id)}; it will be delivered after this reply.`,
+        }],
+      },
+      execute: async (args, exec) => {
+        const target = this.activeTurns.get(id)
+        if (target === undefined) {
+          throw new Error('wecom_send_card: no active WeCom turn; this tool cannot send cards from another channel')
+        }
+        if (this.config.cardMode === 'off') {
+          throw new Error('wecom_send_card: cardMode is "off"; cards are disabled for this WeCom channel')
+        }
+        exec.signal.throwIfAborted()
+        const input: CardInput = {
+          cardType: args.card_type,
+          title: args.title,
+          ...(args.desc === undefined ? {} : { desc: args.desc }),
+          ...(args.subtitle === undefined ? {} : { subtitle: args.subtitle }),
+          ...(args.buttons === undefined ? {} : { buttons: args.buttons as Exclude<CardInput['buttons'], undefined> }),
+          ...(args.image_url === undefined ? {} : { imageUrl: args.image_url }),
+          ...(args.jump_url === undefined ? {} : { jumpUrl: args.jump_url }),
+          ...(args.task_id === undefined ? {} : { taskId: args.task_id }),
+        }
+        const card = buildTemplateCard(input, this.config.cardTaskIdPrefix)
+        const cards = this.pendingCards.get(id) ?? []
+        cards.push(card)
+        this.pendingCards.set(id, cards)
+        return {
+          task_id: card.task_id ?? '',
+          card_type: card.card_type,
+          title: card.main_title?.title ?? '',
+          buttons: (card.button_list ?? []).map(button => ({
+            text: button.text,
+            key: button.key,
+            style: button.style ?? 1,
+          })),
+        }
+      },
+      presentCall: args => ({
+        card: 'generic',
+        title: `Send ${args.card_type} card`,
+        kind: 'execute',
+        rawInput: args.title,
+      }),
+    }))
+  }
+
+  private async collectReply(agent: Agent, events: readonly SessionEvent[]): Promise<Omit<ConversationReply, 'cards'>> {
     const texts: string[] = []
     const images: ConversationReply['images'] = []
     for (const event of events) {

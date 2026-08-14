@@ -8,7 +8,7 @@ export const WECOM_FILE_MAX_BYTES = 20 * 1024 * 1024
 /** Default storage outside the agent workspace for decrypted inbound files. */
 export const DEFAULT_WECOM_INBOUND_FILE_DIRECTORY = join(
   tmpdir(),
-  `deepseek-harness-wecom-${typeof process.getuid === 'function' ? process.getuid() : 'current-user'}`,
+  `deepseek-harness-wecom-plus-${typeof process.getuid === 'function' ? process.getuid() : 'current-user'}`,
   'inbound',
 )
 
@@ -17,6 +17,15 @@ export type AccessMode = 'open' | 'allowlist' | 'disabled'
 
 /** How inbound WeCom images are presented to the selected Harness model. */
 export type ImageInputMode = 'auto' | 'always' | 'never'
+
+/**
+ * How template cards accompany model replies.
+ * - "auto": every model turn sends one Markdown message plus one derived
+ *   text_notice summary card, unless the model sent an explicit card first.
+ * - "tool": cards are only sent when the model calls `wecom_send_card`.
+ * - "off": no cards; `wecom_send_card` fails with a teaching error.
+ */
+export type CardMode = 'auto' | 'tool' | 'off'
 
 const COMMAND_NAME_PATTERN = /^[a-z][a-z0-9_-]*$/u
 
@@ -35,6 +44,10 @@ export interface Config {
   groupAllowFrom: string[]
   allowedHarnessCommands: string[]
   imageInputMode: ImageInputMode
+  cardMode: CardMode
+  cardTaskIdPrefix: string
+  cardClickAckTitle: string
+  cardClickAckSubtitle: string
   inboundFileDirectory: string
   welcomeText: string
   startupTimeoutMs: number
@@ -67,6 +80,10 @@ export const Config: z<Config> = z.object({
   groupAllowFrom: z.array(z.string()).default([]),
   allowedHarnessCommands: z.array(z.string().pattern(COMMAND_NAME_PATTERN)).default(['compact', 'goal', 'plan']),
   imageInputMode: z.union(['auto', 'always', 'never']).default('auto'),
+  cardMode: z.union(['auto', 'tool', 'off']).default('auto'),
+  cardTaskIdPrefix: z.string().default('dshp'),
+  cardClickAckTitle: z.string().default('正在处理…'),
+  cardClickAckSubtitle: z.string().default('已收到按钮点击，正在处理，请稍候。'),
   inboundFileDirectory: z.string().default(DEFAULT_WECOM_INBOUND_FILE_DIRECTORY),
   welcomeText: z.string().default(''),
   startupTimeoutMs: z.number().step(1).min(1).default(30_000),
@@ -86,6 +103,12 @@ export const Config: z<Config> = z.object({
     + 'Use WeCom-compatible Markdown for headings, lists, links, emphasis, quotes, and code when structure helps. '
     + 'When the WeCom user asks to receive an existing workspace file, use wecom_send_file instead of '
     + 'claiming that file attachments are unavailable or pasting the whole file. '
+    + 'When the reply benefits from a condensed summary or selectable choices, call wecom_send_card: '
+    + 'the card is delivered as a second message right after your Markdown reply (one turn → one Markdown '
+    + 'message + one card). Keep card text short — the title is capped at 26 characters, the subtitle at 112, '
+    + 'and button text at 10 — and never duplicate the whole reply inside the card. When a user clicks a card '
+    + 'button, the click arrives as a WeCom message containing its task_id and event_key; answer that click '
+    + 'in your reply. '
     + 'Inbound WeCom files are already downloaded and decrypted; their absolute local paths appear in the user message. '
     + 'Use the available file or shell tools to inspect those paths when the user asks you to process an attachment. '
     + 'Do not reveal credentials or internal system data. When a request needs an interactive approval '

@@ -1,12 +1,16 @@
 import { describe, expect, it, vi } from 'vitest'
 import type {
   BaseMessage,
+  EventMessageWith,
   ReplyMsgItem,
+  TemplateCard,
+  TemplateCardEventData,
   UploadMediaOptions,
   WSClientOptions,
   WeComMediaType,
   WsFrameHeaders,
 } from '@wecom/aibot-node-sdk'
+import { EventType } from '@wecom/aibot-node-sdk'
 import { WeComHarnessBridge } from '../src/bridge.js'
 import { testConfig } from './fixtures.js'
 
@@ -16,9 +20,13 @@ interface SentReply {
   items: ReplyMsgItem[] | undefined
 }
 
+type SentMessage = { chatid: string; msgtype: string; markdown?: { content: string }; template_card?: TemplateCard }
+
 class FakeClient {
   isConnected = false
   readonly replies: SentReply[] = []
+  readonly sent: SentMessage[] = []
+  readonly cardUpdates: Array<{ templateCard: TemplateCard; userids?: string[] }> = []
   readonly uploads: Array<{ data: Buffer; type: string; filename: string }> = []
   readonly activeMedia: Array<{ chatid: string; type: WeComMediaType; mediaId: string }> = []
   readonly welcomes: string[] = []
@@ -56,6 +64,21 @@ class FakeClient {
     this.welcomes.push(body.text.content)
   }
 
+  async updateTemplateCard(
+    _frame: WsFrameHeaders,
+    templateCard: TemplateCard,
+    userids?: string[],
+  ): Promise<void> {
+    this.cardUpdates.push({ templateCard, ...(userids === undefined ? {} : { userids }) })
+  }
+
+  async sendMessage(
+    chatid: string,
+    body: { msgtype: 'markdown'; markdown: { content: string } } | { msgtype: 'template_card'; template_card: TemplateCard },
+  ): Promise<void> {
+    this.sent.push({ chatid, ...body })
+  }
+
   async uploadMedia(data: Buffer, options: UploadMediaOptions): Promise<{ media_id: string }> {
     this.uploads.push({ data, ...options })
     return { media_id: `media-${this.uploads.length}` }
@@ -71,6 +94,10 @@ class FakeClient {
 
   async message(body: BaseMessage): Promise<void> {
     await this.emit('message', { headers: { req_id: `req-${body.msgid}` }, body })
+  }
+
+  async cardEvent(body: EventMessageWith<TemplateCardEventData>): Promise<void> {
+    await this.emit('event.template_card_event', { headers: { req_id: `evreq-${body.msgid}` }, body })
   }
 
   private async emit(event: string, ...args: unknown[]): Promise<void> {
@@ -232,6 +259,84 @@ describe('WeComHarnessBridge', () => {
     expect(client.replies).toHaveLength(1)
     expect(client.replies[0]?.content).toBe('# Model reply\n\n- first\n- second')
     expect(client.replies[0]?.items).toHaveLength(1)
+    await bridge.stop()
+  })
+
+  it('sends a button_interaction card and a confirmation through /bot-card-test', async () => {
+    const client = new FakeClient()
+    const bridge = new WeComHarnessBridge(commandContext('resolved-secret'), testConfig(), () => client as never)
+    await bridge.start()
+    await client.message(textMessage('/bot-card-test', 'm-card-test'))
+
+    const card = client.sent.find(entry => entry.msgtype === 'template_card')
+    expect(card?.template_card).toEqual(expect.objectContaining({
+      card_type: 'button_interaction',
+      main_title: expect.objectContaining({ title: '模板卡片测试' }),
+      button_list: [
+        expect.objectContaining({ text: '确认收到', key: 'bot-card-test-ok' }),
+        expect.objectContaining({ text: '再想想', key: 'bot-card-test-retry' }),
+      ],
+    }))
+    expect(String(card?.template_card?.task_id)).toMatch(/^dshp-test-/)
+    expect(card?.chatid).toBe('u1')
+    expect(client.replies[0]?.content).toContain('模板卡片已发送')
+    await bridge.stop()
+  })
+
+  it('acknowledges a card button click within the update window and pushes the model reply proactively', async () => {
+    const client = new FakeClient()
+    const bridge = new WeComHarnessBridge(agentContext(), testConfig(), () => client as never)
+    await bridge.start()
+    await client.cardEvent({
+      msgid: 'ev-card',
+      aibotid: 'test-bot',
+      chattype: 'single',
+      from: { userid: 'u1' },
+      msgtype: 'event',
+      create_time: 1,
+      event: { eventtype: EventType.TemplateCardEvent, task_id: 'task-42', event_key: 'btn-ok' },
+    })
+
+    expect(client.cardUpdates).toEqual([{
+      templateCard: expect.objectContaining({
+        card_type: 'text_notice',
+        task_id: 'task-42',
+        main_title: expect.objectContaining({
+          title: '正在处理…',
+          desc: '已收到按钮点击，正在处理，请稍候。',
+        }),
+      }),
+      userids: ['u1'],
+    }])
+    const markdown = client.sent.find(entry => entry.msgtype === 'markdown')
+    expect(markdown).toEqual({
+      chatid: 'u1',
+      msgtype: 'markdown',
+      markdown: { content: '# Model reply\n\n- first\n- second' },
+    })
+    expect(client.replies).toEqual([])
+    await bridge.stop()
+  })
+
+  it('silently drops a card button click from a sender excluded by policy', async () => {
+    const client = new FakeClient()
+    const bridge = new WeComHarnessBridge(commandContext('resolved-secret'), testConfig({
+      singlePolicy: 'allowlist',
+      singleAllowFrom: ['someone-else'],
+    }), () => client as never)
+    await bridge.start()
+    await client.cardEvent({
+      msgid: 'ev-denied',
+      aibotid: 'test-bot',
+      chattype: 'single',
+      from: { userid: 'u1' },
+      msgtype: 'event',
+      create_time: 1,
+      event: { eventtype: EventType.TemplateCardEvent, task_id: 'task-9', event_key: 'btn-ok' },
+    })
+
+    expect(client.cardUpdates).toEqual([])
+    expect(client.sent).toEqual([])
     await bridge.stop()
   })
 

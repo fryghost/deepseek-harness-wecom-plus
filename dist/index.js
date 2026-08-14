@@ -1348,7 +1348,7 @@ var WeComHarnessBridge = class {
       maxReconnectAttempts: this.config.maxReconnectAttempts,
       maxAuthFailureAttempts: this.config.maxAuthFailureAttempts,
       requestTimeout: this.config.sendTimeoutMs,
-      plug_version: "deepseek-harness-wecom-plus/0.3.2"
+      plug_version: "deepseek-harness-wecom-plus/0.3.3"
     });
   }
   async handleWelcome(frame) {
@@ -1752,7 +1752,7 @@ import {
 } from "@deepseek-ai/dsh-settings";
 
 // src/version.ts
-var PLUGIN_VERSION = "0.3.2";
+var PLUGIN_VERSION = "0.3.3";
 
 // src/settings-web.ts
 var SETTINGS_ROUTE = "/_dsh/deepseek-harness-wecom-plus/settings";

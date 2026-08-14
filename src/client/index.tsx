@@ -273,7 +273,20 @@ function LoadedSettings({ controller }: SettingsInjected) {
       </header>
 
       {!snapshot.writable ? <div className="wc-alert warning">当前 Settings 提供方为只读，无法在界面保存。</div> : null}
-      {channel.detail !== undefined ? <div className="wc-alert warning">{channel.detail}</div> : null}
+      {channel.state === 'inactive'
+        ? (
+          <div className="wc-alert warning">
+            {draft.botId.trim() === ''
+              ? '通道未激活：还没有填写 Bot ID。请在企微管理后台「应用管理 → 智能机器人」的机器人详情页复制 Bot ID，粘贴到上方输入框并保存。'
+              : snapshot.credential.configured
+                ? '通道未激活：请确认 Secret 与 Bot ID 属于同一个机器人，并把该机器人的接收消息模式设为「长连接流式接收」。'
+                : '通道未激活：还没有保存 Secret。请把机器人 Secret 粘贴到凭据框并点击「保存 Secret」。'}
+          </div>
+        )
+        : null}
+      {channel.state !== 'inactive' && channel.detail !== undefined
+        ? <div className="wc-alert warning">{channel.detail}</div>
+        : null}
       {state.error === undefined ? null : <div className="wc-alert error">{state.error}</div>}
       {state.message === 'saved' ? <div className="wc-alert success">设置已保存，通道已按新配置重连。</div> : null}
       {state.message === 'keySaved' ? <div className="wc-alert success">Secret 已保存。</div> : null}

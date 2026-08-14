@@ -7,7 +7,7 @@
  * channel live on the Host.
  */
 
-import { useEffect, useState, useSyncExternalStore } from 'react'
+import { Component, useEffect, useState, useSyncExternalStore, type ReactNode } from 'react'
 import type { ClientContext } from '@deepseek-ai/dsh-client-runtime/client'
 import type {} from '@deepseek-ai/dsh-client-ui-settings/client'
 import type { PropsRuntime } from '@deepseek-ai/dsh-client-ui-slots'
@@ -152,7 +152,7 @@ type SettingsProps = PropsRuntime<'settings.section'> & Partial<SettingsInjected
 function Field({ label, hint, children }: {
   label: string
   hint?: string
-  children: React.ReactNode
+  children: ReactNode
 }) {
   return (
     <label className="wc-field">
@@ -161,6 +161,37 @@ function Field({ label, hint, children }: {
       {hint === undefined ? null : <small>{hint}</small>}
     </label>
   )
+}
+
+/**
+ * Local error surface: instead of letting the slot machinery retire this
+ * entry on a render crash (which paints a silent blank panel), show the
+ * error text right on the page so it can be reported.
+ */
+class SectionErrorBoundary extends Component<{ children: ReactNode }, { error?: Error }> {
+  state: { error?: Error } = { error: undefined }
+
+  static getDerivedStateFromError(error: Error) {
+    return { error }
+  }
+
+  render() {
+    if (this.state.error !== undefined) {
+      const message = this.state.error?.message || String(this.state.error)
+      return (
+        <div className="wc-settings">
+          <div className="wc-alert error">
+            页面渲染出错（请把这段文字和浏览器控制台报错一起反馈）：
+            <pre style={{ whiteSpace: 'pre-wrap', margin: '8px 0 0' }}>{message}</pre>
+            {this.state.error?.stack !== undefined
+              ? <pre style={{ whiteSpace: 'pre-wrap', margin: '8px 0 0' }}>{this.state.error.stack}</pre>
+              : null}
+          </div>
+        </div>
+      )
+    }
+    return this.props.children
+  }
 }
 
 const CHANNEL_LABEL: Record<ChannelStatus['state'], string> = {
@@ -181,9 +212,22 @@ const CARD_MODE_OPTIONS = [
   { value: 'off', label: 'off（关闭卡片）' },
 ] as const
 
-function SettingsSection({ controller }: SettingsProps) {
-  if (controller === undefined) return null
-  return <LoadedSettings controller={controller} />
+function SettingsSection(props: SettingsProps) {
+  const { controller } = props
+  if (controller === undefined) {
+    return (
+      <div className="wc-settings">
+        <div className="wc-alert error">
+          内部错误：控制器未注入（controller is undefined）。请按 F12 打开浏览器控制台，把红色报错截图或复制给我。
+        </div>
+      </div>
+    )
+  }
+  return (
+    <SectionErrorBoundary>
+      <LoadedSettings controller={controller} />
+    </SectionErrorBoundary>
+  )
 }
 
 function LoadedSettings({ controller }: SettingsInjected) {

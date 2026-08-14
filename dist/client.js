@@ -115,6 +115,19 @@ var WeComSettingsController = class {
 function Field({ label, hint, children }) {
   return /* @__PURE__ */ React.createElement("label", { className: "wc-field" }, /* @__PURE__ */ React.createElement("span", null, label), children, hint === void 0 ? null : /* @__PURE__ */ React.createElement("small", null, hint));
 }
+var SectionErrorBoundary = class extends import_react.Component {
+  state = { error: void 0 };
+  static getDerivedStateFromError(error) {
+    return { error };
+  }
+  render() {
+    if (this.state.error !== void 0) {
+      const message = this.state.error?.message || String(this.state.error);
+      return /* @__PURE__ */ React.createElement("div", { className: "wc-settings" }, /* @__PURE__ */ React.createElement("div", { className: "wc-alert error" }, "\u9875\u9762\u6E32\u67D3\u51FA\u9519\uFF08\u8BF7\u628A\u8FD9\u6BB5\u6587\u5B57\u548C\u6D4F\u89C8\u5668\u63A7\u5236\u53F0\u62A5\u9519\u4E00\u8D77\u53CD\u9988\uFF09\uFF1A", /* @__PURE__ */ React.createElement("pre", { style: { whiteSpace: "pre-wrap", margin: "8px 0 0" } }, message), this.state.error?.stack !== void 0 ? /* @__PURE__ */ React.createElement("pre", { style: { whiteSpace: "pre-wrap", margin: "8px 0 0" } }, this.state.error.stack) : null));
+    }
+    return this.props.children;
+  }
+};
 var CHANNEL_LABEL = {
   inactive: "\u672A\u6FC0\u6D3B\uFF08\u7F3A Bot ID / Secret \u6216\u672A\u914D\u7F6E\uFF09",
   connecting: "\u8FDE\u63A5\u4E2D\u2026",
@@ -130,9 +143,12 @@ var CARD_MODE_OPTIONS = [
   { value: "tool", label: "tool\uFF08\u4EC5\u6A21\u578B\u663E\u5F0F\u53D1\u5361\uFF09" },
   { value: "off", label: "off\uFF08\u5173\u95ED\u5361\u7247\uFF09" }
 ];
-function SettingsSection({ controller }) {
-  if (controller === void 0) return null;
-  return /* @__PURE__ */ React.createElement(LoadedSettings, { controller });
+function SettingsSection(props) {
+  const { controller } = props;
+  if (controller === void 0) {
+    return /* @__PURE__ */ React.createElement("div", { className: "wc-settings" }, /* @__PURE__ */ React.createElement("div", { className: "wc-alert error" }, "\u5185\u90E8\u9519\u8BEF\uFF1A\u63A7\u5236\u5668\u672A\u6CE8\u5165\uFF08controller is undefined\uFF09\u3002\u8BF7\u6309 F12 \u6253\u5F00\u6D4F\u89C8\u5668\u63A7\u5236\u53F0\uFF0C\u628A\u7EA2\u8272\u62A5\u9519\u622A\u56FE\u6216\u590D\u5236\u7ED9\u6211\u3002"));
+  }
+  return /* @__PURE__ */ React.createElement(SectionErrorBoundary, null, /* @__PURE__ */ React.createElement(LoadedSettings, { controller }));
 }
 function LoadedSettings({ controller }) {
   const state = (0, import_react.useSyncExternalStore)(controller.subscribe, controller.snapshot, controller.snapshot);

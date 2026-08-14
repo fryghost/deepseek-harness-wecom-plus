@@ -1,9 +1,11 @@
 import type { Context } from '@deepseek-ai/cordis'
 import type { Agent, AgentHandle } from '@deepseek-ai/dsh-agent'
 import type {} from '@deepseek-ai/dsh-agent-default-model'
+import { resolveSessionPreset } from '@deepseek-ai/dsh-agent-presets'
 import { createUserMessage } from '@deepseek-ai/dsh-llm'
 import { SessionId, type SessionEvent } from '@deepseek-ai/dsh-session'
 import type {} from '@deepseek-ai/dsh-session-persistence'
+import type {} from '@deepseek-ai/dsh-system-prompt'
 import type { BaseMessage } from '@wecom/aibot-node-sdk'
 import type { Config } from './config.js'
 import { inboundContent, type WeComDownloadPort } from './inbound.js'
@@ -15,11 +17,18 @@ export interface ConversationReply {
   images: Array<{ data: Uint8Array; mediaType: string; name?: string }>
 }
 
+/** One live agent plus only the lifecycle capability this manager owns. */
+interface ConversationAgentBinding {
+  agent: Agent
+  release(): Promise<void>
+}
+
 /** Owns deterministic WeCom conversation agents and their persisted resume lifecycle. */
 export class ConversationManager {
-  private readonly handles = new Map<string, AgentHandle>()
-  private readonly creations = new Map<string, Promise<AgentHandle>>()
+  private readonly bindings = new Map<string, ConversationAgentBinding>()
+  private readonly creations = new Map<string, Promise<ConversationAgentBinding>>()
   private readonly queues = new Map<string, Promise<unknown>>()
+  private readonly activeTurns = new Set<string>()
   private persistedIds = new Set<string>()
 
   constructor(private readonly ctx: Context, private readonly config: Config) {}
@@ -45,7 +54,7 @@ export class ConversationManager {
   /** Cancel active work for one WeCom conversation. */
   cancel(message: BaseMessage): boolean {
     const id = sessionIdFor(this.config.accountId, message)
-    const agent = this.handles.get(id)?.agent ?? this.ctx.agents.get(SessionId(id))
+    const agent = this.bindings.get(id)?.agent ?? this.ctx.agents.get(SessionId(id))
     if (agent === undefined || agent.status === 'idle') return false
     agent.cancel({ kind: 'user' })
     return true
@@ -54,8 +63,9 @@ export class ConversationManager {
   /** Dispose every bridge-owned Agent after queued message work settles. */
   async dispose(): Promise<void> {
     await Promise.allSettled(this.queues.values())
-    await Promise.allSettled([...this.handles.values()].map(handle => handle.dispose()))
-    this.handles.clear()
+    await Promise.allSettled([...this.bindings.values()].map(binding => binding.release()))
+    this.bindings.clear()
+    this.activeTurns.clear()
   }
 
   private async processNow(
@@ -63,13 +73,19 @@ export class ConversationManager {
     message: BaseMessage,
     client: WeComDownloadPort,
   ): Promise<ConversationReply> {
-    const handle = await this.getOrCreate(id)
-    const agent = handle.agent
-    const start = agent.session.events.length
+    const binding = await this.getOrCreate(id)
+    const agent = binding.agent
     const content = await inboundContent(this.ctx, this.config, client, message, await this.includeImages(agent))
-    agent.followup(createUserMessage({ content, source: { kind: 'user' } }))
-    await withTimeout(agent.whenIdle(), this.config.responseTimeoutMs, 'DeepSeek Harness response')
-    return this.collectReply(agent, agent.session.events.slice(start))
+    await withTimeout(agent.whenIdle(), this.config.responseTimeoutMs, 'DeepSeek Harness conversation availability')
+    const start = agent.session.events.length
+    this.activeTurns.add(id)
+    try {
+      agent.followup(createUserMessage({ content, source: { kind: 'user' } }))
+      await withTimeout(agent.whenIdle(), this.config.responseTimeoutMs, 'DeepSeek Harness response')
+      return await this.collectReply(agent, agent.session.events.slice(start))
+    } finally {
+      this.activeTurns.delete(id)
+    }
   }
 
   private async includeImages(agent: Agent): Promise<boolean> {
@@ -81,38 +97,100 @@ export class ConversationManager {
     return info.inputModalities?.includes('image') ?? false
   }
 
-  private async getOrCreate(id: string): Promise<AgentHandle> {
-    const existing = this.handles.get(id)
-    if (existing !== undefined) return existing
+  private async getOrCreate(id: string): Promise<ConversationAgentBinding> {
+    const sessionId = SessionId(id)
+    const existing = this.bindings.get(id)
+    if (existing !== undefined && this.ctx.agents.get(sessionId) === existing.agent) return existing
+    if (existing !== undefined) {
+      this.bindings.delete(id)
+      await existing.release()
+    }
     const pending = this.creations.get(id)
     if (pending !== undefined) return pending
 
     const creation = this.createOrResume(id).finally(() => this.creations.delete(id))
     this.creations.set(id, creation)
-    const handle = await creation
-    this.handles.set(id, handle)
-    return handle
+    const binding = await creation
+    this.bindings.set(id, binding)
+    return binding
   }
 
-  private async createOrResume(id: string): Promise<AgentHandle> {
+  private async createOrResume(id: string): Promise<ConversationAgentBinding> {
     const sessionId = SessionId(id)
+    const live = this.ctx.agents.get(sessionId)
+    if (live !== undefined) return this.borrowAgent(live, id)
+
     const current = this.ctx.agentDefaultModel.currentSelection()
     const agentOptions = { provider: current.provider, model: current.model }
     if (this.persistedIds.has(id)) {
-      return this.ctx.agents.resume({ resumeSessionId: sessionId, agentOptions })
+      const inspected = await this.ctx.sessionPersistence.inspect(sessionId)
+      const agentPreset = resolveSessionPreset({
+        header: inspected.meta,
+        events: inspected.events,
+      }) ?? this.resolveAgentPreset()
+      try {
+        return this.ownAgent(await this.ctx.agents.resume({
+          resumeSessionId: sessionId,
+          agentOptions,
+          setup: agentCtx => this.setupAgent(agentCtx, agentPreset, id),
+        }))
+      } catch (error) {
+        const raced = this.ctx.agents.get(sessionId)
+        if (raced !== undefined) return this.borrowAgent(raced, id)
+        throw error
+      }
     }
 
-    const handle = await this.ctx.agents.create({
-      sessionId,
-      meta: { cwd: this.config.cwd },
-      agentOptions,
-    })
+    const agentPreset = this.resolveAgentPreset()
+    let handle: AgentHandle
+    try {
+      handle = await this.ctx.agents.create({
+        sessionId,
+        meta: { cwd: this.config.cwd, agentPreset },
+        agentOptions,
+        setup: agentCtx => this.setupAgent(agentCtx, agentPreset, id),
+      })
+    } catch (error) {
+      const raced = this.ctx.agents.get(sessionId)
+      if (raced !== undefined) return this.borrowAgent(raced, id)
+      throw error
+    }
     this.persistedIds.add(id)
-    handle.agent.inject(createUserMessage({
-      content: [{ type: 'text', text: this.config.systemPrompt }],
-      source: { kind: 'plugin', plugin: 'deepseek-harness-wecom', form: 'instructions' },
-    }))
-    return handle
+    return this.ownAgent(handle)
+  }
+
+  private ownAgent(handle: AgentHandle): ConversationAgentBinding {
+    return { agent: handle.agent, release: () => handle.dispose() }
+  }
+
+  private borrowAgent(agent: Agent, id: string): ConversationAgentBinding {
+    const disposeInstructions = this.registerWeComInstructions(agent.ctx, id)
+    let released = false
+    return {
+      agent,
+      release: async () => {
+        if (released) return
+        released = true
+        disposeInstructions()
+      },
+    }
+  }
+
+  private resolveAgentPreset(): string {
+    return this.config.agentPreset ?? this.ctx.agentPresets.defaultId
+  }
+
+  private async setupAgent(agentCtx: Context, agentPreset: string, id: string): Promise<void> {
+    await this.ctx.agentPresets.mount(agentCtx, agentPreset)
+    this.registerWeComInstructions(agentCtx, id)
+  }
+
+  private registerWeComInstructions(agentCtx: Context, id: string): () => void {
+    return agentCtx.systemPrompt.section({
+      name: 'channel:wecom',
+      order: 190,
+      text: () => this.activeTurns.has(id) ? this.config.systemPrompt : '',
+    })
   }
 
   private async collectReply(agent: Agent, events: readonly SessionEvent[]): Promise<ConversationReply> {

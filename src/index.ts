@@ -5,7 +5,16 @@ import { WeComHarnessBridge } from './bridge.js'
 import { Config, type Config as WeComConfig } from './config.js'
 
 export const name = 'deepseek-harness-wecom'
-export const inject = ['agentDefaultModel', 'agents', 'attachments', 'credentials', 'llm', 'sessionPersistence']
+export const inject = [
+  'agentDefaultModel',
+  'agentPresets',
+  'agents',
+  'attachments',
+  'credentials',
+  'llm',
+  'sessionPersistence',
+  'systemPrompt',
+]
 export { Config }
 export type { WeComConfig as ConfigType }
 export { WeComHarnessBridge }

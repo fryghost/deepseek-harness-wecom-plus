@@ -14,7 +14,10 @@ An independent out-of-tree [DeepSeek Harness](https://github.com/deepseek-ai/dee
 - Durable Harness image attachments
 - Automatic text-only fallback when the selected model cannot accept images
 - Text and inline image replies, plus uploaded active image sends for other image formats
+- WeCom Markdown replies through the official stream response fields
 - One persistent Harness session per single or group conversation
+- Harness agent-preset composition for the same tools, prompts, and skills as Web sessions
+- Safe reuse of a live session already opened by Web, without a second session writer
 - Per-conversation ordering, duplicate suppression, retries, and bounded timeouts
 - Open, allowlist, or disabled access policies for single and group traffic
 - `/bot-ping`, `/bot-image-test`, `/bot-help`, `/bot-status`, and `/bot-cancel`
@@ -63,6 +66,7 @@ Override the plugin row in `~/.dsh/profiles/web/cordis.patch.yml` to change poli
     botId: !!js process.env.WECOM_BOT_ID
     secretRef: WECOM_BOT_SECRET
     cwd: !!js process.env.DSH_WECOM_CWD ?? process.cwd()
+    agentPreset: standard
     scene: 1
     singlePolicy: allowlist
     singleAllowFrom: [zhangsan]
@@ -72,6 +76,10 @@ Override the plugin row in `~/.dsh/profiles/web/cordis.patch.yml` to change poli
 ```
 
 `imageInputMode` defaults to `auto`: image-capable models receive a durable image block, while text-only models receive attachment metadata instead of failing the turn. Use `always` only with a route known to accept images, or `never` to force the text fallback.
+
+WeCom's official SDK defines the `replyStream` content field as Markdown-capable. The plugin passes assistant Markdown through unchanged, including headings, lists, links, emphasis, quotes, and code. The final payload remains bounded by `maxReplyBytes`, which defaults to 20,000 bytes.
+
+`agentPreset` defaults to the Harness deployment's selected default (normally `standard`). The preset is recorded in the session header and mounted again on resume, so model tool calls are handled by the Harness Agent Loop instead of being exposed as raw DSML text. Sessions created before preset composition use the `wecom-v1-` namespace; corrected sessions use `wecom-v2-`, leaving old history untouched. If Web already has the same corrected session live, the WeCom bridge borrows that Agent, waits for its current activity to finish, and does not open a second session writer.
 
 The default WebSocket URL is `wss://openws.work.weixin.qq.com`, and `scene` defaults to `1` as required by the WeCom AI Bot long-connection integration. Private deployments can override these values with those shown in their WeCom administration console.
 
@@ -86,6 +94,8 @@ pong — DeepSeek Harness 企微机器人已连接。
 Send `/bot-image-test` to exercise the official inline-image reply fields without depending on model-generated media. The bot should return a blue PNG and a success message.
 
 Then send ordinary text, an image, or a mixed text/image message. The plugin appends it to the conversation's durable Harness session and returns the selected default model's response.
+
+To verify Markdown, request a response containing a heading, list, link, emphasis, quote, and fenced code block. WeCom should render the structures instead of displaying transport markup. To verify tool routing, ask `What files are in the current directory?`; the Agent should execute the configured filesystem or shell tools and return the result without exposing `<｜｜DSML｜｜tool_calls>` or `<｜｜DSML｜｜invoke>` text. Continuing that same `wecom-v2-` session in Web should preserve normal tool execution.
 
 ## Development
 

@@ -12,6 +12,7 @@ export interface Config {
   secretRef: string
   accountId: string
   cwd: string
+  agentPreset?: string
   websocketUrl: string
   scene: number
   singlePolicy: AccessMode
@@ -39,6 +40,7 @@ export const Config: z<Config> = z.object({
   secretRef: z.string().default('WECOM_BOT_SECRET'),
   accountId: z.string().default('default'),
   cwd: z.string().required(),
+  agentPreset: z.string(),
   websocketUrl: z.string().default('wss://openws.work.weixin.qq.com'),
   scene: z.number().step(1).min(0).default(1),
   singlePolicy: z.union(['open', 'allowlist', 'disabled']).default('open'),
@@ -59,6 +61,7 @@ export const Config: z<Config> = z.object({
   maxSeenMessageIds: z.number().step(1).min(100).max(100_000).default(5_000),
   systemPrompt: z.string().default(
     'You are replying through WeCom. Keep replies clear and suitable for enterprise chat. '
+    + 'Use WeCom-compatible Markdown for headings, lists, links, emphasis, quotes, and code when structure helps. '
     + 'Do not reveal credentials or internal system data. When a request needs an interactive approval '
     + 'that WeCom cannot provide, explain what approval is needed instead of waiting indefinitely.',
   ),

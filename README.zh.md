@@ -14,7 +14,10 @@
 - 把图片保存为 Harness 持久附件
 - 当前模型不支持图片输入时自动降级为文本元数据，不让整轮失败
 - 支持文本、内联图片回复；其他图片格式通过临时素材上传后主动发送
+- 通过官方流式回复字段发送企微 Markdown
 - 每个单聊或群聊对应一个独立、可恢复的 Harness 会话
+- 挂载 Harness agent preset，使企微会话与网页会话使用相同的工具、提示词和技能组合
+- 网页已打开同一会话时安全复用 live Agent，不创建第二个 session writer
 - 同会话消息串行处理、消息排重、发送重试和超时保护
 - 单聊/群聊可分别配置开放、白名单或禁用
 - 内置 `/bot-ping`、`/bot-image-test`、`/bot-help`、`/bot-status`、`/bot-cancel`
@@ -65,6 +68,7 @@ pnpm dsh --profile web
     botId: !!js process.env.WECOM_BOT_ID
     secretRef: WECOM_BOT_SECRET
     cwd: !!js process.env.DSH_WECOM_CWD ?? process.cwd()
+    agentPreset: standard
     scene: 1
     singlePolicy: allowlist
     singleAllowFrom: [zhangsan]
@@ -74,6 +78,10 @@ pnpm dsh --profile web
 ```
 
 `imageInputMode` 默认为 `auto`：支持视觉的模型会收到持久图片块；纯文本模型会收到附件元数据，避免整轮失败。只有确认模型支持图片时才使用 `always`；使用 `never` 可强制文本降级。
+
+企微官方 SDK 明确定义 `replyStream` 的内容字段支持 Markdown。插件会原样传递 assistant 生成的 Markdown，包括标题、列表、链接、强调、引用和代码；最终负载仍受 `maxReplyBytes` 限制，默认上限为 20,000 字节。
+
+`agentPreset` 默认使用当前 Harness 部署选择的默认 preset（通常是 `standard`）。插件会把 preset 写入 session header，并在恢复时重新挂载，使模型工具调用交给 Harness Agent Loop 处理，而不是把原始 DSML 文本暴露给用户。修复前创建的会话使用 `wecom-v1-` 命名空间；正确组合后的会话使用 `wecom-v2-`，旧历史保留不动。如果网页已经打开同一个修复后会话，企微 bridge 会借用该 Agent、等待当前活动结束，不会再启动第二个 session writer。
 
 默认长连接地址为 `wss://openws.work.weixin.qq.com`，`scene` 默认为企微智能机器人长连接所需的 `1`。私有部署企业可以按企微管理后台显示的值覆盖这些配置。
 
@@ -88,6 +96,8 @@ pong — DeepSeek Harness 企微机器人已连接。
 发送 `/bot-image-test` 可以直接验证官方内联图片回复字段，不依赖模型生成图片。机器人应回复一张蓝色 PNG 和发送成功提示。
 
 然后发送普通文本、图片或图文混排消息。插件会把消息追加到对应的 Harness 持久会话，并把当前默认模型的回复发回企微。
+
+验证 Markdown 时，可以要求回复包含标题、列表、链接、强调、引用和围栏代码块，企微应渲染这些结构而不是显示传输标记。验证工具路由时，可以发送“我当前有什么文件？”；Agent 应执行所配置的文件系统或 shell 工具并返回结果，回复中不能出现 `<｜｜DSML｜｜tool_calls>` 或 `<｜｜DSML｜｜invoke>`。随后在网页继续同一个 `wecom-v2-` session，工具调用也应保持正常。
 
 ## 开发
 

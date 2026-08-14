@@ -15,6 +15,7 @@ interface Config {
     secretRef: string;
     accountId: string;
     cwd: string;
+    agentPreset?: string;
     websocketUrl: string;
     scene: number;
     singlePolicy: AccessMode;

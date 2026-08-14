@@ -6,7 +6,7 @@ describe('sessionIdFor', () => {
     const message = { chattype: 'single' as const, from: { userid: 'sensitive-userid' } }
     const first = sessionIdFor('default', message)
     expect(sessionIdFor('default', message)).toBe(first)
-    expect(first).toMatch(/^wecom-v1-single-[0-9a-f]{32}$/)
+    expect(first).toMatch(/^wecom-v2-single-[0-9a-f]{32}$/)
     expect(first).not.toContain('sensitive-userid')
     expect(sessionIdFor('other', message)).not.toBe(first)
     expect(chatTarget(message)).toBe('sensitive-userid')

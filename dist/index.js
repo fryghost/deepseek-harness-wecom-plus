@@ -10,6 +10,7 @@ import {
 } from "@wecom/aibot-node-sdk";
 
 // src/conversations.ts
+import { resolveSessionPreset } from "@deepseek-ai/dsh-agent-presets";
 import { createUserMessage } from "@deepseek-ai/dsh-llm";
 import { SessionId } from "@deepseek-ai/dsh-session";
 
@@ -20,7 +21,7 @@ function sessionIdFor(accountId, message) {
   const peer = scope === "group" ? message.chatid : message.from.userid;
   if (peer === void 0 || peer.length === 0) throw new Error(`WeCom ${scope} message has no peer identifier`);
   const digest = createHash("sha256").update(`${accountId}\0${scope}\0${peer}`).digest("hex").slice(0, 32);
-  return `wecom-v1-${scope}-${digest}`;
+  return `wecom-v2-${scope}-${digest}`;
 }
 function chatTarget(message) {
   const target = message.chattype === "group" ? message.chatid : message.from.userid;
@@ -184,9 +185,10 @@ var ConversationManager = class {
   }
   ctx;
   config;
-  handles = /* @__PURE__ */ new Map();
+  bindings = /* @__PURE__ */ new Map();
   creations = /* @__PURE__ */ new Map();
   queues = /* @__PURE__ */ new Map();
+  activeTurns = /* @__PURE__ */ new Set();
   persistedIds = /* @__PURE__ */ new Set();
   /** Snapshot persisted identities once before accepting traffic. */
   async initialize() {
@@ -207,7 +209,7 @@ var ConversationManager = class {
   /** Cancel active work for one WeCom conversation. */
   cancel(message) {
     const id = sessionIdFor(this.config.accountId, message);
-    const agent = this.handles.get(id)?.agent ?? this.ctx.agents.get(SessionId(id));
+    const agent = this.bindings.get(id)?.agent ?? this.ctx.agents.get(SessionId(id));
     if (agent === void 0 || agent.status === "idle") return false;
     agent.cancel({ kind: "user" });
     return true;
@@ -215,17 +217,24 @@ var ConversationManager = class {
   /** Dispose every bridge-owned Agent after queued message work settles. */
   async dispose() {
     await Promise.allSettled(this.queues.values());
-    await Promise.allSettled([...this.handles.values()].map((handle) => handle.dispose()));
-    this.handles.clear();
+    await Promise.allSettled([...this.bindings.values()].map((binding) => binding.release()));
+    this.bindings.clear();
+    this.activeTurns.clear();
   }
   async processNow(id, message, client) {
-    const handle = await this.getOrCreate(id);
-    const agent = handle.agent;
-    const start = agent.session.events.length;
+    const binding = await this.getOrCreate(id);
+    const agent = binding.agent;
     const content = await inboundContent(this.ctx, this.config, client, message, await this.includeImages(agent));
-    agent.followup(createUserMessage({ content, source: { kind: "user" } }));
-    await withTimeout(agent.whenIdle(), this.config.responseTimeoutMs, "DeepSeek Harness response");
-    return this.collectReply(agent, agent.session.events.slice(start));
+    await withTimeout(agent.whenIdle(), this.config.responseTimeoutMs, "DeepSeek Harness conversation availability");
+    const start = agent.session.events.length;
+    this.activeTurns.add(id);
+    try {
+      agent.followup(createUserMessage({ content, source: { kind: "user" } }));
+      await withTimeout(agent.whenIdle(), this.config.responseTimeoutMs, "DeepSeek Harness response");
+      return await this.collectReply(agent, agent.session.events.slice(start));
+    } finally {
+      this.activeTurns.delete(id);
+    }
   }
   async includeImages(agent) {
     if (this.config.imageInputMode === "always") return true;
@@ -236,34 +245,90 @@ var ConversationManager = class {
     return info.inputModalities?.includes("image") ?? false;
   }
   async getOrCreate(id) {
-    const existing = this.handles.get(id);
-    if (existing !== void 0) return existing;
+    const sessionId = SessionId(id);
+    const existing = this.bindings.get(id);
+    if (existing !== void 0 && this.ctx.agents.get(sessionId) === existing.agent) return existing;
+    if (existing !== void 0) {
+      this.bindings.delete(id);
+      await existing.release();
+    }
     const pending = this.creations.get(id);
     if (pending !== void 0) return pending;
     const creation = this.createOrResume(id).finally(() => this.creations.delete(id));
     this.creations.set(id, creation);
-    const handle = await creation;
-    this.handles.set(id, handle);
-    return handle;
+    const binding = await creation;
+    this.bindings.set(id, binding);
+    return binding;
   }
   async createOrResume(id) {
     const sessionId = SessionId(id);
+    const live = this.ctx.agents.get(sessionId);
+    if (live !== void 0) return this.borrowAgent(live, id);
     const current = this.ctx.agentDefaultModel.currentSelection();
     const agentOptions = { provider: current.provider, model: current.model };
     if (this.persistedIds.has(id)) {
-      return this.ctx.agents.resume({ resumeSessionId: sessionId, agentOptions });
+      const inspected = await this.ctx.sessionPersistence.inspect(sessionId);
+      const agentPreset2 = resolveSessionPreset({
+        header: inspected.meta,
+        events: inspected.events
+      }) ?? this.resolveAgentPreset();
+      try {
+        return this.ownAgent(await this.ctx.agents.resume({
+          resumeSessionId: sessionId,
+          agentOptions,
+          setup: (agentCtx) => this.setupAgent(agentCtx, agentPreset2, id)
+        }));
+      } catch (error) {
+        const raced = this.ctx.agents.get(sessionId);
+        if (raced !== void 0) return this.borrowAgent(raced, id);
+        throw error;
+      }
     }
-    const handle = await this.ctx.agents.create({
-      sessionId,
-      meta: { cwd: this.config.cwd },
-      agentOptions
-    });
+    const agentPreset = this.resolveAgentPreset();
+    let handle;
+    try {
+      handle = await this.ctx.agents.create({
+        sessionId,
+        meta: { cwd: this.config.cwd, agentPreset },
+        agentOptions,
+        setup: (agentCtx) => this.setupAgent(agentCtx, agentPreset, id)
+      });
+    } catch (error) {
+      const raced = this.ctx.agents.get(sessionId);
+      if (raced !== void 0) return this.borrowAgent(raced, id);
+      throw error;
+    }
     this.persistedIds.add(id);
-    handle.agent.inject(createUserMessage({
-      content: [{ type: "text", text: this.config.systemPrompt }],
-      source: { kind: "plugin", plugin: "deepseek-harness-wecom", form: "instructions" }
-    }));
-    return handle;
+    return this.ownAgent(handle);
+  }
+  ownAgent(handle) {
+    return { agent: handle.agent, release: () => handle.dispose() };
+  }
+  borrowAgent(agent, id) {
+    const disposeInstructions = this.registerWeComInstructions(agent.ctx, id);
+    let released = false;
+    return {
+      agent,
+      release: async () => {
+        if (released) return;
+        released = true;
+        disposeInstructions();
+      }
+    };
+  }
+  resolveAgentPreset() {
+    return this.config.agentPreset ?? this.ctx.agentPresets.defaultId;
+  }
+  async setupAgent(agentCtx, agentPreset, id) {
+    await this.ctx.agentPresets.mount(agentCtx, agentPreset);
+    this.registerWeComInstructions(agentCtx, id);
+  }
+  registerWeComInstructions(agentCtx, id) {
+    return agentCtx.systemPrompt.section({
+      name: "channel:wecom",
+      order: 190,
+      text: () => this.activeTurns.has(id) ? this.config.systemPrompt : ""
+    });
   }
   async collectReply(agent, events) {
     const texts = [];
@@ -387,7 +452,7 @@ var WeComHarnessBridge = class {
       maxReconnectAttempts: this.config.maxReconnectAttempts,
       maxAuthFailureAttempts: this.config.maxAuthFailureAttempts,
       requestTimeout: this.config.sendTimeoutMs,
-      plug_version: "deepseek-harness-wecom/0.1.0"
+      plug_version: "deepseek-harness-wecom/0.1.1"
     });
   }
   async handleWelcome(frame) {
@@ -544,6 +609,7 @@ var Config = z.object({
   secretRef: z.string().default("WECOM_BOT_SECRET"),
   accountId: z.string().default("default"),
   cwd: z.string().required(),
+  agentPreset: z.string(),
   websocketUrl: z.string().default("wss://openws.work.weixin.qq.com"),
   scene: z.number().step(1).min(0).default(1),
   singlePolicy: z.union(["open", "allowlist", "disabled"]).default("open"),
@@ -563,13 +629,22 @@ var Config = z.object({
   maxReplyBytes: z.number().step(1).min(100).max(20480).default(2e4),
   maxSeenMessageIds: z.number().step(1).min(100).max(1e5).default(5e3),
   systemPrompt: z.string().default(
-    "You are replying through WeCom. Keep replies clear and suitable for enterprise chat. Do not reveal credentials or internal system data. When a request needs an interactive approval that WeCom cannot provide, explain what approval is needed instead of waiting indefinitely."
+    "You are replying through WeCom. Keep replies clear and suitable for enterprise chat. Use WeCom-compatible Markdown for headings, lists, links, emphasis, quotes, and code when structure helps. Do not reveal credentials or internal system data. When a request needs an interactive approval that WeCom cannot provide, explain what approval is needed instead of waiting indefinitely."
   )
 });
 
 // src/index.ts
 var name = "deepseek-harness-wecom";
-var inject = ["agentDefaultModel", "agents", "attachments", "credentials", "llm", "sessionPersistence"];
+var inject = [
+  "agentDefaultModel",
+  "agentPresets",
+  "agents",
+  "attachments",
+  "credentials",
+  "llm",
+  "sessionPersistence",
+  "systemPrompt"
+];
 async function apply(ctx, config) {
   const bridge = new WeComHarnessBridge(ctx, config);
   await ctx.effect(async function* () {

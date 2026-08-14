@@ -88,11 +88,17 @@ function agentContext(): never {
     status: 'idle',
     options: { provider: 'deepseek', model: 'deepseek-chat' },
     session: { events },
-    inject: vi.fn(),
     followup: vi.fn(() => {
       events.push({
         type: 'assistant/message',
-        data: { message: { content: [{ type: 'text', text: 'model reply' }, { type: 'image', attachment: ref }] } },
+        data: {
+          message: {
+            content: [
+              { type: 'text', text: '# Model reply\n\n- first\n- second' },
+              { type: 'image', attachment: ref },
+            ],
+          },
+        },
       })
       events.push({ type: 'turn/end', data: { reason: { kind: 'completed' } } })
     }),
@@ -103,8 +109,15 @@ function agentContext(): never {
     credentials: { resolve: vi.fn(async () => ({ value: 'resolved-secret', source: 'test' })) },
     sessionPersistence: { list: vi.fn(async () => []) },
     agentDefaultModel: { currentSelection: vi.fn(() => ({ provider: 'deepseek', model: 'deepseek-chat' })) },
+    agentPresets: { defaultId: 'standard', mount: vi.fn(async () => ({ id: 'standard' })) },
     llm: { resolveModelInfo: vi.fn(async () => ({ inputModalities: ['text'] })) },
-    agents: { create: vi.fn(async () => ({ agent, dispose: vi.fn(async () => undefined) })), get: vi.fn() },
+    agents: {
+      create: vi.fn(async (options: { setup?: (ctx: never) => Promise<void> }) => {
+        await options.setup?.({ systemPrompt: { section: vi.fn(() => vi.fn()) } } as never)
+        return { agent, dispose: vi.fn(async () => undefined) }
+      }),
+      get: vi.fn(),
+    },
     attachments: {
       imageLimits: { maxImagesPerMessage: 4, maxMessageImageBytes: 10_000, maxImageBytes: 10_000 },
       readImage: vi.fn(async () => ({ ref, data: new Uint8Array([1, 2, 3]) })),
@@ -165,14 +178,14 @@ describe('WeComHarnessBridge', () => {
     await bridge.stop()
   })
 
-  it('runs an ordinary message through Harness and returns text plus image', async () => {
+  it('runs an ordinary message through Harness and preserves Markdown plus images', async () => {
     const client = new FakeClient()
     const bridge = new WeComHarnessBridge(agentContext(), testConfig(), () => client as never)
     await bridge.start()
     await client.message(textMessage('hello model', 'm-model'))
 
     expect(client.replies).toHaveLength(1)
-    expect(client.replies[0]?.content).toBe('model reply')
+    expect(client.replies[0]?.content).toBe('# Model reply\n\n- first\n- second')
     expect(client.replies[0]?.items).toHaveLength(1)
     await bridge.stop()
   })

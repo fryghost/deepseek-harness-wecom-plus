@@ -10,7 +10,7 @@ export function sessionIdFor(
   const peer = scope === 'group' ? message.chatid : message.from.userid
   if (peer === undefined || peer.length === 0) throw new Error(`WeCom ${scope} message has no peer identifier`)
   const digest = createHash('sha256').update(`${accountId}\0${scope}\0${peer}`).digest('hex').slice(0, 32)
-  return `wecom-v1-${scope}-${digest}`
+  return `wecom-v2-${scope}-${digest}`
 }
 
 /** Target id accepted by WeCom proactive-send APIs. */

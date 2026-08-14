@@ -20,6 +20,14 @@ export default defineConfig([
     outDir: '.client-build',
     platform: 'browser',
     target: 'es2022',
+    // The ModuleLoader factory scope has no `React` global, so the automatic
+    // runtime is mandatory: it requires 'react/jsx-runtime', which the web
+    // seed provides. The classic transform would emit `React.createElement`
+    // and crash every JSX component at render time. (tsup Options has no `jsx`
+    // field, so this must ride the esbuildOptions hook.)
+    esbuildOptions: (options) => {
+      options.jsx = 'automatic'
+    },
     external: [/^react/u, /^@deepseek-ai\//u],
   },
 ])

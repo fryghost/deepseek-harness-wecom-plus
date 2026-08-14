@@ -51,7 +51,7 @@
 从 GitHub 安装到 web profile（fork 后换成你的仓库地址）：
 
 ```sh
-pnpm dsh plugin --profile web add github:<your-account>/deepseek-harness-wecom-plus
+pnpm dsh plugin --profile web add github:fryghost/deepseek-harness-wecom-plus
 ```
 
 从本地检出安装：

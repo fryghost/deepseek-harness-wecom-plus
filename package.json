@@ -39,6 +39,14 @@
     "template-card"
   ],
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/fryghost/deepseek-harness-wecom-plus.git"
+  },
+  "homepage": "https://github.com/fryghost/deepseek-harness-wecom-plus#readme",
+  "bugs": {
+    "url": "https://github.com/fryghost/deepseek-harness-wecom-plus/issues"
+  },
   "dependencies": {
     "@deepseek-ai/schemastery": "^3.18.1",
     "@wecom/aibot-node-sdk": "^1.0.7"

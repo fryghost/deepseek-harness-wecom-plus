@@ -49,7 +49,7 @@ An out-of-tree [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harnes
 ## Install from GitHub
 
 ```sh
-pnpm dsh plugin --profile web add github:<your-account>/deepseek-harness-wecom-plus
+pnpm dsh plugin --profile web add github:fryghost/deepseek-harness-wecom-plus
 ```
 
 For a local checkout:

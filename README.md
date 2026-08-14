@@ -32,7 +32,7 @@ An independent out-of-tree [DeepSeek Harness](https://github.com/deepseek-ai/dee
 ## Requirements
 
 - Node.js 22.19 or later
-- pnpm 11
+- pnpm 10.33.4
 - DeepSeek Harness 0.1.0-rc.6 or later
 - A WeCom AI Bot with long connection enabled and a Bot ID/Secret
 

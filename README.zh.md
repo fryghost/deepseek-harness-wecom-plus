@@ -32,7 +32,7 @@
 ## 环境要求
 
 - Node.js 22.19 或更高版本
-- pnpm 11
+- pnpm 10.33.4
 - DeepSeek Harness 0.1.0-rc.6 或更高版本
 - 已开启长连接并取得 Bot ID、Secret 的企微智能机器人
 

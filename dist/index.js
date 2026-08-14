@@ -20,7 +20,16 @@ var CARD_LIMITS = {
   buttonText: 10,
   buttonKeyBytes: 1024,
   maxButtons: 6,
-  taskIdBytes: 128
+  taskIdBytes: 128,
+  voteOptionText: 11,
+  voteOptionIdBytes: 128,
+  maxVoteOptions: 20,
+  selectOptionText: 10,
+  selectOptionIdBytes: 128,
+  maxSelectOptions: 10,
+  maxSelects: 3,
+  selectTitle: 13,
+  questionKeyBytes: 1024
 };
 var TASK_ID_PATTERN = /^[0-9A-Za-z_@-]{1,128}$/u;
 function truncateChars(text, maxChars, suffix = "\u2026") {
@@ -89,6 +98,108 @@ function normalizeButtons(value) {
   }
   return buttons;
 }
+function normalizeOptions(value, limits, context) {
+  if (!Array.isArray(value) || value.length === 0) {
+    throw new Error(`wecom_send_card: ${context} requires a non-empty options array`);
+  }
+  if (value.length > limits.max) {
+    throw new Error(`wecom_send_card: ${context} supports at most ${limits.max} options`);
+  }
+  const options = value.map((entry) => {
+    if (typeof entry !== "object" || entry === null) {
+      throw new Error(`wecom_send_card: each ${context} option must be an object with id and text`);
+    }
+    const item = entry;
+    const id = typeof item.id === "string" ? item.id.trim() : "";
+    const text = truncateChars(typeof item.text === "string" ? item.text : "", limits.textCap);
+    if (id.length === 0 || text.length === 0) {
+      throw new Error(`wecom_send_card: each ${context} option needs a non-empty id and text`);
+    }
+    if (Buffer.byteLength(id) > limits.idBytes) {
+      throw new Error(`wecom_send_card: ${context} option id exceeds ${limits.idBytes} bytes`);
+    }
+    return {
+      id,
+      text,
+      ...item.isChecked === true ? { isChecked: true } : {}
+    };
+  });
+  const ids = /* @__PURE__ */ new Set();
+  for (let index = 0; index < options.length; index += 1) {
+    const option = options[index];
+    if (option === void 0) continue;
+    let id = option.id;
+    let suffix = 2;
+    while (ids.has(id)) id = `${option.id}-${suffix++}`;
+    ids.add(id);
+    option.id = id;
+  }
+  return options;
+}
+function normalizeCheckbox(value) {
+  if (value === void 0 || value === null) return void 0;
+  const options = normalizeOptions(value, {
+    max: CARD_LIMITS.maxVoteOptions,
+    textCap: CARD_LIMITS.voteOptionText,
+    idBytes: CARD_LIMITS.voteOptionIdBytes
+  }, "vote_interaction");
+  return {
+    question_key: "vote",
+    mode: 0,
+    option_list: options.map(({ id, text, isChecked }) => ({
+      id,
+      text,
+      ...isChecked === true ? { is_checked: true } : {}
+    }))
+  };
+}
+function normalizeSelects(value) {
+  if (value === void 0 || value === null) return void 0;
+  if (!Array.isArray(value) || value.length === 0) {
+    throw new Error("wecom_send_card: multiple_interaction requires a non-empty selects array");
+  }
+  if (value.length > CARD_LIMITS.maxSelects) {
+    throw new Error(`wecom_send_card: multiple_interaction supports at most ${CARD_LIMITS.maxSelects} selectors`);
+  }
+  return value.map((entry) => {
+    if (typeof entry !== "object" || entry === null) {
+      throw new Error("wecom_send_card: each selector must be an object with question_key and options");
+    }
+    const item = entry;
+    const questionKey = typeof item.questionKey === "string" ? item.questionKey.trim() : "";
+    if (questionKey.length === 0) {
+      throw new Error("wecom_send_card: each selector needs a non-empty question_key");
+    }
+    if (Buffer.byteLength(questionKey) > CARD_LIMITS.questionKeyBytes) {
+      throw new Error(`wecom_send_card: question_key exceeds ${CARD_LIMITS.questionKeyBytes} bytes`);
+    }
+    const title = optionalChars(
+      typeof item.title === "string" ? item.title : void 0,
+      CARD_LIMITS.selectTitle
+    );
+    const options = normalizeOptions(item.options, {
+      max: CARD_LIMITS.maxSelectOptions,
+      textCap: CARD_LIMITS.selectOptionText,
+      idBytes: CARD_LIMITS.selectOptionIdBytes
+    }, `selector "${questionKey}"`);
+    return {
+      question_key: questionKey,
+      ...title === void 0 ? {} : { title },
+      option_list: options.map(({ id, text }) => ({ id, text }))
+    };
+  });
+}
+function normalizeSubmitButton(textValue, keyValue, context) {
+  const text = truncateChars(typeof textValue === "string" ? textValue : "", CARD_LIMITS.buttonText);
+  const key = typeof keyValue === "string" ? keyValue.trim() : "";
+  if (text.length === 0 || key.length === 0) {
+    throw new Error(`wecom_send_card: ${context} requires non-empty submit_text and submit_key`);
+  }
+  if (Buffer.byteLength(key) > CARD_LIMITS.buttonKeyBytes) {
+    throw new Error(`wecom_send_card: submit_key exceeds ${CARD_LIMITS.buttonKeyBytes} bytes`);
+  }
+  return { text, key };
+}
 function buildTemplateCard(input, taskIdPrefix) {
   const title = requireTitle(input.title);
   const desc = optionalChars(input.desc, CARD_LIMITS.titleDesc);
@@ -126,21 +237,120 @@ function buildTemplateCard(input, taskIdPrefix) {
         button_list: buttons
       };
     }
+    case "vote_interaction": {
+      const checkbox = normalizeCheckbox(input.options);
+      if (checkbox === void 0) {
+        throw new Error("wecom_send_card: vote_interaction requires a non-empty options array");
+      }
+      const numeric = typeof input.voteMode === "number" ? Math.trunc(input.voteMode) : 0;
+      checkbox.mode = numeric === 1 ? 1 : 0;
+      return {
+        ...base,
+        main_title: { title, ...desc === void 0 ? {} : { desc } },
+        checkbox,
+        submit_button: normalizeSubmitButton(input.submitText, input.submitKey, "vote_interaction")
+      };
+    }
+    case "multiple_interaction": {
+      const selects = normalizeSelects(input.selects);
+      if (selects === void 0) {
+        throw new Error("wecom_send_card: multiple_interaction requires a non-empty selects array");
+      }
+      return {
+        ...base,
+        main_title: { title, ...desc === void 0 ? {} : { desc } },
+        select_list: selects,
+        submit_button: normalizeSubmitButton(input.submitText, input.submitKey, "multiple_interaction")
+      };
+    }
   }
 }
-function deriveSummaryCard(text, taskIdPrefix) {
-  const trimmed = text.trim();
-  if (trimmed.length === 0) return void 0;
-  const [first, ...rest] = trimmed.split("\n");
-  const title = truncateChars((first ?? "").replace(/^[#>+\-*]\s*/u, ""), CARD_LIMITS.title);
-  if (title.length === 0) return void 0;
-  const subtitle = optionalChars(rest.join("\n"), CARD_LIMITS.subtitle);
+function deriveAdaptiveCard(text, taskIdPrefix) {
+  const choice = deriveChoiceCard(text, taskIdPrefix);
+  if (choice !== void 0) return choice;
+  return deriveConfirmCard(text, taskIdPrefix);
+}
+var LIST_ITEM_PATTERN = /^\s*(?:\d+[.、)）]\s*|[-*•·]\s+)(.+)$/u;
+var CHOICE_CUE_PATTERN = /选择|选项|choose|select|pick|哪一个|哪个|which|回复数字|确认|是否|投票/iu;
+function deriveChoiceCard(text, taskIdPrefix) {
+  const lines = text.split("\n");
+  while (lines.length > 0 && lines[lines.length - 1]?.trim() === "") lines.pop();
+  const items = [];
+  let cueLine = "";
+  for (let index = lines.length - 1; index >= 0; index -= 1) {
+    const match = LIST_ITEM_PATTERN.exec(lines[index] ?? "");
+    if (match === null) {
+      cueLine = lines[index] ?? "";
+      break;
+    }
+    items.unshift(match[1] ?? "");
+  }
+  if (items.length < 2 || items.length > CARD_LIMITS.maxButtons) return void 0;
+  if (cueLine === "") return void 0;
+  const labels = [];
+  let allShort = true;
+  for (const item of items) {
+    const label = optionLabel(item);
+    if (label === void 0) return void 0;
+    if (label.length > CARD_LIMITS.buttonText) allShort = false;
+    labels.push(label);
+  }
+  const cue = CHOICE_CUE_PATTERN.test(cueLine);
+  if (!cue && !(allShort && cueLine.trim().endsWith("\uFF1F"))) return void 0;
+  const buttons = labels.map((label, index) => ({
+    text: label,
+    key: `opt-${index + 1}`
+  }));
+  const title = truncateChars(stripMarkdownPrefix(cueLine).replace(/[：:？?。.!！]+$/u, ""), CARD_LIMITS.title) || "\u8BF7\u9009\u62E9";
+  const card = buildTemplateCard({
+    cardType: "button_interaction",
+    title,
+    buttons
+  }, taskIdPrefix);
+  const keyLabels = /* @__PURE__ */ new Map();
+  for (let index = 0; index < buttons.length; index += 1) {
+    const button = buttons[index];
+    if (button !== void 0) keyLabels.set(button.key, labels[index] ?? button.text);
+  }
+  return { card, labels: keyLabels };
+}
+var CONFIRM_QUESTION_PATTERN = /是否|要不要|需不需要|确认|继续|取消/u;
+function deriveConfirmCard(text, taskIdPrefix) {
+  const lines = text.trim().split("\n");
+  const last = lines[lines.length - 1]?.trim() ?? "";
+  if (!last.endsWith("\uFF1F") && !last.endsWith("?")) return void 0;
+  if (!CONFIRM_QUESTION_PATTERN.test(last)) return void 0;
+  const verb = /继续/u.test(last) ? "\u7EE7\u7EED" : "\u786E\u8BA4";
+  const buttons = [
+    { text: verb, key: "confirm", style: 1 },
+    { text: "\u53D6\u6D88", key: "cancel", style: 2 }
+  ];
+  const title = truncateChars(stripMarkdownPrefix(last).replace(/[：:？?。.!！]+$/u, ""), CARD_LIMITS.title) || verb;
+  const card = buildTemplateCard({
+    cardType: "button_interaction",
+    title,
+    buttons
+  }, taskIdPrefix);
   return {
-    card_type: "text_notice",
-    main_title: { title },
-    ...subtitle === void 0 ? {} : { sub_title_text: subtitle },
-    task_id: generateTaskId(taskIdPrefix)
+    card,
+    labels: /* @__PURE__ */ new Map([
+      ["confirm", verb],
+      ["cancel", "\u53D6\u6D88"]
+    ])
   };
+}
+function optionLabel(item) {
+  const content = item.trim();
+  if (content.length === 0) return void 0;
+  const separator = content.search(/[：:｜|—–-]/u);
+  if (separator > 0) {
+    const head = content.slice(0, separator).trim();
+    return head.length === 0 ? void 0 : stripMarkdownPrefix(head);
+  }
+  return content.length <= CARD_LIMITS.buttonText ? content : void 0;
+}
+function stripMarkdownPrefix(value) {
+  return value.replace(/^[#>+\-*]\s*/u, "").replace(/[*_`~]/gu, "").trim();
 }
 
 // src/conversations.ts
@@ -434,6 +644,7 @@ async function resolveOutboundFile(cwd, requestedPath, maxBytes) {
 }
 
 // src/conversations.ts
+var MAX_CARD_LABEL_TASKS = 500;
 var ConversationManager = class {
   constructor(ctx, config, sendFile) {
     this.ctx = ctx;
@@ -448,6 +659,7 @@ var ConversationManager = class {
   queues = /* @__PURE__ */ new Map();
   activeTurns = /* @__PURE__ */ new Map();
   pendingCards = /* @__PURE__ */ new Map();
+  cardLabels = /* @__PURE__ */ new Map();
   generations = /* @__PURE__ */ new Map();
   persistedIds = /* @__PURE__ */ new Set();
   /** Snapshot persisted identities once before accepting traffic. */
@@ -461,9 +673,20 @@ var ConversationManager = class {
     return this.enqueue(baseId, () => this.processNow(this.currentSessionId(baseId), message, client));
   }
   /** Process one template card button click as a user message into the same conversation. */
-  processCardEvent(message) {
+  processCardEvent(message, selectedLabel) {
     const baseId = sessionIdFor(this.config.accountId, message);
-    return this.enqueue(baseId, () => this.processCardEventNow(this.currentSessionId(baseId), message));
+    return this.enqueue(baseId, () => this.processCardEventNow(this.currentSessionId(baseId), message, selectedLabel));
+  }
+  /**
+   * Resolve one card click back to the visible option label the card carried.
+   * WeCom only echoes the key (event_key), so the bridge stores every sent
+   * card's key → label mapping here.
+   */
+  cardLabel(taskId, eventKey) {
+    if (taskId === void 0 || taskId.length === 0 || eventKey === void 0 || eventKey.length === 0) {
+      return void 0;
+    }
+    return this.cardLabels.get(taskId)?.get(eventKey);
   }
   /** End the current WeCom conversation session while retaining its history. */
   async reset(message) {
@@ -533,6 +756,7 @@ var ConversationManager = class {
     this.bindings.clear();
     this.activeTurns.clear();
     this.pendingCards.clear();
+    this.cardLabels.clear();
   }
   enqueue(baseId, operation) {
     const previous = this.queues.get(baseId) ?? Promise.resolve();
@@ -578,7 +802,7 @@ var ConversationManager = class {
       this.activeTurns.delete(id);
     }
   }
-  async processCardEventNow(id, message) {
+  async processCardEventNow(id, message, selectedLabel) {
     const binding = await this.getOrCreate(id);
     const agent = binding.agent;
     const scope = message.chattype === "group" ? "WeCom group" : "WeCom private chat";
@@ -590,7 +814,9 @@ var ConversationManager = class {
         `[${scope} template card button click from WeCom user ${message.from.userid}]`,
         `task_id: ${taskId}`,
         `event_key: ${eventKey}`,
-        "The user clicked a button on a WeCom template card you sent earlier. Answer the click in your reply."
+        ...selectedLabel === void 0 ? [] : [`selected option: ${selectedLabel}`],
+        `raw event: ${JSON.stringify(message.event)}`,
+        "The user clicked a button (or submitted a selection) on a WeCom template card you sent earlier. Answer the click in your reply."
       ].join("\n")
     }];
     await withTimeout(agent.whenIdle(), this.config.responseTimeoutMs, "DeepSeek Harness conversation availability");
@@ -606,16 +832,18 @@ var ConversationManager = class {
     }
   }
   /**
-   * Attach the turn's queued cards to a collected reply. In "auto" mode a
-   * derived text_notice summary card accompanies the Markdown reply whenever
-   * the model did not send an explicit card first.
+   * Attach the turn's queued cards to a collected reply. In "auto" mode an
+   * adaptive interaction card accompanies the Markdown reply whenever the
+   * reply asks the user to choose or confirm and the model did not send an
+   * explicit card first.
    */
   finalizeReply(id, collected) {
     const cards = this.takeCards(id);
     if (this.config.cardMode === "auto" && cards.length === 0 && collected.text.trim().length > 0) {
-      const derived = deriveSummaryCard(collected.text, this.config.cardTaskIdPrefix);
-      if (derived !== void 0) cards.push(derived);
+      const derived = deriveAdaptiveCard(collected.text, this.config.cardTaskIdPrefix);
+      if (derived !== void 0) cards.push(derived.card);
     }
+    this.registerCardLabels(cards);
     return { ...collected, cards };
   }
   /** Drain and clear the template cards queued by one active turn's tools. */
@@ -623,6 +851,30 @@ var ConversationManager = class {
     const cards = this.pendingCards.get(id) ?? [];
     this.pendingCards.delete(id);
     return cards;
+  }
+  /**
+   * Remember every sent card's button key → visible label pairs so a later
+   * click (which only echoes event_key) can be resolved to the chosen option.
+   */
+  registerCardLabels(cards) {
+    for (const card of cards) {
+      const taskId = card.task_id;
+      if (taskId === void 0) continue;
+      let labels = this.cardLabels.get(taskId);
+      if (labels === void 0) {
+        labels = /* @__PURE__ */ new Map();
+        this.cardLabels.set(taskId, labels);
+        while (this.cardLabels.size > MAX_CARD_LABEL_TASKS) {
+          const oldest = this.cardLabels.keys().next().value;
+          if (oldest === void 0) break;
+          this.cardLabels.delete(oldest);
+        }
+      }
+      for (const button of card.button_list ?? []) labels.set(button.key, button.text);
+      if (card.submit_button !== void 0) {
+        labels.set(card.submit_button.key, `\u63D0\u4EA4\uFF1A${card.submit_button.text}`);
+      }
+    }
   }
   async includeImages(agent) {
     if (this.config.imageInputMode === "always") return true;
@@ -772,13 +1024,13 @@ var ConversationManager = class {
   registerCardTool(agentCtx, id) {
     return agentCtx.tools.register(defineTool({
       name: "wecom_send_card",
-      description: "Send one WeCom template card to the user who initiated the current WeCom turn. The card is delivered as a second message right after the main Markdown reply, so one turn becomes one Markdown message plus one card. Use it for condensed summaries or selectable choices (button_interaction). Display text is truncated to the WeCom card limits (title 26, desc 30, subtitle 112, button text 10 characters), so keep it short instead of duplicating the full reply. Only valid during an active WeCom turn.",
+      description: "Send one WeCom template card to the user who initiated the current WeCom turn. The card is delivered as a second message right after the main Markdown reply, so one turn becomes one Markdown message plus one card. Prefer this tool when the user must choose among options or confirm/cancel an action: put the FULL option details in your Markdown reply and put SHORT labels (at most 10 characters) on the card buttons, because button text is truncated by the WeCom client. Display text is truncated to the WeCom card limits (title 26, desc 30, subtitle 112 characters), so never duplicate the full reply inside the card. Only valid during an active WeCom turn.",
       parameters: {
         card_type: {
           type: "string",
           required: true,
-          enum: ["text_notice", "news_notice", "button_interaction"],
-          description: "Card layout: text_notice (title + subtitle), news_notice (image card, needs image_url), button_interaction (buttons the user can click; clicks come back as WeCom messages carrying task_id and event_key)."
+          enum: ["text_notice", "news_notice", "button_interaction", "vote_interaction", "multiple_interaction"],
+          description: "Card layout: text_notice (title + subtitle), news_notice (image card, needs image_url), button_interaction (option/confirm buttons), vote_interaction (checkbox list + submit), multiple_interaction (up to 3 dropdown selectors + submit). Clicks and submissions come back as WeCom messages carrying task_id and event_key."
         },
         title: {
           type: "string",
@@ -799,12 +1051,62 @@ var ConversationManager = class {
             type: "object",
             additionalProperties: false,
             properties: {
-              text: { type: "string", required: true, description: "Button label, capped at 10 characters." },
+              text: { type: "string", required: true, description: "Short option label, capped at 10 characters." },
               key: { type: "string", required: true, description: "Stable key echoed back on click (event_key), max 1024 bytes." },
               style: { type: "integer", description: "Button style 1-4; defaults to 1." }
             }
           },
-          description: "Buttons for button_interaction cards; 1 to 6 entries."
+          description: "Buttons for button_interaction cards; 1 to 6 entries. Keep labels short; spell out the full option details in your Markdown reply instead."
+        },
+        options: {
+          type: "array",
+          items: {
+            type: "object",
+            additionalProperties: false,
+            properties: {
+              id: { type: "string", required: true, description: "Option id, max 128 bytes, unique." },
+              text: { type: "string", required: true, description: "Option label, capped at 11 characters." },
+              is_checked: { type: "boolean", description: "Whether the option is checked by default." }
+            }
+          },
+          description: "Options for vote_interaction cards; 1 to 20 entries."
+        },
+        vote_mode: {
+          type: "integer",
+          description: "vote_interaction mode: 0 single choice (default), 1 multiple choice."
+        },
+        selects: {
+          type: "array",
+          items: {
+            type: "object",
+            additionalProperties: false,
+            properties: {
+              question_key: { type: "string", required: true, description: "Selector key, max 1024 bytes, unique." },
+              title: { type: "string", description: "Selector title, capped at 13 characters." },
+              options: {
+                type: "array",
+                required: true,
+                items: {
+                  type: "object",
+                  additionalProperties: false,
+                  properties: {
+                    id: { type: "string", required: true, description: "Option id, max 128 bytes, unique." },
+                    text: { type: "string", required: true, description: "Option label, capped at 10 characters." }
+                  }
+                },
+                description: "Dropdown options; 1 to 10 entries."
+              }
+            }
+          },
+          description: "Dropdown selectors for multiple_interaction cards; 1 to 3 entries."
+        },
+        submit_text: {
+          type: "string",
+          description: "Submit button label for vote/multiple cards, capped at 10 characters; required for those types."
+        },
+        submit_key: {
+          type: "string",
+          description: "Submit button key echoed back on submission (event_key), max 1024 bytes; required for vote/multiple cards."
         },
         image_url: {
           type: "string",
@@ -850,6 +1152,17 @@ var ConversationManager = class {
           ...args.desc === void 0 ? {} : { desc: args.desc },
           ...args.subtitle === void 0 ? {} : { subtitle: args.subtitle },
           ...args.buttons === void 0 ? {} : { buttons: args.buttons },
+          ...args.options === void 0 ? {} : { options: args.options },
+          ...args.selects === void 0 ? {} : {
+            selects: args.selects.map((select) => ({
+              questionKey: select.question_key,
+              ...select.title === void 0 ? {} : { title: select.title },
+              options: select.options
+            }))
+          },
+          ...args.vote_mode === void 0 ? {} : { voteMode: args.vote_mode },
+          ...args.submit_text === void 0 ? {} : { submitText: args.submit_text },
+          ...args.submit_key === void 0 ? {} : { submitKey: args.submit_key },
           ...args.image_url === void 0 ? {} : { imageUrl: args.image_url },
           ...args.jump_url === void 0 ? {} : { jumpUrl: args.jump_url },
           ...args.task_id === void 0 ? {} : { taskId: args.task_id }
@@ -1063,7 +1376,10 @@ var WeComHarnessBridge = class {
       }
     }
     try {
-      const reply = await this.conversations.processCardEvent(body);
+      const reply = await this.conversations.processCardEvent(
+        body,
+        this.conversations.cardLabel(taskId, body.event.event_key)
+      );
       await this.sendProactive(chatTarget(body), reply);
     } catch (error) {
       this.log.error("WeCom card click %s failed: %s", body.msgid, String(error));
@@ -1410,7 +1726,7 @@ var Config = z.object({
   maxInboundFileBytes: z.number().step(1).min(1).max(WECOM_FILE_MAX_BYTES).default(WECOM_FILE_MAX_BYTES),
   maxOutboundFileBytes: z.number().step(1).min(1).max(WECOM_FILE_MAX_BYTES).default(WECOM_FILE_MAX_BYTES),
   systemPrompt: z.string().default(
-    "You are replying through WeCom. Keep replies clear and suitable for enterprise chat. Use WeCom-compatible Markdown for headings, lists, links, emphasis, quotes, and code when structure helps. When the WeCom user asks to receive an existing workspace file, use wecom_send_file instead of claiming that file attachments are unavailable or pasting the whole file. When the reply benefits from a condensed summary or selectable choices, call wecom_send_card: the card is delivered as a second message right after your Markdown reply (one turn \u2192 one Markdown message + one card). Keep card text short \u2014 the title is capped at 26 characters, the subtitle at 112, and button text at 10 \u2014 and never duplicate the whole reply inside the card. When a user clicks a card button, the click arrives as a WeCom message containing its task_id and event_key; answer that click in your reply. Inbound WeCom files are already downloaded and decrypted; their absolute local paths appear in the user message. Use the available file or shell tools to inspect those paths when the user asks you to process an attachment. Do not reveal credentials or internal system data. When a request needs an interactive approval that WeCom cannot provide, explain what approval is needed instead of waiting indefinitely."
+    "You are replying through WeCom. Keep replies clear and suitable for enterprise chat. Use WeCom-compatible Markdown for headings, lists, links, emphasis, quotes, and code when structure helps. When the WeCom user asks to receive an existing workspace file, use wecom_send_file instead of claiming that file attachments are unavailable or pasting the whole file. When the user must choose among options or confirm/cancel an action, pair your reply with a card: put the FULL option details (what each choice does) in your Markdown reply, then call wecom_send_card with button_interaction whose buttons carry SHORT labels (at most 10 characters, or the WeCom client truncates them). One turn therefore renders as one Markdown message + one card. For lists of choices you may use vote_interaction (checkbox) or multiple_interaction (dropdowns) instead; keep every label within its cap and never duplicate the whole reply inside the card. When a user clicks a card button or submits a selection, the click arrives as a WeCom message carrying task_id and event_key (plus the selected label when known); answer that click in your reply. Inbound WeCom files are already downloaded and decrypted; their absolute local paths appear in the user message. Use the available file or shell tools to inspect those paths when the user asks you to process an attachment. Do not reveal credentials or internal system data. When a request needs an interactive approval that WeCom cannot provide, explain what approval is needed instead of waiting indefinitely."
   )
 });
 

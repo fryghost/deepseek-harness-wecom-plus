@@ -20,9 +20,13 @@ export type ImageInputMode = 'auto' | 'always' | 'never'
 
 /**
  * How template cards accompany model replies.
- * - "auto": every model turn sends one Markdown message plus one derived
- *   text_notice summary card, unless the model sent an explicit card first.
- * - "tool": cards are only sent when the model calls `wecom_send_card`.
+ * - "auto" (default): adaptive interaction cards. Explicit `wecom_send_card`
+ *   calls always win; otherwise the bridge inspects the reply and adds a
+ *   button card automatically when the reply asks the user to choose among
+ *   options or confirm/cancel — the Markdown message keeps the full details,
+ *   the card carries the short option buttons. Informational replies get no
+ *   card, so ordinary chat stays clean.
+ * - "tool": cards are sent only when the model calls `wecom_send_card`.
  * - "off": no cards; `wecom_send_card` fails with a teaching error.
  */
 export type CardMode = 'auto' | 'tool' | 'off'
@@ -103,12 +107,14 @@ export const Config: z<Config> = z.object({
     + 'Use WeCom-compatible Markdown for headings, lists, links, emphasis, quotes, and code when structure helps. '
     + 'When the WeCom user asks to receive an existing workspace file, use wecom_send_file instead of '
     + 'claiming that file attachments are unavailable or pasting the whole file. '
-    + 'When the reply benefits from a condensed summary or selectable choices, call wecom_send_card: '
-    + 'the card is delivered as a second message right after your Markdown reply (one turn → one Markdown '
-    + 'message + one card). Keep card text short — the title is capped at 26 characters, the subtitle at 112, '
-    + 'and button text at 10 — and never duplicate the whole reply inside the card. When a user clicks a card '
-    + 'button, the click arrives as a WeCom message containing its task_id and event_key; answer that click '
-    + 'in your reply. '
+    + 'When the user must choose among options or confirm/cancel an action, pair your reply with a card: '
+    + 'put the FULL option details (what each choice does) in your Markdown reply, then call wecom_send_card '
+    + 'with button_interaction whose buttons carry SHORT labels (at most 10 characters, or the WeCom client '
+    + 'truncates them). One turn therefore renders as one Markdown message + one card. For lists of choices '
+    + 'you may use vote_interaction (checkbox) or multiple_interaction (dropdowns) instead; keep every label '
+    + 'within its cap and never duplicate the whole reply inside the card. When a user clicks a card button '
+    + 'or submits a selection, the click arrives as a WeCom message carrying task_id and event_key (plus the '
+    + 'selected label when known); answer that click in your reply. '
     + 'Inbound WeCom files are already downloaded and decrypted; their absolute local paths appear in the user message. '
     + 'Use the available file or shell tools to inspect those paths when the user asks you to process an attachment. '
     + 'Do not reveal credentials or internal system data. When a request needs an interactive approval '

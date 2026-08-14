@@ -6,8 +6,9 @@ An out-of-tree [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harnes
 
 ## What plus adds
 
-- **Template cards out**: the model can send `text_notice`, `news_notice`, or `button_interaction` cards through the `wecom_send_card` tool; with `cardMode: auto` (default), every model reply is paired with a derived summary card, so one turn renders as *one Markdown message + one card*.
-- **Card button clicks in**: official `template_card_event` handling — the click is acknowledged locally inside the protocol's 5-second update window (no model involved), then injected into the conversation as a user message carrying `task_id`/`event_key`; the model's reply is pushed proactively (Markdown + card).
+- **Template cards out**: the model can send `text_notice`, `news_notice`, `button_interaction`, `vote_interaction`, or `multiple_interaction` cards through the `wecom_send_card` tool, with protocol-aware text truncation.
+- **Adaptive paired messages (`cardMode: auto`, default)**: one reply renders as *one Markdown message + one interaction card* — replies that end in an option list or a confirm question automatically get a button card (Markdown keeps the full option details, buttons keep the short labels), while informational replies get no card.
+- **Card button clicks in**: official `template_card_event` handling — a 5-second local card acknowledgement, key → label resolution back to the chosen option, then the click injected as a user message and the model's reply pushed proactively (Markdown + card).
 - **`/bot-card-test`** self-check command and `cardMode`, `cardTaskIdPrefix`, `cardClickAckTitle`, `cardClickAckSubtitle` configuration.
 
 ## Features
@@ -22,8 +23,8 @@ An out-of-tree [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harnes
 - Automatic text-only fallback when the selected model cannot accept images
 - Text and inline image replies, plus uploaded active image sends for other image formats
 - A WeCom-turn-scoped `wecom_send_file` tool with workspace containment and file-size checks
-- A WeCom-turn-scoped `wecom_send_card` tool for text/news/button template cards, delivered right after the Markdown reply
-- `cardMode: auto` Markdown+card pairing with protocol-aware text truncation (title 26, subtitle 112, button text 10 characters)
+- A WeCom-turn-scoped `wecom_send_card` tool for text/news/button/vote/multiple-select template cards, delivered right after the Markdown reply
+- `cardMode: auto` adaptive interaction pairing: option lists and confirm questions get button cards automatically; informational replies stay card-free
 - `template_card_event` button clicks with a 5-second local card acknowledgement and a proactive model reply
 - WeCom Markdown replies through the official stream response fields
 - One persistent Harness session per single or group conversation
@@ -107,16 +108,33 @@ WeCom's official SDK defines the `replyStream` content field as Markdown-capable
 
 ## Template cards and button interactions
 
-Template cards have strict row and character limits, and cramming a long reply into one card renders poorly. The default presentation (`cardMode: auto`) pairs every model reply as *one Markdown message + one summary card*: the Markdown carries the full answer while the `text_notice` card carries only the condensed summary, with title (26) and subtitle (112) characters auto-truncated.
+Template cards have strict row and character limits, and cramming a long reply into one card renders poorly. Cards therefore carry only the **interaction surface**: the Markdown message keeps the full content, the card carries short button/option labels. One reply renders as *one Markdown message + one card*.
 
-- `cardMode: auto` (default): every model reply gets a derived summary card, unless the model already sent an explicit card through `wecom_send_card`.
-- `cardMode: tool`: cards are sent only when the model calls `wecom_send_card` (`text_notice`, `news_notice`, or `button_interaction`).
+`cardMode` controls how cards are produced:
+
+- `cardMode: auto` (default, adaptive): explicit `wecom_send_card` calls always win; otherwise the bridge inspects the reply and adds an interaction card automatically —
+  - a trailing option list with a choice cue (2–6 numbered or bulleted items, e.g. "请选择：1. 发布 2. 灰度 3. 暂不发布") becomes a `button_interaction` card whose buttons hold each item's short head label;
+  - a yes/no or confirm question becomes a 确认/取消 (or 继续/取消) button card;
+  - informational replies get no card, so ordinary chat stays clean.
+- `cardMode: tool`: cards are sent only when the model calls `wecom_send_card`.
 - `cardMode: off`: cards are disabled; `wecom_send_card` fails with a teaching error.
 
-The turn-scoped `wecom_send_card` tool can send a `button_interaction` card with 1–6 buttons (labels capped at 10 characters, keys at 1024 bytes). When a user clicks a button, WeCom pushes `template_card_event` and the plugin:
+`wecom_send_card` supports five card layouts:
+
+| Card | Use |
+| --- | --- |
+| `button_interaction` | option/confirm buttons (1–6, labels capped at 10 characters) |
+| `vote_interaction` | checkbox vote (1–20 options, single/multiple) + submit button |
+| `multiple_interaction` | up to 3 dropdown selectors + submit button |
+| `text_notice` | title + subtitle notification card |
+| `news_notice` | image card (requires `image_url`, optional whole-card jump) |
+
+All display text is truncated against the protocol caps (title 26, desc 30, subtitle 112, button 10, vote option 11 characters); button keys, option ids, and task ids are validated and deduplicated, and task ids are auto-generated when omitted.
+
+When a user clicks a button or submits a selection, WeCom pushes `template_card_event` (carrying only `task_id` and `event_key`). The plugin:
 
 1. updates the card in place within the protocol's **5-second window** using local acknowledgement text (`cardClickAckTitle`/`cardClickAckSubtitle`, default "正在处理…"), without involving the model;
-2. injects the click into the conversation's durable session as a user message carrying `task_id` and `event_key`;
+2. resolves `event_key` back to the visible option label through a key → label registry recorded when the card was sent (WeCom echoes only the key), then injects the click — task id, event key, resolved label, and the raw event — into the conversation's durable session as a user message;
 3. pushes the model's reply proactively as Markdown + card, keeping the same paired-message presentation.
 
 Because one model turn usually exceeds the 5-second window, click-time card updates are always plugin-local; the model's answer arrives as new messages rather than rewriting the card in place.
@@ -139,11 +157,11 @@ pong — DeepSeek Harness 企微机器人已连接。
 
 Send `/bot-image-test` to exercise the official inline-image reply fields without depending on model-generated media. The bot should return a blue PNG and a success message.
 
-Send `/bot-card-test` to exercise the template-card and button-interaction path without invoking a model. The bot should send a `button_interaction` card with "确认收到 / 再想想" buttons. Clicking a button should first update the card in place to the acknowledgement text within seconds, then deliver the model's reply (with a summary card unless `cardMode` is off).
+Send `/bot-card-test` to exercise the template-card and button-interaction path without invoking a model. The bot should send a `button_interaction` card with "确认收到 / 再想想" buttons. Clicking a button should first update the card in place to the acknowledgement text within seconds, then deliver the model's reply.
 
 Send `/bot-file-test` to exercise the official temporary-media upload and active file-send APIs without invoking a model. The bot should send `wecom-file-test.txt` followed by a success message. Then ask the agent to send an existing workspace file, such as `Send README.md as a file`; the session should contain a `wecom_send_file` call and WeCom should receive the attachment.
 
-Then send ordinary text, an image, or a mixed text/image message. The plugin appends it to the conversation's durable Harness session and returns the selected default model's response. With `cardMode: auto`, the reply should render as a Markdown message plus a summary card; asking for choices should produce a `wecom_send_card` call and a button card.
+Then send ordinary text, an image, or a mixed text/image message. The plugin appends it to the conversation's durable Harness session and returns the selected default model's response. With `cardMode: auto`, a reply that asks the user to choose renders as a Markdown message plus a button card; clicking a button first updates the card to the acknowledgement text, then delivers the model's answer. Plain informational questions should get no card.
 
 Send `/new` and verify that the bot confirms a fresh conversation. A subsequent question about details from the old conversation must not reuse that context. `/compact`, `/goal`, and `/plan` should display the direct Harness command result instead of a model explanation. Unknown or disabled slash commands must be rejected without reaching the model.
 

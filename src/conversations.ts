@@ -14,7 +14,7 @@ import type {
   TemplateCard,
   TemplateCardEventData,
 } from '@wecom/aibot-node-sdk'
-import { buildTemplateCard, deriveSummaryCard, type CardInput } from './card.js'
+import { buildTemplateCard, deriveAdaptiveCard, type CardInput } from './card.js'
 import type { Config } from './config.js'
 import { inboundContent, type WeComDownloadPort } from './inbound.js'
 import { resolveOutboundFile, type OutboundFile } from './outbound-file.js'
@@ -37,6 +37,9 @@ export interface ConversationCommandReply {
 /** Upload one validated local file to the active WeCom reply target. */
 export type ConversationFileSender = (target: string, file: OutboundFile) => Promise<void>
 
+/** Bound on remembered card label registries; oldest tasks are evicted first. */
+const MAX_CARD_LABEL_TASKS = 500
+
 /** One live agent plus only the lifecycle capability this manager owns. */
 interface ConversationAgentBinding {
   agent: Agent
@@ -50,6 +53,7 @@ export class ConversationManager {
   private readonly queues = new Map<string, Promise<unknown>>()
   private readonly activeTurns = new Map<string, string>()
   private readonly pendingCards = new Map<string, TemplateCard[]>()
+  private readonly cardLabels = new Map<string, Map<string, string>>()
   private readonly generations = new Map<string, number>()
   private persistedIds = new Set<string>()
 
@@ -72,9 +76,24 @@ export class ConversationManager {
   }
 
   /** Process one template card button click as a user message into the same conversation. */
-  processCardEvent(message: EventMessageWith<TemplateCardEventData>): Promise<ConversationReply> {
+  processCardEvent(
+    message: EventMessageWith<TemplateCardEventData>,
+    selectedLabel?: string,
+  ): Promise<ConversationReply> {
     const baseId = sessionIdFor(this.config.accountId, message)
-    return this.enqueue(baseId, () => this.processCardEventNow(this.currentSessionId(baseId), message))
+    return this.enqueue(baseId, () => this.processCardEventNow(this.currentSessionId(baseId), message, selectedLabel))
+  }
+
+  /**
+   * Resolve one card click back to the visible option label the card carried.
+   * WeCom only echoes the key (event_key), so the bridge stores every sent
+   * card's key → label mapping here.
+   */
+  cardLabel(taskId: string | undefined, eventKey: string | undefined): string | undefined {
+    if (taskId === undefined || taskId.length === 0 || eventKey === undefined || eventKey.length === 0) {
+      return undefined
+    }
+    return this.cardLabels.get(taskId)?.get(eventKey)
   }
 
   /** End the current WeCom conversation session while retaining its history. */
@@ -150,6 +169,7 @@ export class ConversationManager {
     this.bindings.clear()
     this.activeTurns.clear()
     this.pendingCards.clear()
+    this.cardLabels.clear()
   }
 
   private enqueue<T>(baseId: string, operation: () => Promise<T>): Promise<T> {
@@ -207,6 +227,7 @@ export class ConversationManager {
   private async processCardEventNow(
     id: string,
     message: EventMessageWith<TemplateCardEventData>,
+    selectedLabel?: string,
   ): Promise<ConversationReply> {
     const binding = await this.getOrCreate(id)
     const agent = binding.agent
@@ -219,7 +240,10 @@ export class ConversationManager {
         `[${scope} template card button click from WeCom user ${message.from.userid}]`,
         `task_id: ${taskId}`,
         `event_key: ${eventKey}`,
-        'The user clicked a button on a WeCom template card you sent earlier. Answer the click in your reply.',
+        ...(selectedLabel === undefined ? [] : [`selected option: ${selectedLabel}`]),
+        `raw event: ${JSON.stringify(message.event)}`,
+        'The user clicked a button (or submitted a selection) on a WeCom template card you sent earlier. '
+        + 'Answer the click in your reply.',
       ].join('\n'),
     }]
     await withTimeout(agent.whenIdle(), this.config.responseTimeoutMs, 'DeepSeek Harness conversation availability')
@@ -236,16 +260,18 @@ export class ConversationManager {
   }
 
   /**
-   * Attach the turn's queued cards to a collected reply. In "auto" mode a
-   * derived text_notice summary card accompanies the Markdown reply whenever
-   * the model did not send an explicit card first.
+   * Attach the turn's queued cards to a collected reply. In "auto" mode an
+   * adaptive interaction card accompanies the Markdown reply whenever the
+   * reply asks the user to choose or confirm and the model did not send an
+   * explicit card first.
    */
   private finalizeReply(id: string, collected: Omit<ConversationReply, 'cards'>): ConversationReply {
     const cards = this.takeCards(id)
     if (this.config.cardMode === 'auto' && cards.length === 0 && collected.text.trim().length > 0) {
-      const derived = deriveSummaryCard(collected.text, this.config.cardTaskIdPrefix)
-      if (derived !== undefined) cards.push(derived)
+      const derived = deriveAdaptiveCard(collected.text, this.config.cardTaskIdPrefix)
+      if (derived !== undefined) cards.push(derived.card)
     }
+    this.registerCardLabels(cards)
     return { ...collected, cards }
   }
 
@@ -254,6 +280,31 @@ export class ConversationManager {
     const cards = this.pendingCards.get(id) ?? []
     this.pendingCards.delete(id)
     return cards
+  }
+
+  /**
+   * Remember every sent card's button key → visible label pairs so a later
+   * click (which only echoes event_key) can be resolved to the chosen option.
+   */
+  private registerCardLabels(cards: readonly TemplateCard[]): void {
+    for (const card of cards) {
+      const taskId = card.task_id
+      if (taskId === undefined) continue
+      let labels = this.cardLabels.get(taskId)
+      if (labels === undefined) {
+        labels = new Map()
+        this.cardLabels.set(taskId, labels)
+        while (this.cardLabels.size > MAX_CARD_LABEL_TASKS) {
+          const oldest = this.cardLabels.keys().next().value
+          if (oldest === undefined) break
+          this.cardLabels.delete(oldest)
+        }
+      }
+      for (const button of card.button_list ?? []) labels.set(button.key, button.text)
+      if (card.submit_button !== undefined) {
+        labels.set(card.submit_button.key, `提交：${card.submit_button.text}`)
+      }
+    }
   }
 
   private async includeImages(agent: Agent): Promise<boolean> {
@@ -420,17 +471,20 @@ export class ConversationManager {
       name: 'wecom_send_card',
       description: 'Send one WeCom template card to the user who initiated the current WeCom turn. '
         + 'The card is delivered as a second message right after the main Markdown reply, so one turn becomes '
-        + 'one Markdown message plus one card. Use it for condensed summaries or selectable choices '
-        + '(button_interaction). Display text is truncated to the WeCom card limits (title 26, desc 30, '
-        + 'subtitle 112, button text 10 characters), so keep it short instead of duplicating the full reply. '
-        + 'Only valid during an active WeCom turn.',
+        + 'one Markdown message plus one card. Prefer this tool when the user must choose among options or '
+        + 'confirm/cancel an action: put the FULL option details in your Markdown reply and put SHORT labels '
+        + '(at most 10 characters) on the card buttons, because button text is truncated by the WeCom client. '
+        + 'Display text is truncated to the WeCom card limits (title 26, desc 30, subtitle 112 characters), '
+        + 'so never duplicate the full reply inside the card. Only valid during an active WeCom turn.',
       parameters: {
         card_type: {
           type: 'string',
           required: true,
-          enum: ['text_notice', 'news_notice', 'button_interaction'],
+          enum: ['text_notice', 'news_notice', 'button_interaction', 'vote_interaction', 'multiple_interaction'],
           description: 'Card layout: text_notice (title + subtitle), news_notice (image card, needs image_url), '
-            + 'button_interaction (buttons the user can click; clicks come back as WeCom messages carrying task_id and event_key).',
+            + 'button_interaction (option/confirm buttons), vote_interaction (checkbox list + submit), '
+            + 'multiple_interaction (up to 3 dropdown selectors + submit). Clicks and submissions come back as '
+            + 'WeCom messages carrying task_id and event_key.',
         },
         title: {
           type: 'string',
@@ -451,12 +505,63 @@ export class ConversationManager {
             type: 'object',
             additionalProperties: false,
             properties: {
-              text: { type: 'string', required: true, description: 'Button label, capped at 10 characters.' },
+              text: { type: 'string', required: true, description: 'Short option label, capped at 10 characters.' },
               key: { type: 'string', required: true, description: 'Stable key echoed back on click (event_key), max 1024 bytes.' },
               style: { type: 'integer', description: 'Button style 1-4; defaults to 1.' },
             },
           },
-          description: 'Buttons for button_interaction cards; 1 to 6 entries.',
+          description: 'Buttons for button_interaction cards; 1 to 6 entries. Keep labels short; '
+            + 'spell out the full option details in your Markdown reply instead.',
+        },
+        options: {
+          type: 'array',
+          items: {
+            type: 'object',
+            additionalProperties: false,
+            properties: {
+              id: { type: 'string', required: true, description: 'Option id, max 128 bytes, unique.' },
+              text: { type: 'string', required: true, description: 'Option label, capped at 11 characters.' },
+              is_checked: { type: 'boolean', description: 'Whether the option is checked by default.' },
+            },
+          },
+          description: 'Options for vote_interaction cards; 1 to 20 entries.',
+        },
+        vote_mode: {
+          type: 'integer',
+          description: 'vote_interaction mode: 0 single choice (default), 1 multiple choice.',
+        },
+        selects: {
+          type: 'array',
+          items: {
+            type: 'object',
+            additionalProperties: false,
+            properties: {
+              question_key: { type: 'string', required: true, description: 'Selector key, max 1024 bytes, unique.' },
+              title: { type: 'string', description: 'Selector title, capped at 13 characters.' },
+              options: {
+                type: 'array',
+                required: true,
+                items: {
+                  type: 'object',
+                  additionalProperties: false,
+                  properties: {
+                    id: { type: 'string', required: true, description: 'Option id, max 128 bytes, unique.' },
+                    text: { type: 'string', required: true, description: 'Option label, capped at 10 characters.' },
+                  },
+                },
+                description: 'Dropdown options; 1 to 10 entries.',
+              },
+            },
+          },
+          description: 'Dropdown selectors for multiple_interaction cards; 1 to 3 entries.',
+        },
+        submit_text: {
+          type: 'string',
+          description: 'Submit button label for vote/multiple cards, capped at 10 characters; required for those types.',
+        },
+        submit_key: {
+          type: 'string',
+          description: 'Submit button key echoed back on submission (event_key), max 1024 bytes; required for vote/multiple cards.',
         },
         image_url: {
           type: 'string',
@@ -502,6 +607,17 @@ export class ConversationManager {
           ...(args.desc === undefined ? {} : { desc: args.desc }),
           ...(args.subtitle === undefined ? {} : { subtitle: args.subtitle }),
           ...(args.buttons === undefined ? {} : { buttons: args.buttons as Exclude<CardInput['buttons'], undefined> }),
+          ...(args.options === undefined ? {} : { options: args.options as Exclude<CardInput['options'], undefined> }),
+          ...(args.selects === undefined ? {} : {
+            selects: args.selects.map(select => ({
+              questionKey: select.question_key,
+              ...(select.title === undefined ? {} : { title: select.title }),
+              options: select.options,
+            })),
+          }),
+          ...(args.vote_mode === undefined ? {} : { voteMode: args.vote_mode }),
+          ...(args.submit_text === undefined ? {} : { submitText: args.submit_text }),
+          ...(args.submit_key === undefined ? {} : { submitKey: args.submit_key }),
           ...(args.image_url === undefined ? {} : { imageUrl: args.image_url }),
           ...(args.jump_url === undefined ? {} : { jumpUrl: args.jump_url }),
           ...(args.task_id === undefined ? {} : { taskId: args.task_id }),

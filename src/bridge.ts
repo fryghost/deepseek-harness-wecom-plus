@@ -248,7 +248,10 @@ export class WeComHarnessBridge {
       }
     }
     try {
-      const reply = await this.conversations.processCardEvent(body)
+      const reply = await this.conversations.processCardEvent(
+        body,
+        this.conversations.cardLabel(taskId, body.event.event_key),
+      )
       await this.sendProactive(chatTarget(body), reply)
     } catch (error) {
       this.log.error('WeCom card click %s failed: %s', body.msgid, String(error))

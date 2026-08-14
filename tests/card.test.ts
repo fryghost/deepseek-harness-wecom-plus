@@ -2,7 +2,7 @@ import { describe, expect, it } from 'vitest'
 import {
   buildTemplateCard,
   CARD_LIMITS,
-  deriveSummaryCard,
+  deriveAdaptiveCard,
   generateTaskId,
   truncateChars,
 } from '../src/card.js'
@@ -107,17 +107,111 @@ describe('template card construction', () => {
     expect(card.card_action).toEqual({ type: 1, url: 'https://example.com/report' })
   })
 
-  it('derives a Markdown+card pairing from a reply', () => {
-    const card = deriveSummaryCard('# 部署完成\n\n应用已上线，运行正常。', 'dshp')
-    expect(card).toEqual(expect.objectContaining({
-      card_type: 'text_notice',
-      main_title: { title: '部署完成' },
-      sub_title_text: '应用已上线，运行正常。',
+  it('derives a button card from a trailing option list with a choice cue', () => {
+    const derived = deriveAdaptiveCard(
+      '# 发布计划\n\n请选择下一步操作：\n1. **发布到生产**：立即上线，影响全部用户\n2. **灰度发布**：先给 10% 用户\n3. **暂不发布**：继续观察监控',
+      'dshp',
+    )
+    expect(derived).toBeDefined()
+    expect(derived?.card).toEqual(expect.objectContaining({
+      card_type: 'button_interaction',
+      main_title: expect.objectContaining({ title: '请选择下一步操作' }),
+      button_list: [
+        expect.objectContaining({ text: '发布到生产', key: 'opt-1' }),
+        expect.objectContaining({ text: '灰度发布', key: 'opt-2' }),
+        expect.objectContaining({ text: '暂不发布', key: 'opt-3' }),
+      ],
     }))
-    expect(card?.task_id).toMatch(/^dshp-/u)
+    expect(derived?.labels.get('opt-1')).toBe('发布到生产')
+    expect(derived?.labels.get('opt-3')).toBe('暂不发布')
   })
 
-  it('derives no card from an empty reply', () => {
-    expect(deriveSummaryCard('   ', 'dshp')).toBeUndefined()
+  it('derives a confirm/cancel card from a yes/no question', () => {
+    const derived = deriveAdaptiveCard('已定位到构建缓存问题。是否立即清理缓存并重新构建？', 'dshp')
+    expect(derived?.card).toEqual(expect.objectContaining({
+      card_type: 'button_interaction',
+      button_list: [
+        expect.objectContaining({ text: '确认', key: 'confirm' }),
+        expect.objectContaining({ text: '取消', key: 'cancel' }),
+      ],
+    }))
+    expect(derived?.labels.get('confirm')).toBe('确认')
+  })
+
+  it('prefers 继续 over 确认 for continue-style questions', () => {
+    const derived = deriveAdaptiveCard('第一批数据已迁移完成，是否继续迁移第二批？', 'dshp')
+    expect(derived?.card.button_list?.[0]).toEqual(expect.objectContaining({ text: '继续', key: 'confirm' }))
+  })
+
+  it('adds no card for informational replies', () => {
+    expect(deriveAdaptiveCard('# 部署完成\n\n应用已上线，运行正常。', 'dshp')).toBeUndefined()
+    expect(deriveAdaptiveCard('今天天气不错。', 'dshp')).toBeUndefined()
+  })
+
+  it('adds no card for a list without a choice cue', () => {
+    expect(deriveAdaptiveCard('本季度进展：\n1. 完成迁移\n2. 上线灰度\n3. 修复告警', 'dshp')).toBeUndefined()
+  })
+
+  it('treats long list items as content instead of options', () => {
+    expect(deriveAdaptiveCard(
+      '请选择：\n1. 这是一段非常长的选项说明，超出了按钮标签的长度上限\n2. 另一段同样非常长的选项说明内容',
+      'dshp',
+    )).toBeUndefined()
+  })
+
+  it('builds vote and multiple interaction cards', () => {
+    const vote = buildTemplateCard({
+      cardType: 'vote_interaction',
+      title: '选出优先级',
+      options: [
+        { id: 'p0', text: '性能优化' },
+        { id: 'p1', text: '文档完善', isChecked: true },
+      ],
+      voteMode: 1,
+      submitText: '提交',
+      submitKey: 'vote-submit',
+    }, 'dshp')
+    expect(vote.checkbox).toEqual(expect.objectContaining({
+      question_key: 'vote',
+      mode: 1,
+      option_list: [
+        { id: 'p0', text: '性能优化' },
+        { id: 'p1', text: '文档完善', is_checked: true },
+      ],
+    }))
+    expect(vote.submit_button).toEqual({ text: '提交', key: 'vote-submit' })
+
+    const multiple = buildTemplateCard({
+      cardType: 'multiple_interaction',
+      title: '发布设置',
+      selects: [{
+        questionKey: 'region',
+        title: '目标区域',
+        options: [{ id: 'cn', text: '华南' }, { id: 'eu', text: '欧洲' }],
+      }],
+      submitText: '开始发布',
+      submitKey: 'multi-submit',
+    }, 'dshp')
+    expect(multiple.select_list).toEqual([expect.objectContaining({
+      question_key: 'region',
+      title: '目标区域',
+      option_list: [{ id: 'cn', text: '华南' }, { id: 'eu', text: '欧洲' }],
+    })])
+    expect(multiple.submit_button).toEqual({ text: '开始发布', key: 'multi-submit' })
+  })
+
+  it('rejects vote or multiple cards without submit buttons or options', () => {
+    expect(() => buildTemplateCard({
+      cardType: 'vote_interaction',
+      title: '投票',
+      options: [{ id: 'a', text: '选项' }],
+    }, 'dshp')).toThrow('submit_text and submit_key')
+    expect(() => buildTemplateCard({
+      cardType: 'multiple_interaction',
+      title: '设置',
+      selects: [],
+      submitText: '提交',
+      submitKey: 's',
+    }, 'dshp')).toThrow('non-empty selects')
   })
 })

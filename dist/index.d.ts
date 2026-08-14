@@ -11,9 +11,13 @@ type AccessMode = 'open' | 'allowlist' | 'disabled';
 type ImageInputMode = 'auto' | 'always' | 'never';
 /**
  * How template cards accompany model replies.
- * - "auto": every model turn sends one Markdown message plus one derived
- *   text_notice summary card, unless the model sent an explicit card first.
- * - "tool": cards are only sent when the model calls `wecom_send_card`.
+ * - "auto" (default): adaptive interaction cards. Explicit `wecom_send_card`
+ *   calls always win; otherwise the bridge inspects the reply and adds a
+ *   button card automatically when the reply asks the user to choose among
+ *   options or confirm/cancel — the Markdown message keeps the full details,
+ *   the card carries the short option buttons. Informational replies get no
+ *   card, so ordinary chat stays clean.
+ * - "tool": cards are sent only when the model calls `wecom_send_card`.
  * - "off": no cards; `wecom_send_card` fails with a teaching error.
  */
 type CardMode = 'auto' | 'tool' | 'off';

@@ -6,8 +6,9 @@
 
 ## 与上游的区别（plus 增强）
 
-- **模板卡片（template_card）完整支持**：模型可通过 `wecom_send_card` 工具发送 `text_notice` / `news_notice` / `button_interaction` 卡片；`cardMode: auto` 时每条模型回复自动配一张摘要卡片 —— 一次对话呈现为「一条 Markdown 消息 + 一张卡片」的成对消息（针对模板卡片行数、字数限制多且容易变丑的问题，卡片文本按协议上限自动截断）。
-- **按钮点击入站**：订阅官方 `template_card_event`，点击在 5 秒窗口内先由插件本地确认更新（"正在处理…"，不经过模型），随后作为带 `task_id` / `event_key` 上下文的用户消息注入对应会话，模型回复通过主动发送通道推送（Markdown + 卡片）。
+- **模板卡片（template_card）完整支持**：模型可通过 `wecom_send_card` 工具发送 `text_notice` / `news_notice` / `button_interaction` / `vote_interaction` / `multiple_interaction` 五种卡片，卡片文本按协议上限自动截断。
+- **自适应成对消息（`cardMode: auto`，默认）**：一次回复呈现为「一条 Markdown 消息 + 一张交互卡片」——回复以选项列表或确认类问句结尾时自动生成按钮卡片（Markdown 承载完整选项说明、按钮承载短标签）；普通陈述回复不配卡，日常对话保持干净。
+- **按钮点击入站**：订阅官方 `template_card_event`，点击在 5 秒窗口内先由插件本地确认更新（"正在处理…"，不经过模型），随后通过 key → 标签注册表还原用户选中的选项文案，连同 `task_id` / `event_key` 注入对应会话，模型回复通过主动发送通道推送（Markdown + 卡片）。
 - 新增 `/bot-card-test` 自检命令，无需模型即可验证卡片与按钮交互链路。
 - 新增 `cardMode`、`cardTaskIdPrefix`、`cardClickAckTitle`、`cardClickAckSubtitle` 配置项。
 
@@ -109,17 +110,34 @@ pnpm dsh --profile web
 
 ## 模板卡片与按钮交互
 
-模板卡片协议对行数、字数限制很多，单卡片直接承载长回复容易变丑。本插件的默认呈现方式（`cardMode: auto`）是一次模型回复 = **一条 Markdown 消息 + 一张摘要卡片** 的成对消息：Markdown 承载完整内容，卡片只放标题与摘要（标题 26 字、副标题 112 字自动截断），让聊天流整洁、重点突出。
+模板卡片协议对行数、字数限制很多，单卡片直接承载长回复容易变丑，所以卡片只承担**交互表面**：Markdown 消息承载完整内容，卡片承载短标签的按钮/选项。一次回复 = **一条 Markdown 消息 + 一张卡片** 的成对消息。
 
-- `cardMode: auto`（默认）：每条模型回复自动配一张 `text_notice` 摘要卡片；若模型已用 `wecom_send_card` 显式发卡则不重复配卡。
-- `cardMode: tool`：只有模型调用 `wecom_send_card` 时才发卡，内容完全由模型控制（`text_notice` / `news_notice` / `button_interaction`）。
+`cardMode` 控制卡片的产生方式：
+
+- `cardMode: auto`（默认，自适应）：模型显式调用 `wecom_send_card` 的卡片永远优先；否则插件检查回复内容，**自动**补一张交互卡片——
+  - 回复以"选项列表 + 选择类引导语"结尾（2~6 个编号或项目符号，如「请选择：1. 发布 2. 灰度 3. 暂不发布」）时，自动生成 `button_interaction` 卡片，按钮取每项冒号前的短标签；
+  - 回复以"是否/确认/继续"类问句结尾时，自动生成「确认/继续 + 取消」按钮卡片；
+  - 普通陈述性回复不配卡，日常对话保持干净。
+- `cardMode: tool`：只有模型调用 `wecom_send_card` 时才发卡，内容完全由模型控制。
 - `cardMode: off`：完全关闭卡片，`wecom_send_card` 会返回明确的禁用错误。
 
-模型可以调用会话范围内的 `wecom_send_card` 工具发送 `button_interaction` 卡片（1~6 个按钮，按钮文案 10 字上限，`key` 最长 1024 字节）。用户点击按钮后，企微推送 `template_card_event`，插件会：
+`wecom_send_card` 支持五种卡片：
+
+| 卡片 | 用途 |
+| --- | --- |
+| `button_interaction` | 选项/确认按钮（1~6 个按钮，文案 10 字上限） |
+| `vote_interaction` | 投票复选框（1~20 个选项，单选/多选）+ 提交按钮 |
+| `multiple_interaction` | 最多 3 个下拉选择器 + 提交按钮 |
+| `text_notice` | 标题 + 副标题的通知卡 |
+| `news_notice` | 图文卡（需 `image_url`，可整卡跳转） |
+
+所有展示文本都按协议上限自动截断（标题 26、辅助 30、副标题 112、按钮 10、投票选项 11 字），按钮 key / 选项 id / task_id 自动校验与去重，task_id 缺省自动生成。
+
+用户点击按钮或提交选择后，企微推送 `template_card_event`（只带 `task_id` 和 `event_key`）。插件会：
 
 1. 在协议要求的 **5 秒窗口内**先用插件本地文案原位更新卡片（`cardClickAckTitle` / `cardClickAckSubtitle`，默认"正在处理…"），**不经过模型**，保证点击立即有反馈；
-2. 把点击作为一条带 `task_id` 与 `event_key` 上下文的用户消息注入该单聊/群聊的持久会话，交给模型；
-3. 模型回复通过主动发送通道推送（Markdown 消息 + 卡片），因此一次点击同样得到成对消息。
+2. 通过发送时登记的 **key → 标签注册表**把 `event_key` 还原成用户选中的选项文案（企微只回传 key 不回传文案），连同 `task_id`、`event_key` 和原始事件 JSON 一起，作为用户消息注入该单聊/群聊的持久会话；
+3. 模型回复通过主动发送通道推送（Markdown 消息 + 卡片），一次点击同样得到成对消息。
 
 注意：模型一轮推理通常超过 5 秒，所以按钮点击后的卡片更新只能由插件本地完成；模型结果以新消息呈现，而不是原位改写卡片。
 
@@ -145,7 +163,7 @@ pong — DeepSeek Harness 企微机器人已连接。
 
 发送 `/bot-file-test` 可以在不调用模型的情况下验证官方临时素材上传和主动文件发送接口。机器人应先发送 `wecom-file-test.txt`，再回复发送成功。随后可以要求 agent 发送工作目录中已有的文件，例如“把 README.md 作为文件发给我”；对应会话中应出现 `wecom_send_file` 调用，企微应收到附件。
 
-然后发送普通文本、图片或图文混排消息。插件会把消息追加到对应的 Harness 持久会话，并把当前默认模型的回复发回企微。`cardMode: auto` 时，模型回复应呈现为「Markdown 消息 + 摘要卡片」两条消息；让模型做选择题（例如"给我两个选项：继续/暂停"）时，会话中应出现 `wecom_send_card` 调用和一张带按钮的卡片。
+然后发送普通文本、图片或图文混排消息。插件会把消息追加到对应的 Harness 持久会话，并把当前默认模型的回复发回企微。`cardMode: auto` 时，让模型做选择题（例如"给我两个方案：继续发布/回滚，说明各自影响"）——回复应呈现为「Markdown 消息 + 带选项按钮的卡片」两条消息；点击按钮后卡片先原位变为"正在处理…"，随后收到模型对所选选项的回复。普通的陈述性问题（如"今天是什么日期"）则不应配卡。
 
 发送 `/new` 后，机器人应确认已经开启新对话；随后询问旧对话中的细节，Agent 不应继续使用旧上下文。发送 `/compact`、`/goal` 或 `/plan` 时，插件应直接显示 Harness 命令结果，回复中不应出现模型对斜杠命令的解释。未知或未开放的斜杠命令应被明确拒绝，不能送入模型。
 

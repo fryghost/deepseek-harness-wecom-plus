@@ -342,11 +342,21 @@ describe('ConversationManager', () => {
       session: { events },
       followup: vi.fn(() => {
         if (cardTool === undefined) throw new Error('wecom_send_card was not registered')
-        runningCard = cardTool.execute({
-          card_type: 'button_interaction',
-          title: '请选择操作',
-          buttons: [{ text: '确认', key: 'btn-ok' }, { text: '取消', key: 'btn-cancel', style: 3 }],
-        }, { signal: new AbortController().signal } as never)
+        runningCard = Promise.all([
+          cardTool.execute({
+            card_type: 'button_interaction',
+            title: '请选择操作',
+            buttons: [{ text: '确认', key: 'btn-ok' }, { text: '取消', key: 'btn-cancel', style: 3 }],
+          }, { signal: new AbortController().signal } as never),
+          cardTool.execute({
+            card_type: 'vote_interaction',
+            title: '优先级',
+            options: [{ id: 'p0', text: '性能优化' }, { id: 'p1', text: '文档完善' }],
+            vote_mode: 1,
+            submit_text: '提交',
+            submit_key: 'vote-submit',
+          }, { signal: new AbortController().signal } as never),
+        ])
         events.push({
           type: 'assistant/message',
           data: { message: { content: [{ type: 'text', text: '请选择。' }] } },
@@ -384,7 +394,7 @@ describe('ConversationManager', () => {
     const reply = await manager.process(textMessage('u-card', 'm-card', '给我几个选项'), downloadPort)
 
     expect(register).toHaveBeenCalledWith(expect.objectContaining({ name: 'wecom_send_card' }))
-    expect(reply.cards).toHaveLength(1)
+    expect(reply.cards).toHaveLength(2)
     expect(reply.cards[0]).toEqual(expect.objectContaining({
       card_type: 'button_interaction',
       main_title: expect.objectContaining({ title: '请选择操作' }),
@@ -394,6 +404,18 @@ describe('ConversationManager', () => {
       ],
     }))
     expect(String(reply.cards[0]?.task_id)).toMatch(/^dshp-test-/)
+    expect(reply.cards[1]).toEqual(expect.objectContaining({
+      card_type: 'vote_interaction',
+      checkbox: expect.objectContaining({
+        mode: 1,
+        option_list: [
+          expect.objectContaining({ id: 'p0', text: '性能优化' }),
+          expect.objectContaining({ id: 'p1', text: '文档完善' }),
+        ],
+      }),
+      submit_button: expect.objectContaining({ text: '提交', key: 'vote-submit' }),
+    }))
+    expect(manager.cardLabel(reply.cards[1]?.task_id, 'vote-submit')).toBe('提交：提交')
     if (cardTool === undefined) throw new Error('wecom_send_card was not registered')
     await expect(cardTool.execute(
       { card_type: 'text_notice', title: 'x' },
@@ -402,7 +424,7 @@ describe('ConversationManager', () => {
     await manager.dispose()
   })
 
-  it('derives one text_notice summary card per reply when cardMode is auto', async () => {
+  it('derives an adaptive choice card when cardMode is auto and no explicit card was sent', async () => {
     const config = testConfig({ cardMode: 'auto' })
     const events: unknown[] = []
     const agent = {
@@ -414,7 +436,7 @@ describe('ConversationManager', () => {
           type: 'assistant/message',
           data: {
             message: {
-              content: [{ type: 'text', text: '# 部署完成\n\n应用已上线，运行正常。' }],
+              content: [{ type: 'text', text: '请选择下一步：\n1. 发布到生产：立即上线\n2. 灰度发布：先给 10% 用户\n3. 暂不发布：继续观察' }],
             },
           },
         })
@@ -444,14 +466,66 @@ describe('ConversationManager', () => {
     const manager = new ConversationManager(ctx, config, vi.fn(async () => undefined))
     await manager.initialize()
 
-    const reply = await manager.process(textMessage('u-auto', 'm-auto', '部署好了吗'), downloadPort)
+    const reply = await manager.process(textMessage('u-auto', 'm-auto', '我该选哪个方案？'), downloadPort)
 
     expect(reply.cards).toHaveLength(1)
     expect(reply.cards[0]).toEqual(expect.objectContaining({
-      card_type: 'text_notice',
-      main_title: expect.objectContaining({ title: '部署完成' }),
-      sub_title_text: '应用已上线，运行正常。',
+      card_type: 'button_interaction',
+      main_title: expect.objectContaining({ title: '请选择下一步' }),
+      button_list: [
+        expect.objectContaining({ text: '发布到生产', key: 'opt-1' }),
+        expect.objectContaining({ text: '灰度发布', key: 'opt-2' }),
+        expect.objectContaining({ text: '暂不发布', key: 'opt-3' }),
+      ],
     }))
+    const taskId = reply.cards[0]?.task_id
+    expect(taskId).toBeDefined()
+    expect(manager.cardLabel(taskId, 'opt-2')).toBe('灰度发布')
+    expect(manager.cardLabel(taskId, 'opt-9')).toBeUndefined()
+    await manager.dispose()
+  })
+
+  it('adds no card in auto mode for informational replies', async () => {
+    const config = testConfig({ cardMode: 'auto' })
+    const events: unknown[] = []
+    const agent = {
+      status: 'idle',
+      options: { provider: 'deepseek', model: 'deepseek-chat' },
+      session: { events },
+      followup: vi.fn(() => {
+        events.push({
+          type: 'assistant/message',
+          data: { message: { content: [{ type: 'text', text: '# 部署完成\n\n应用已上线，运行正常。' }] } },
+        })
+        events.push({ type: 'turn/end', data: { reason: { kind: 'stop' } } })
+      }),
+      whenIdle: vi.fn(async () => undefined),
+    }
+    const ctx = {
+      sessionPersistence: { list: vi.fn(async () => []) },
+      agentDefaultModel: { currentSelection: vi.fn(() => ({ provider: 'deepseek', model: 'deepseek-chat' })) },
+      agentPresets: { defaultId: 'standard', mount: vi.fn(async () => ({ id: 'standard' })) },
+      llm: { resolveModelInfo: vi.fn(async () => ({ inputModalities: ['text'] })) },
+      agents: {
+        create: vi.fn(async (options: { setup?: (ctx: never) => Promise<void> }) => {
+          await options.setup?.({
+            systemPrompt: { section: vi.fn(() => vi.fn()) },
+            tools: { register: vi.fn(() => vi.fn()) },
+          } as never)
+          return { agent, dispose: vi.fn(async () => undefined) }
+        }),
+        get: vi.fn(),
+      },
+      attachments: {
+        imageLimits: { maxImagesPerMessage: 4, maxMessageImageBytes: 10_000, maxImageBytes: 10_000 },
+      },
+    } as never
+    const manager = new ConversationManager(ctx, config, vi.fn(async () => undefined))
+    await manager.initialize()
+
+    const reply = await manager.process(textMessage('u-info', 'm-info', '部署好了吗'), downloadPort)
+
+    expect(reply.cards).toEqual([])
     await manager.dispose()
   })
 
@@ -503,7 +577,7 @@ describe('ConversationManager', () => {
       msgtype: 'event',
       event: { eventtype: EventType.TemplateCardEvent, event_key: 'btn-ok', task_id: 'task-1' },
       create_time: 1,
-    })
+    }, '确认')
 
     expect(reply).toEqual({ text: '已为你确认。', images: [], cards: [] })
     expect(followedUp).toEqual(expect.objectContaining({
@@ -514,6 +588,7 @@ describe('ConversationManager', () => {
     }))
     const text = (followedUp as { content: Array<{ text: string }> }).content[0]?.text ?? ''
     expect(text).toContain('event_key: btn-ok')
+    expect(text).toContain('selected option: 确认')
     expect(text).toContain('template card button click')
     await manager.dispose()
   })

@@ -20,6 +20,7 @@ describe('Config', () => {
     expect(config.maxInboundFileBytes).toBe(WECOM_FILE_MAX_BYTES)
     expect(config.inboundFileDirectory).toBe(DEFAULT_WECOM_INBOUND_FILE_DIRECTORY)
     expect(config.allowedHarnessCommands).toEqual(['compact', 'goal', 'plan'])
+    expect(config.cardMode).toBe('auto')
   })
 
   it('rejects invalid Harness command names', () => {

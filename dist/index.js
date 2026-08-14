@@ -1744,11 +1744,22 @@ var inject = [
   "systemPrompt"
 ];
 async function apply(ctx, config) {
-  const bridge = new WeComHarnessBridge(ctx, config);
+  const log = ctx.logger(name);
+  let bridge;
+  try {
+    bridge = new WeComHarnessBridge(ctx, config);
+  } catch (error) {
+    log.error("WeCom channel configuration is invalid and stays inactive: %s", String(error));
+    return;
+  }
   await ctx.effect(async function* () {
     yield async () => bridge.stop();
-    await bridge.start();
-  }, "deepseek-harness-wecom.websocket");
+    try {
+      await bridge.start();
+    } catch (error) {
+      log.error("WeCom channel failed to start and stays inactive: %s", String(error));
+    }
+  }, "deepseek-harness-wecom-plus.websocket");
 }
 var index_default = { name, inject, Config, apply };
 export {

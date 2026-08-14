@@ -91,7 +91,7 @@ declare class WeComHarnessBridge {
     private client;
     private stopping;
     constructor(ctx: Context, config: Config, clientFactory?: WeComClientFactory);
-    /** Load persisted ids, authenticate, and wait for WeCom readiness. */
+    /** Stay dormant without credentials, or authenticate and wait for WeCom readiness. */
     start(): Promise<void>;
     /** Stop ingress and drain owned conversations. */
     stop(): Promise<void>;

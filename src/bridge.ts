@@ -101,14 +101,27 @@ export class WeComHarnessBridge {
     this.allowedHarnessCommands = new Set(config.allowedHarnessCommands)
   }
 
-  /** Load persisted ids, authenticate, and wait for WeCom readiness. */
+  /** Stay dormant without credentials, or authenticate and wait for WeCom readiness. */
   async start(): Promise<void> {
-    await this.conversations.initialize()
-    const resolved = await this.ctx.credentials.resolve(credentialRef(this.config.secretRef))
-    if (resolved === undefined) {
-      throw new Error(`wecom-channel: credential ${JSON.stringify(this.config.secretRef)} is not configured`)
+    if (!this.config.botId.trim()) {
+      this.log.info('WeCom channel is inactive: configure botId or WECOM_BOT_ID to enable it')
+      return
     }
-    const client = this.createClient(resolved.value)
+    if (!this.config.secretRef.trim()) {
+      this.log.warn('WeCom channel is inactive: secretRef is empty')
+      return
+    }
+    const resolved = await this.ctx.credentials.resolve(credentialRef(this.config.secretRef))
+    const secret = resolved?.value.trim()
+    if (!secret) {
+      this.log.warn(
+        'WeCom channel is inactive: credential %s is not configured',
+        JSON.stringify(this.config.secretRef),
+      )
+      return
+    }
+    await this.conversations.initialize()
+    const client = this.createClient(secret)
     this.client = client
     const ready = Promise.withResolvers<void>()
     let readySettled = false
@@ -176,7 +189,7 @@ export class WeComHarnessBridge {
       maxReconnectAttempts: this.config.maxReconnectAttempts,
       maxAuthFailureAttempts: this.config.maxAuthFailureAttempts,
       requestTimeout: this.config.sendTimeoutMs,
-      plug_version: 'deepseek-harness-wecom/0.1.2',
+      plug_version: 'deepseek-harness-wecom/0.1.3',
     })
   }
 

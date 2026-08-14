@@ -634,14 +634,27 @@ var WeComHarnessBridge = class {
   allowedHarnessCommands;
   client;
   stopping = false;
-  /** Load persisted ids, authenticate, and wait for WeCom readiness. */
+  /** Stay dormant without credentials, or authenticate and wait for WeCom readiness. */
   async start() {
-    await this.conversations.initialize();
-    const resolved = await this.ctx.credentials.resolve(credentialRef(this.config.secretRef));
-    if (resolved === void 0) {
-      throw new Error(`wecom-channel: credential ${JSON.stringify(this.config.secretRef)} is not configured`);
+    if (!this.config.botId.trim()) {
+      this.log.info("WeCom channel is inactive: configure botId or WECOM_BOT_ID to enable it");
+      return;
     }
-    const client = this.createClient(resolved.value);
+    if (!this.config.secretRef.trim()) {
+      this.log.warn("WeCom channel is inactive: secretRef is empty");
+      return;
+    }
+    const resolved = await this.ctx.credentials.resolve(credentialRef(this.config.secretRef));
+    const secret = resolved?.value.trim();
+    if (!secret) {
+      this.log.warn(
+        "WeCom channel is inactive: credential %s is not configured",
+        JSON.stringify(this.config.secretRef)
+      );
+      return;
+    }
+    await this.conversations.initialize();
+    const client = this.createClient(secret);
     this.client = client;
     const ready = Promise.withResolvers();
     let readySettled = false;
@@ -705,7 +718,7 @@ var WeComHarnessBridge = class {
       maxReconnectAttempts: this.config.maxReconnectAttempts,
       maxAuthFailureAttempts: this.config.maxAuthFailureAttempts,
       requestTimeout: this.config.sendTimeoutMs,
-      plug_version: "deepseek-harness-wecom/0.1.2"
+      plug_version: "deepseek-harness-wecom/0.1.3"
     });
   }
   async handleWelcome(frame) {
@@ -950,7 +963,7 @@ var DEFAULT_WECOM_INBOUND_FILE_DIRECTORY = join2(
 );
 var COMMAND_NAME_PATTERN = /^[a-z][a-z0-9_-]*$/u;
 var Config = z.object({
-  botId: z.string().required(),
+  botId: z.string().default(""),
   secretRef: z.string().default("WECOM_BOT_SECRET"),
   accountId: z.string().default("default"),
   cwd: z.string().required(),

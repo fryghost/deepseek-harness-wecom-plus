@@ -27,6 +27,7 @@ An independent out-of-tree [DeepSeek Harness](https://github.com/deepseek-ai/dee
 - `/bot-ping`, `/bot-image-test`, `/bot-file-test`, `/bot-help`, `/bot-status`, and `/bot-cancel`
 - Optional welcome text for the WeCom `enter_chat` event
 - Secret resolution through the Harness credential service instead of plugin configuration
+- Dormant startup when Bot ID or Secret is not configured, so installation alone never blocks DSH
 
 ## Requirements
 
@@ -58,6 +59,8 @@ pnpm dsh --profile web
 ```
 
 The bundle reads `WECOM_BOT_ID`, resolves `WECOM_BOT_SECRET` through `ctx.credentials`, and uses the launch directory as the agent working directory. `DSH_WECOM_CWD` can override the working directory.
+
+Installing the bundle does not require configuring credentials immediately. If the Bot ID is empty or the referenced Secret is absent or blank, the channel logs that it is inactive and lets DSH finish starting. Configure both values and reload or restart DSH to connect. A non-empty but invalid credential still fails during WeCom authentication.
 
 For a durable setup, put `WECOM_BOT_ID` in `~/.dsh/.env` and store `WECOM_BOT_SECRET` with the Harness credential settings surface. Never commit either value.
 

@@ -7,6 +7,12 @@ import {
 } from '../src/config.js'
 
 describe('Config', () => {
+  it('accepts an installation that has not configured a Bot ID yet', () => {
+    const config = Config({ cwd: '/tmp/wecom-test' } as WeComConfig)
+
+    expect(config.botId).toBe('')
+  })
+
   it('defaults outbound files to the WeCom protocol limit', () => {
     const config = Config({ botId: 'test-bot', cwd: '/tmp/wecom-test' } as WeComConfig)
 

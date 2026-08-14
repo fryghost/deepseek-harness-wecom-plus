@@ -54,7 +54,7 @@ export interface Config {
 
 /** Runtime-validated plugin configuration. */
 export const Config: z<Config> = z.object({
-  botId: z.string().required(),
+  botId: z.string().default(''),
   secretRef: z.string().default('WECOM_BOT_SECRET'),
   accountId: z.string().default('default'),
   cwd: z.string().required(),

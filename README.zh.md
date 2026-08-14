@@ -27,6 +27,7 @@
 - 内置 `/bot-ping`、`/bot-image-test`、`/bot-file-test`、`/bot-help`、`/bot-status`、`/bot-cancel`
 - 可为企微 `enter_chat` 事件配置欢迎语
 - Secret 通过 Harness 凭据服务解析，不进入插件配置
+- 未配置 Bot ID 或 Secret 时保持休眠，单独安装插件不会阻断 DSH 启动
 
 ## 环境要求
 
@@ -60,6 +61,8 @@ pnpm dsh --profile web
 ```
 
 组合包会读取 `WECOM_BOT_ID`，通过 `ctx.credentials` 解析 `WECOM_BOT_SECRET`，并默认让 agent 使用启动目录作为工作目录。可以用 `DSH_WECOM_CWD` 覆盖工作目录。
+
+安装组合包后不必立即配置凭据。Bot ID 为空，或引用的 Secret 不存在/为空时，通道会记录“未配置、保持休眠”的日志并允许 DSH 正常完成启动；补齐两项配置后重载或重启 DSH 即可连接。非空但错误的凭据仍会在企微鉴权阶段报错。
 
 长期使用时，建议把 `WECOM_BOT_ID` 放到 `~/.dsh/.env`，并通过 Harness 凭据设置界面保存 `WECOM_BOT_SECRET`。不要把任何真实凭据提交到 Git。
 

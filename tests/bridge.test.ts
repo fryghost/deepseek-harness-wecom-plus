@@ -173,11 +173,24 @@ describe('WeComHarnessBridge', () => {
     await bridge.stop()
   })
 
-  it('fails before constructing the SDK client when the credential is absent', async () => {
+  it('stays inactive before constructing the SDK client when the credential is absent', async () => {
     const factory = vi.fn()
     const bridge = new WeComHarnessBridge(commandContext(undefined), testConfig(), factory as never)
-    await expect(bridge.start()).rejects.toThrow('WECOM_BOT_SECRET')
+    await expect(bridge.start()).resolves.toBeUndefined()
     expect(factory).not.toHaveBeenCalled()
+    await bridge.stop()
+  })
+
+  it('stays inactive without constructing the SDK client when the Bot ID is absent', async () => {
+    const factory = vi.fn()
+    const bridge = new WeComHarnessBridge(
+      commandContext('resolved-secret'),
+      testConfig({ botId: '' }),
+      factory as never,
+    )
+    await expect(bridge.start()).resolves.toBeUndefined()
+    expect(factory).not.toHaveBeenCalled()
+    await bridge.stop()
   })
 
   it('sends an inline PNG and MD5 through the official image reply fields', async () => {

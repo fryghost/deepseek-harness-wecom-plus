@@ -81,7 +81,7 @@ describe('ConversationManager', () => {
   it('restores the recorded agent preset before resuming a conversation', async () => {
     const config = testConfig()
     const message = textMessage('u2', 'm2')
-    const id = sessionIdFor(config.accountId, message)
+    const id = `${sessionIdFor(config.accountId, message)}-n2`
     const events: unknown[] = []
     const agent = {
       status: 'idle',
@@ -256,6 +256,75 @@ describe('ConversationManager', () => {
       { path: 'README.md' },
       { signal: new AbortController().signal } as never,
     )).rejects.toThrow('no active WeCom turn')
+    await manager.dispose()
+  })
+
+  it('rotates /new to a durable fresh session and retains the old session', async () => {
+    const config = testConfig()
+    const message = textMessage('u-new', 'm-before')
+    const baseId = sessionIdFor(config.accountId, message)
+    const live = new Map<string, object>()
+    const disposed: string[] = []
+    const create = vi.fn(async (options: {
+      sessionId: string
+      setup?: (ctx: never) => Promise<void>
+    }) => {
+      const id = String(options.sessionId)
+      const events: unknown[] = []
+      const agent = {
+        status: 'idle',
+        options: { provider: 'deepseek', model: 'deepseek-chat' },
+        session: { events },
+        followup: vi.fn(() => {
+          events.push({
+            type: 'assistant/message',
+            data: { message: { content: [{ type: 'text', text: `reply from ${id}` }] } },
+          })
+          events.push({ type: 'turn/end', data: { reason: { kind: 'stop' } } })
+        }),
+        whenIdle: vi.fn(async () => undefined),
+      }
+      await options.setup?.({
+        systemPrompt: { section: vi.fn(() => vi.fn()) },
+        tools: { register: vi.fn(() => vi.fn()) },
+      } as never)
+      live.set(id, agent)
+      return {
+        agent,
+        dispose: vi.fn(async () => {
+          live.delete(id)
+          disposed.push(id)
+        }),
+      }
+    })
+    const ctx = {
+      sessionPersistence: { list: vi.fn(async () => []) },
+      agentDefaultModel: { currentSelection: vi.fn(() => ({ provider: 'deepseek', model: 'deepseek-chat' })) },
+      agentPresets: { defaultId: 'standard', mount: vi.fn(async () => ({ id: 'standard' })) },
+      llm: { resolveModelInfo: vi.fn(async () => ({ inputModalities: ['text'] })) },
+      agents: {
+        create,
+        get: vi.fn((id: unknown) => live.get(String(id)) as never),
+      },
+      attachments: {
+        imageLimits: { maxImagesPerMessage: 4, maxMessageImageBytes: 10_000, maxImageBytes: 10_000 },
+      },
+    } as never
+    const manager = new ConversationManager(ctx, config, vi.fn(async () => undefined))
+    await manager.initialize()
+
+    await expect(manager.process(message, downloadPort)).resolves.toEqual({
+      text: `reply from ${baseId}`,
+      images: [],
+    })
+    await manager.reset(textMessage('u-new', 'm-new', '/new'))
+    await expect(manager.process(textMessage('u-new', 'm-after'), downloadPort)).resolves.toEqual({
+      text: `reply from ${baseId}-n1`,
+      images: [],
+    })
+
+    expect(create.mock.calls.map(([options]) => String(options.sessionId))).toEqual([baseId, `${baseId}-n1`])
+    expect(disposed).toEqual([baseId])
     await manager.dispose()
   })
 })

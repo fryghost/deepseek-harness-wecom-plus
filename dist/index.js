@@ -314,6 +314,7 @@ var ConversationManager = class {
   creations = /* @__PURE__ */ new Map();
   queues = /* @__PURE__ */ new Map();
   activeTurns = /* @__PURE__ */ new Map();
+  generations = /* @__PURE__ */ new Map();
   persistedIds = /* @__PURE__ */ new Set();
   /** Snapshot persisted identities once before accepting traffic. */
   async initialize() {
@@ -322,18 +323,61 @@ var ConversationManager = class {
   }
   /** Process one inbound message after earlier work in the same WeCom conversation. */
   process(message, client) {
-    const id = sessionIdFor(this.config.accountId, message);
-    const previous = this.queues.get(id) ?? Promise.resolve();
-    const current = previous.catch(() => void 0).then(() => this.processNow(id, message, client));
-    const tracked = current.finally(() => {
-      if (this.queues.get(id) === tracked) this.queues.delete(id);
+    const baseId = sessionIdFor(this.config.accountId, message);
+    return this.enqueue(baseId, () => this.processNow(this.currentSessionId(baseId), message, client));
+  }
+  /** End the current WeCom conversation session while retaining its history. */
+  async reset(message) {
+    const baseId = sessionIdFor(this.config.accountId, message);
+    this.cancel(message);
+    await this.enqueue(baseId, async () => {
+      const id = this.currentSessionId(baseId);
+      const binding = this.bindings.get(id);
+      if (binding !== void 0) {
+        this.bindings.delete(id);
+        await binding.release();
+      }
+      const generation = this.generationFor(baseId);
+      if (!Number.isSafeInteger(generation + 1)) throw new Error("WeCom conversation generation is exhausted");
+      this.generations.set(baseId, generation + 1);
+      await this.getOrCreate(this.currentSessionId(baseId));
     });
-    this.queues.set(id, tracked);
-    return current;
+  }
+  /** Execute a registered Harness command against the current WeCom session. */
+  executeCommand(message, line) {
+    const baseId = sessionIdFor(this.config.accountId, message);
+    return this.enqueue(baseId, async () => {
+      const id = this.currentSessionId(baseId);
+      const binding = await this.getOrCreate(id);
+      const agent = binding.agent;
+      await withTimeout(
+        agent.whenIdle(),
+        this.config.responseTimeoutMs,
+        "DeepSeek Harness conversation availability"
+      );
+      const start = agent.session.events.length;
+      const controller = new AbortController();
+      const timer = setTimeout(() => {
+        controller.abort(new Error(`DeepSeek Harness command timed out after ${this.config.responseTimeoutMs}ms`));
+      }, this.config.responseTimeoutMs);
+      this.activeTurns.set(id, chatTarget(message));
+      try {
+        const execution = await this.ctx.commands.execute(agent, line, controller.signal);
+        if (execution === void 0) return { execution, response: void 0 };
+        await withTimeout(agent.whenIdle(), this.config.responseTimeoutMs, "DeepSeek Harness command response");
+        const events = agent.session.events.slice(start);
+        const response = events.some((event) => event.type === "assistant/message") ? await this.collectReply(agent, events) : void 0;
+        return { execution, response };
+      } finally {
+        clearTimeout(timer);
+        this.activeTurns.delete(id);
+      }
+    });
   }
   /** Cancel active work for one WeCom conversation. */
   cancel(message) {
-    const id = sessionIdFor(this.config.accountId, message);
+    const baseId = sessionIdFor(this.config.accountId, message);
+    const id = this.currentSessionId(baseId);
     const agent = this.bindings.get(id)?.agent ?? this.ctx.agents.get(SessionId(id));
     if (agent === void 0 || agent.status === "idle") return false;
     agent.cancel({ kind: "user" });
@@ -345,6 +389,34 @@ var ConversationManager = class {
     await Promise.allSettled([...this.bindings.values()].map((binding) => binding.release()));
     this.bindings.clear();
     this.activeTurns.clear();
+  }
+  enqueue(baseId, operation) {
+    const previous = this.queues.get(baseId) ?? Promise.resolve();
+    const current = previous.catch(() => void 0).then(operation);
+    const tracked = current.finally(() => {
+      if (this.queues.get(baseId) === tracked) this.queues.delete(baseId);
+    });
+    this.queues.set(baseId, tracked);
+    return current;
+  }
+  currentSessionId(baseId) {
+    const generation = this.generationFor(baseId);
+    return generation === 0 ? baseId : `${baseId}-n${generation}`;
+  }
+  generationFor(baseId) {
+    const cached = this.generations.get(baseId);
+    if (cached !== void 0) return cached;
+    const prefix = `${baseId}-n`;
+    let generation = 0;
+    for (const id of this.persistedIds) {
+      if (!id.startsWith(prefix)) continue;
+      const suffix = id.slice(prefix.length);
+      if (!/^[1-9][0-9]*$/u.test(suffix)) continue;
+      const candidate = Number(suffix);
+      if (Number.isSafeInteger(candidate)) generation = Math.max(generation, candidate);
+    }
+    this.generations.set(baseId, generation);
+    return generation;
   }
   async processNow(id, message, client) {
     const binding = await this.getOrCreate(id);
@@ -551,6 +623,7 @@ var WeComHarnessBridge = class {
     this.log = ctx.logger("deepseek-harness-wecom");
     this.conversations = new ConversationManager(ctx, config, (target, file) => this.sendLocalFile(target, file));
     this.seen = new SeenMessageIds(config.maxSeenMessageIds);
+    this.allowedHarnessCommands = new Set(config.allowedHarnessCommands);
   }
   ctx;
   config;
@@ -558,6 +631,7 @@ var WeComHarnessBridge = class {
   log;
   conversations;
   seen;
+  allowedHarnessCommands;
   client;
   stopping = false;
   /** Load persisted ids, authenticate, and wait for WeCom readiness. */
@@ -631,7 +705,7 @@ var WeComHarnessBridge = class {
       maxReconnectAttempts: this.config.maxReconnectAttempts,
       maxAuthFailureAttempts: this.config.maxAuthFailureAttempts,
       requestTimeout: this.config.sendTimeoutMs,
-      plug_version: "deepseek-harness-wecom/0.1.1"
+      plug_version: "deepseek-harness-wecom/0.1.2"
     });
   }
   async handleWelcome(frame) {
@@ -652,60 +726,76 @@ var WeComHarnessBridge = class {
   async handleMessage(frame) {
     const message = frame.body;
     if (message === void 0 || this.seen.hasOrAdd(message.msgid) || !this.allowed(message)) return;
-    const command = commandText(message);
-    if (command === "/bot-ping") {
-      await this.sendReply(frame, { text: "pong \u2014 DeepSeek Harness \u4F01\u5FAE\u673A\u5668\u4EBA\u5DF2\u8FDE\u63A5\u3002", images: [] });
-      return;
-    }
-    if (command === "/bot-help") {
-      await this.sendReply(frame, {
-        text: [
-          "DeepSeek Harness \u4F01\u5FAE\u673A\u5668\u4EBA",
-          "/bot-ping \u2014 \u68C0\u67E5\u8FDE\u901A\u6027",
-          "/bot-image-test \u2014 \u53D1\u9001\u4E00\u5F20\u84DD\u8272\u56FE\u7247\uFF0C\u68C0\u67E5\u56FE\u7247\u51FA\u7AD9\u94FE\u8DEF",
-          "/bot-file-test \u2014 \u53D1\u9001\u4E00\u4E2A\u6587\u672C\u9644\u4EF6\uFF0C\u68C0\u67E5\u6587\u4EF6\u51FA\u7AD9\u94FE\u8DEF",
-          "/bot-status \u2014 \u67E5\u770B\u5F53\u524D\u4F1A\u8BDD\u72B6\u6001",
-          "/bot-cancel \u2014 \u53D6\u6D88\u5F53\u524D\u751F\u6210",
-          "\u5176\u4ED6\u6D88\u606F\u4F1A\u4EA4\u7ED9\u5F53\u524D Harness \u9ED8\u8BA4\u6A21\u578B\u5904\u7406\u3002"
-        ].join("\n"),
-        images: []
-      });
-      return;
-    }
-    if (command === "/bot-image-test") {
-      await this.sendReply(frame, {
-        text: "\u84DD\u8272\u6D4B\u8BD5\u56FE\u7247\u53D1\u9001\u6210\u529F\u3002",
-        images: [{ data: OUTBOUND_TEST_PNG, mediaType: "image/png", name: "wecom-image-test.png" }]
-      });
-      return;
-    }
-    if (command === "/bot-file-test") {
-      await this.sendMedia(
-        chatTarget(message),
-        OUTBOUND_TEST_FILE,
-        "file",
-        "wecom-file-test.txt",
-        "WeCom file"
-      );
-      await this.sendReply(frame, { text: "\u6587\u672C\u9644\u4EF6\u53D1\u9001\u6210\u529F\u3002", images: [] });
-      return;
-    }
-    if (command === "/bot-cancel") {
-      const cancelled = this.conversations.cancel(message);
-      await this.sendReply(frame, {
-        text: cancelled ? "\u5DF2\u8BF7\u6C42\u53D6\u6D88\u5F53\u524D\u751F\u6210\u3002" : "\u5F53\u524D\u6CA1\u6709\u6B63\u5728\u751F\u6210\u7684\u56DE\u590D\u3002",
-        images: []
-      });
-      return;
-    }
-    if (command === "/bot-status") {
-      await this.sendReply(frame, {
-        text: "\u4F01\u5FAE\u957F\u8FDE\u63A5\u6B63\u5E38\uFF0CDeepSeek Harness \u4F1A\u8BDD\u6309\u5355\u804A/\u7FA4\u804A\u72EC\u7ACB\u6301\u4E45\u5316\u3002",
-        images: []
-      });
-      return;
-    }
     try {
+      const command = slashCommand(message);
+      if (command?.name === "bot-ping") {
+        await this.sendReply(frame, { text: "pong \u2014 DeepSeek Harness \u4F01\u5FAE\u673A\u5668\u4EBA\u5DF2\u8FDE\u63A5\u3002", images: [] });
+        return;
+      }
+      if (command?.name === "help" || command?.name === "bot-help") {
+        await this.sendReply(frame, { text: this.helpText(), images: [] });
+        return;
+      }
+      if (command?.name === "new" || command?.name === "reset") {
+        await this.conversations.reset(message);
+        await this.sendReply(frame, {
+          text: "\u5DF2\u5F00\u542F\u65B0\u5BF9\u8BDD\u3002\u4E0B\u4E00\u6761\u6D88\u606F\u4F1A\u4F7F\u7528\u5168\u65B0\u7684 Harness \u4E0A\u4E0B\u6587\uFF0C\u65E7\u4F1A\u8BDD\u5386\u53F2\u4ECD\u4FDD\u7559\u5728\u7F51\u9875\u7AEF\u3002",
+          images: []
+        });
+        return;
+      }
+      if (command?.name === "bot-image-test") {
+        await this.sendReply(frame, {
+          text: "\u84DD\u8272\u6D4B\u8BD5\u56FE\u7247\u53D1\u9001\u6210\u529F\u3002",
+          images: [{ data: OUTBOUND_TEST_PNG, mediaType: "image/png", name: "wecom-image-test.png" }]
+        });
+        return;
+      }
+      if (command?.name === "bot-file-test") {
+        await this.sendMedia(
+          chatTarget(message),
+          OUTBOUND_TEST_FILE,
+          "file",
+          "wecom-file-test.txt",
+          "WeCom file"
+        );
+        await this.sendReply(frame, { text: "\u6587\u672C\u9644\u4EF6\u53D1\u9001\u6210\u529F\u3002", images: [] });
+        return;
+      }
+      if (command?.name === "bot-cancel") {
+        const cancelled = this.conversations.cancel(message);
+        await this.sendReply(frame, {
+          text: cancelled ? "\u5DF2\u8BF7\u6C42\u53D6\u6D88\u5F53\u524D\u751F\u6210\u3002" : "\u5F53\u524D\u6CA1\u6709\u6B63\u5728\u751F\u6210\u7684\u56DE\u590D\u3002",
+          images: []
+        });
+        return;
+      }
+      if (command?.name === "bot-status") {
+        await this.sendReply(frame, {
+          text: "\u4F01\u5FAE\u957F\u8FDE\u63A5\u6B63\u5E38\uFF0CDeepSeek Harness \u4F1A\u8BDD\u6309\u5355\u804A/\u7FA4\u804A\u72EC\u7ACB\u6301\u4E45\u5316\u3002",
+          images: []
+        });
+        return;
+      }
+      if (command?.name === "export") {
+        await this.sendReply(frame, {
+          text: "/export \u4F9D\u8D56\u7F51\u9875\u4E0B\u8F7D\u754C\u9762\uFF0C\u4F01\u5FAE\u6682\u4E0D\u652F\u6301\u3002\u4F1A\u8BDD\u5185\u5BB9\u6CA1\u6709\u53D1\u9001\u7ED9\u6A21\u578B\u3002",
+          images: []
+        });
+        return;
+      }
+      if (command !== void 0 && this.allowedHarnessCommands.has(command.name)) {
+        const outcome = await this.conversations.executeCommand(message, command.line);
+        await this.sendReply(frame, this.commandReply(command.name, outcome));
+        return;
+      }
+      if (command !== void 0) {
+        await this.sendReply(frame, {
+          text: `\u672A\u77E5\u6216\u672A\u5F00\u653E\u7684\u547D\u4EE4 /${command.name}\u3002\u8BE5\u5185\u5BB9\u6CA1\u6709\u53D1\u9001\u7ED9\u6A21\u578B\uFF1B\u53D1\u9001 /help \u67E5\u770B\u53EF\u7528\u547D\u4EE4\u3002`,
+          images: []
+        });
+        return;
+      }
       const reply = await this.conversations.process(message, this.requireClient());
       await this.sendReply(frame, reply);
     } catch (error) {
@@ -716,6 +806,38 @@ var WeComHarnessBridge = class {
         this.log.error("WeCom error reply failed: %s", String(sendError));
       }
     }
+  }
+  helpText() {
+    const harnessCommands = [...this.allowedHarnessCommands].map((name2) => `/${name2}`).join("\u3001") || "\uFF08\u672A\u5F00\u653E\uFF09";
+    return [
+      "DeepSeek Harness \u4F01\u5FAE\u673A\u5668\u4EBA",
+      "/new \u2014 \u5F00\u542F\u5168\u65B0\u7684\u6301\u4E45\u4F1A\u8BDD\uFF0C\u65E7\u5386\u53F2\u4FDD\u7559",
+      "/reset \u2014 /new \u7684\u522B\u540D",
+      "/help\u3001/bot-help \u2014 \u663E\u793A\u672C\u5E2E\u52A9",
+      "/bot-ping \u2014 \u68C0\u67E5\u8FDE\u901A\u6027",
+      "/bot-image-test \u2014 \u53D1\u9001\u4E00\u5F20\u84DD\u8272\u56FE\u7247\uFF0C\u68C0\u67E5\u56FE\u7247\u51FA\u7AD9\u94FE\u8DEF",
+      "/bot-file-test \u2014 \u53D1\u9001\u4E00\u4E2A\u6587\u672C\u9644\u4EF6\uFF0C\u68C0\u67E5\u6587\u4EF6\u51FA\u7AD9\u94FE\u8DEF",
+      "/bot-status \u2014 \u67E5\u770B\u5F53\u524D\u4F1A\u8BDD\u72B6\u6001",
+      "/bot-cancel \u2014 \u53D6\u6D88\u5F53\u524D\u751F\u6210",
+      `\u5DF2\u5F00\u653E\u7684 Harness \u547D\u4EE4\uFF1A${harnessCommands}\uFF08\u4EC5\u5728\u5F53\u524D preset \u6CE8\u518C\u540E\u53EF\u7528\uFF09`,
+      "\u5176\u4ED6\u659C\u6760\u547D\u4EE4\u4F1A\u88AB\u63D2\u4EF6\u62D2\u7EDD\uFF0C\u4E0D\u4F1A\u9001\u7ED9\u6A21\u578B\uFF1B\u666E\u901A\u6D88\u606F\u4F1A\u4EA4\u7ED9\u5F53\u524D Harness \u9ED8\u8BA4\u6A21\u578B\u5904\u7406\u3002"
+    ].join("\n");
+  }
+  commandReply(name2, outcome) {
+    if (outcome.execution === void 0) {
+      return {
+        text: `\u5F53\u524D\u4F1A\u8BDD\u7684 agent preset \u6CA1\u6709\u6CE8\u518C /${name2}\u3002\u8BE5\u5185\u5BB9\u6CA1\u6709\u53D1\u9001\u7ED9\u6A21\u578B\u3002`,
+        images: []
+      };
+    }
+    const direct = outcome.execution.result.text?.trim() || (outcome.execution.result.kind === "success" ? `/${name2} \u5DF2\u6267\u884C\u3002` : `/${name2} \u6267\u884C\u5931\u8D25\u3002`);
+    const text = outcome.response?.text ? `${direct}
+
+${outcome.response.text}` : direct;
+    return {
+      text,
+      images: outcome.response?.images ?? []
+    };
   }
   allowed(message) {
     const group = message.chattype === "group";
@@ -792,11 +914,22 @@ var WeComHarnessBridge = class {
     return this.client;
   }
 };
-function commandText(message) {
-  if (message.msgtype === "text") return message.text?.content?.trim().toLowerCase() ?? "";
-  if (message.msgtype !== "mixed") return "";
-  const mixed = message.mixed;
-  return (mixed?.msg_item ?? []).filter((item) => item.msgtype === "text").map((item) => item.text?.content ?? "").join("").trim().toLowerCase();
+function slashCommand(message) {
+  let line;
+  if (message.msgtype === "text") {
+    line = message.text?.content?.trim() ?? "";
+  } else if (message.msgtype === "mixed") {
+    const mixed = message.mixed;
+    line = (mixed?.msg_item ?? []).filter((item) => item.msgtype === "text").map((item) => item.text?.content ?? "").join("").trim();
+  } else {
+    return void 0;
+  }
+  const match = /^\/([a-z][a-z0-9_-]*)(?=$|[\t\n\r ])/iu.exec(line);
+  if (match === null) return void 0;
+  const rawName = match[1];
+  if (rawName === void 0) return void 0;
+  const name2 = rawName.toLowerCase();
+  return { name: name2, line: `/${name2}${line.slice(match[0].length)}` };
 }
 function imageFilename(mediaType) {
   if (mediaType === "image/jpeg") return "image.jpg";
@@ -815,6 +948,7 @@ var DEFAULT_WECOM_INBOUND_FILE_DIRECTORY = join2(
   `deepseek-harness-wecom-${typeof process.getuid === "function" ? process.getuid() : "current-user"}`,
   "inbound"
 );
+var COMMAND_NAME_PATTERN = /^[a-z][a-z0-9_-]*$/u;
 var Config = z.object({
   botId: z.string().required(),
   secretRef: z.string().default("WECOM_BOT_SECRET"),
@@ -827,6 +961,7 @@ var Config = z.object({
   singleAllowFrom: z.array(z.string()).default([]),
   groupPolicy: z.union(["open", "allowlist", "disabled"]).default("open"),
   groupAllowFrom: z.array(z.string()).default([]),
+  allowedHarnessCommands: z.array(z.string().pattern(COMMAND_NAME_PATTERN)).default(["compact", "goal", "plan"]),
   imageInputMode: z.union(["auto", "always", "never"]).default("auto"),
   inboundFileDirectory: z.string().default(DEFAULT_WECOM_INBOUND_FILE_DIRECTORY),
   welcomeText: z.string().default(""),
@@ -854,6 +989,7 @@ var inject = [
   "agentPresets",
   "agents",
   "attachments",
+  "commands",
   "credentials",
   "llm",
   "sessionPersistence",

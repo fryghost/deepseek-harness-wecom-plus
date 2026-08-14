@@ -13,6 +13,15 @@ describe('Config', () => {
     expect(config.maxOutboundFileBytes).toBe(WECOM_FILE_MAX_BYTES)
     expect(config.maxInboundFileBytes).toBe(WECOM_FILE_MAX_BYTES)
     expect(config.inboundFileDirectory).toBe(DEFAULT_WECOM_INBOUND_FILE_DIRECTORY)
+    expect(config.allowedHarnessCommands).toEqual(['compact', 'goal', 'plan'])
+  })
+
+  it('rejects invalid Harness command names', () => {
+    expect(() => Config({
+      botId: 'test-bot',
+      cwd: '/tmp/wecom-test',
+      allowedHarnessCommands: ['permission danger-full-access'],
+    } as WeComConfig)).toThrow()
   })
 
   it('rejects an outbound file limit above the WeCom protocol limit', () => {

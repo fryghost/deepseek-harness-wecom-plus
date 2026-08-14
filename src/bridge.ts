@@ -20,7 +20,11 @@ import {
   type WsFrameHeaders,
 } from '@wecom/aibot-node-sdk'
 import type { Config } from './config.js'
-import { ConversationManager, type ConversationReply } from './conversations.js'
+import {
+  ConversationManager,
+  type ConversationCommandReply,
+  type ConversationReply,
+} from './conversations.js'
 import type { WeComDownloadPort } from './inbound.js'
 import type { OutboundFile } from './outbound-file.js'
 import { chatTarget, SeenMessageIds, truncateUtf8, withTimeout } from './util.js'
@@ -64,6 +68,11 @@ interface WeComClientPort extends WeComDownloadPort {
   sendMediaMessage(chatid: string, mediaType: WeComMediaType, mediaId: string): Promise<unknown>
 }
 
+interface WeComSlashCommand {
+  name: string
+  line: string
+}
+
 export type WeComClientFactory = (options: WSClientOptions) => WeComClientPort
 
 /** Live WeCom WebSocket ↔ DeepSeek Harness bridge. */
@@ -71,6 +80,7 @@ export class WeComHarnessBridge {
   private readonly log
   private readonly conversations: ConversationManager
   private readonly seen: SeenMessageIds
+  private readonly allowedHarnessCommands: ReadonlySet<string>
   private client: WeComClientPort | undefined
   private stopping = false
 
@@ -88,6 +98,7 @@ export class WeComHarnessBridge {
     this.log = ctx.logger('deepseek-harness-wecom')
     this.conversations = new ConversationManager(ctx, config, (target, file) => this.sendLocalFile(target, file))
     this.seen = new SeenMessageIds(config.maxSeenMessageIds)
+    this.allowedHarnessCommands = new Set(config.allowedHarnessCommands)
   }
 
   /** Load persisted ids, authenticate, and wait for WeCom readiness. */
@@ -165,7 +176,7 @@ export class WeComHarnessBridge {
       maxReconnectAttempts: this.config.maxReconnectAttempts,
       maxAuthFailureAttempts: this.config.maxAuthFailureAttempts,
       requestTimeout: this.config.sendTimeoutMs,
-      plug_version: 'deepseek-harness-wecom/0.1.1',
+      plug_version: 'deepseek-harness-wecom/0.1.2',
     })
   }
 
@@ -188,61 +199,77 @@ export class WeComHarnessBridge {
   private async handleMessage(frame: WsFrame<BaseMessage>): Promise<void> {
     const message = frame.body
     if (message === undefined || this.seen.hasOrAdd(message.msgid) || !this.allowed(message)) return
-    const command = commandText(message)
-    if (command === '/bot-ping') {
-      await this.sendReply(frame, { text: 'pong — DeepSeek Harness 企微机器人已连接。', images: [] })
-      return
-    }
-    if (command === '/bot-help') {
-      await this.sendReply(frame, {
-        text: [
-          'DeepSeek Harness 企微机器人',
-          '/bot-ping — 检查连通性',
-          '/bot-image-test — 发送一张蓝色图片，检查图片出站链路',
-          '/bot-file-test — 发送一个文本附件，检查文件出站链路',
-          '/bot-status — 查看当前会话状态',
-          '/bot-cancel — 取消当前生成',
-          '其他消息会交给当前 Harness 默认模型处理。',
-        ].join('\n'),
-        images: [],
-      })
-      return
-    }
-    if (command === '/bot-image-test') {
-      await this.sendReply(frame, {
-        text: '蓝色测试图片发送成功。',
-        images: [{ data: OUTBOUND_TEST_PNG, mediaType: 'image/png', name: 'wecom-image-test.png' }],
-      })
-      return
-    }
-    if (command === '/bot-file-test') {
-      await this.sendMedia(
-        chatTarget(message),
-        OUTBOUND_TEST_FILE,
-        'file',
-        'wecom-file-test.txt',
-        'WeCom file',
-      )
-      await this.sendReply(frame, { text: '文本附件发送成功。', images: [] })
-      return
-    }
-    if (command === '/bot-cancel') {
-      const cancelled = this.conversations.cancel(message)
-      await this.sendReply(frame, {
-        text: cancelled ? '已请求取消当前生成。' : '当前没有正在生成的回复。',
-        images: [],
-      })
-      return
-    }
-    if (command === '/bot-status') {
-      await this.sendReply(frame, {
-        text: '企微长连接正常，DeepSeek Harness 会话按单聊/群聊独立持久化。',
-        images: [],
-      })
-      return
-    }
-
     try {
+      const command = slashCommand(message)
+      if (command?.name === 'bot-ping') {
+        await this.sendReply(frame, { text: 'pong — DeepSeek Harness 企微机器人已连接。', images: [] })
+        return
+      }
+      if (command?.name === 'help' || command?.name === 'bot-help') {
+        await this.sendReply(frame, { text: this.helpText(), images: [] })
+        return
+      }
+      if (command?.name === 'new' || command?.name === 'reset') {
+        await this.conversations.reset(message)
+        await this.sendReply(frame, {
+          text: '已开启新对话。下一条消息会使用全新的 Harness 上下文，旧会话历史仍保留在网页端。',
+          images: [],
+        })
+        return
+      }
+      if (command?.name === 'bot-image-test') {
+        await this.sendReply(frame, {
+          text: '蓝色测试图片发送成功。',
+          images: [{ data: OUTBOUND_TEST_PNG, mediaType: 'image/png', name: 'wecom-image-test.png' }],
+        })
+        return
+      }
+      if (command?.name === 'bot-file-test') {
+        await this.sendMedia(
+          chatTarget(message),
+          OUTBOUND_TEST_FILE,
+          'file',
+          'wecom-file-test.txt',
+          'WeCom file',
+        )
+        await this.sendReply(frame, { text: '文本附件发送成功。', images: [] })
+        return
+      }
+      if (command?.name === 'bot-cancel') {
+        const cancelled = this.conversations.cancel(message)
+        await this.sendReply(frame, {
+          text: cancelled ? '已请求取消当前生成。' : '当前没有正在生成的回复。',
+          images: [],
+        })
+        return
+      }
+      if (command?.name === 'bot-status') {
+        await this.sendReply(frame, {
+          text: '企微长连接正常，DeepSeek Harness 会话按单聊/群聊独立持久化。',
+          images: [],
+        })
+        return
+      }
+      if (command?.name === 'export') {
+        await this.sendReply(frame, {
+          text: '/export 依赖网页下载界面，企微暂不支持。会话内容没有发送给模型。',
+          images: [],
+        })
+        return
+      }
+      if (command !== undefined && this.allowedHarnessCommands.has(command.name)) {
+        const outcome = await this.conversations.executeCommand(message, command.line)
+        await this.sendReply(frame, this.commandReply(command.name, outcome))
+        return
+      }
+      if (command !== undefined) {
+        await this.sendReply(frame, {
+          text: `未知或未开放的命令 /${command.name}。该内容没有发送给模型；发送 /help 查看可用命令。`,
+          images: [],
+        })
+        return
+      }
+
       const reply = await this.conversations.process(message, this.requireClient())
       await this.sendReply(frame, reply)
     } catch (error) {
@@ -252,6 +279,39 @@ export class WeComHarnessBridge {
       } catch (sendError) {
         this.log.error('WeCom error reply failed: %s', String(sendError))
       }
+    }
+  }
+
+  private helpText(): string {
+    const harnessCommands = [...this.allowedHarnessCommands].map(name => `/${name}`).join('、') || '（未开放）'
+    return [
+      'DeepSeek Harness 企微机器人',
+      '/new — 开启全新的持久会话，旧历史保留',
+      '/reset — /new 的别名',
+      '/help、/bot-help — 显示本帮助',
+      '/bot-ping — 检查连通性',
+      '/bot-image-test — 发送一张蓝色图片，检查图片出站链路',
+      '/bot-file-test — 发送一个文本附件，检查文件出站链路',
+      '/bot-status — 查看当前会话状态',
+      '/bot-cancel — 取消当前生成',
+      `已开放的 Harness 命令：${harnessCommands}（仅在当前 preset 注册后可用）`,
+      '其他斜杠命令会被插件拒绝，不会送给模型；普通消息会交给当前 Harness 默认模型处理。',
+    ].join('\n')
+  }
+
+  private commandReply(name: string, outcome: ConversationCommandReply): ConversationReply {
+    if (outcome.execution === undefined) {
+      return {
+        text: `当前会话的 agent preset 没有注册 /${name}。该内容没有发送给模型。`,
+        images: [],
+      }
+    }
+    const direct = outcome.execution.result.text?.trim()
+      || (outcome.execution.result.kind === 'success' ? `/${name} 已执行。` : `/${name} 执行失败。`)
+    const text = outcome.response?.text ? `${direct}\n\n${outcome.response.text}` : direct
+    return {
+      text,
+      images: outcome.response?.images ?? [],
     }
   }
 
@@ -343,18 +403,28 @@ export class WeComHarnessBridge {
   }
 }
 
-function commandText(message: BaseMessage): string {
-  if (message.msgtype === 'text') return message.text?.content?.trim().toLowerCase() ?? ''
-  if (message.msgtype !== 'mixed') return ''
-  const mixed = message.mixed as {
-    msg_item?: Array<{ msgtype?: string; text?: { content?: string } }>
-  } | undefined
-  return (mixed?.msg_item ?? [])
-    .filter(item => item.msgtype === 'text')
-    .map(item => item.text?.content ?? '')
-    .join('')
-    .trim()
-    .toLowerCase()
+function slashCommand(message: BaseMessage): WeComSlashCommand | undefined {
+  let line: string
+  if (message.msgtype === 'text') {
+    line = message.text?.content?.trim() ?? ''
+  } else if (message.msgtype === 'mixed') {
+    const mixed = message.mixed as {
+      msg_item?: Array<{ msgtype?: string; text?: { content?: string } }>
+    } | undefined
+    line = (mixed?.msg_item ?? [])
+      .filter(item => item.msgtype === 'text')
+      .map(item => item.text?.content ?? '')
+      .join('')
+      .trim()
+  } else {
+    return undefined
+  }
+  const match = /^\/([a-z][a-z0-9_-]*)(?=$|[\t\n\r ])/iu.exec(line)
+  if (match === null) return undefined
+  const rawName = match[1]
+  if (rawName === undefined) return undefined
+  const name = rawName.toLowerCase()
+  return { name, line: `/${name}${line.slice(match[0].length)}` }
 }
 
 function imageFilename(mediaType: string): string {

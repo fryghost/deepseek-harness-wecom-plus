@@ -20,6 +20,8 @@
 - 每个单聊或群聊对应一个独立、可恢复的 Harness 会话
 - 挂载 Harness agent preset，使企微会话与网页会话使用相同的工具、提示词和技能组合
 - 网页已打开同一会话时安全复用 live Agent，不创建第二个 session writer
+- `/new`、`/reset` 会切换到新的持久会话，旧会话历史保留
+- 可配置转发当前 agent preset 注册的 Harness 斜杠命令，默认开放 `/compact`、`/goal`、`/plan`
 - 同会话消息串行处理、消息排重、发送重试和超时保护
 - 单聊/群聊可分别配置开放、白名单或禁用
 - 内置 `/bot-ping`、`/bot-image-test`、`/bot-file-test`、`/bot-help`、`/bot-status`、`/bot-cancel`
@@ -75,6 +77,7 @@ pnpm dsh --profile web
     singlePolicy: allowlist
     singleAllowFrom: [zhangsan]
     groupPolicy: open
+    allowedHarnessCommands: [compact, goal, plan]
     imageInputMode: auto
     inboundFileDirectory: /var/tmp/deepseek-harness-wecom/inbound
     maxInboundFileBytes: 20971520
@@ -89,6 +92,8 @@ pnpm dsh --profile web
 企微官方 SDK 明确定义 `replyStream` 的内容字段支持 Markdown。插件会原样传递 assistant 生成的 Markdown，包括标题、列表、链接、强调、引用和代码；最终负载仍受 `maxReplyBytes` 限制，默认上限为 20,000 字节。
 
 `agentPreset` 默认使用当前 Harness 部署选择的默认 preset（通常是 `standard`）。插件会把 preset 写入 session header，并在恢复时重新挂载，使模型工具调用交给 Harness Agent Loop 处理，而不是把原始 DSML 文本暴露给用户。修复前创建的会话使用 `wecom-v1-` 命名空间；正确组合后的会话使用 `wecom-v2-`，旧历史保留不动。如果网页已经打开同一个修复后会话，企微 bridge 会借用该 Agent、等待当前活动结束，不会再启动第二个 session writer。
+
+`/new` 和 `/reset` 由企微插件直接处理：当前生成会先被请求取消，然后插件创建带递增后缀的新持久 session；旧 session 不删除，服务重启后也不会回到旧上下文。其他斜杠命令不会作为普通文本送进模型。`allowedHarnessCommands` 控制允许转发给 Harness 命令服务的名称，默认只开放 `/compact`、`/goal`、`/plan`；命令还必须由当前 agent preset 注册才可执行。`/permission` 可以显著扩大 agent 权限，只有同时严格限制 `singleAllowFrom` 和 `groupAllowFrom` 时才应显式加入。依赖网页下载界面的 `/export` 在企微中不可用。发送 `/help` 或 `/bot-help` 可查看企微侧可用命令。
 
 当前企微用户要求接收或下载文件时，agent 可以调用会话范围内的 `wecom_send_file` 工具。相对路径从 `cwd` 解析，绝对路径也必须位于 `cwd` 内。插件会先解析符号链接，只接受普通文件，并拒绝超过 `maxOutboundFileBytes` 的文件；默认值也是企微协议上限 20,971,520 字节（20 MiB）。该工具仅在当前企微回合生效，因此从网页继续同一会话时，不能向上一次企微目标发送文件。配置的工作目录包含非公开数据时，应使用白名单策略。
 
@@ -107,6 +112,8 @@ pong — DeepSeek Harness 企微机器人已连接。
 发送 `/bot-file-test` 可以在不调用模型的情况下验证官方临时素材上传和主动文件发送接口。机器人应先发送 `wecom-file-test.txt`，再回复发送成功。随后可以要求 agent 发送工作目录中已有的文件，例如“把 README.md 作为文件发给我”；对应会话中应出现 `wecom_send_file` 调用，企微应收到附件。
 
 然后发送普通文本、图片或图文混排消息。插件会把消息追加到对应的 Harness 持久会话，并把当前默认模型的回复发回企微。
+
+发送 `/new` 后，机器人应确认已经开启新对话；随后询问旧对话中的细节，Agent 不应继续使用旧上下文。发送 `/compact`、`/goal` 或 `/plan` 时，插件应直接显示 Harness 命令结果，回复中不应出现模型对斜杠命令的解释。未知或未开放的斜杠命令应被明确拒绝，不能送入模型。
 
 验证入站文件时，可以发送一个较小的文本或文档文件，并让机器人总结其内容。Agent 应使用下载后的本地路径调用相应文件或 shell 工具，不能再回复“插件只支持文本和图片”；引用文件也走同一条链路。
 

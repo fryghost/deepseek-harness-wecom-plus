@@ -13,6 +13,7 @@ export function testConfig(overrides: Partial<Config> = {}): Config {
     singleAllowFrom: [],
     groupPolicy: 'open',
     groupAllowFrom: [],
+    allowedHarnessCommands: ['compact', 'goal', 'plan'],
     imageInputMode: 'auto',
     inboundFileDirectory: '/tmp/deepseek-harness-wecom-test/inbound',
     welcomeText: '',

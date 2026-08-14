@@ -10,6 +10,7 @@ export const inject = [
   'agentPresets',
   'agents',
   'attachments',
+  'commands',
   'credentials',
   'llm',
   'sessionPersistence',

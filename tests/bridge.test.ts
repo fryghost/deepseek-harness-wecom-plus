@@ -87,7 +87,12 @@ function commandContext(secret: string | undefined): never {
   } as never
 }
 
-function agentContext(): never {
+function agentContext(
+  executeCommand = vi.fn(async () => ({
+    commandId: 'test-command',
+    result: { kind: 'success' as const, text: 'Harness command completed' },
+  })),
+): never {
   const logger = { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() }
   const events: unknown[] = []
   const ref = { attachmentId: 'sha256:reply', mediaType: 'image/png', bytes: 3, width: 1, height: 1 }
@@ -114,6 +119,7 @@ function agentContext(): never {
   return {
     logger: vi.fn(() => logger),
     credentials: { resolve: vi.fn(async () => ({ value: 'resolved-secret', source: 'test' })) },
+    commands: { execute: executeCommand },
     sessionPersistence: { list: vi.fn(async () => []) },
     agentDefaultModel: { currentSelection: vi.fn(() => ({ provider: 'deepseek', model: 'deepseek-chat' })) },
     agentPresets: { defaultId: 'standard', mount: vi.fn(async () => ({ id: 'standard' })) },
@@ -213,6 +219,43 @@ describe('WeComHarnessBridge', () => {
     expect(client.replies).toHaveLength(1)
     expect(client.replies[0]?.content).toBe('# Model reply\n\n- first\n- second')
     expect(client.replies[0]?.items).toHaveLength(1)
+    await bridge.stop()
+  })
+
+  it('starts a fresh Harness conversation for /new without sending it to the model', async () => {
+    const client = new FakeClient()
+    const bridge = new WeComHarnessBridge(agentContext(), testConfig(), () => client as never)
+    await bridge.start()
+    await client.message(textMessage('/new', 'm-new'))
+
+    expect(client.replies[0]?.content).toContain('已开启新对话')
+    expect(client.replies[0]?.content).not.toContain('无法直接控制')
+    await bridge.stop()
+  })
+
+  it('executes an allowed Harness slash command and preserves its input', async () => {
+    const execute = vi.fn(async () => ({
+      commandId: 'test-command',
+      result: { kind: 'success' as const, text: '目标已更新。' },
+    }))
+    const client = new FakeClient()
+    const bridge = new WeComHarnessBridge(agentContext(execute), testConfig(), () => client as never)
+    await bridge.start()
+    await client.message(textMessage('/GOAL Keep API Names', 'm-goal'))
+
+    expect(execute).toHaveBeenCalledWith(expect.anything(), '/goal Keep API Names', expect.any(AbortSignal))
+    expect(client.replies[0]?.content).toBe('目标已更新。')
+    await bridge.stop()
+  })
+
+  it('rejects a slash command that is not enabled instead of sending it to the model', async () => {
+    const client = new FakeClient()
+    const bridge = new WeComHarnessBridge(commandContext('resolved-secret'), testConfig(), () => client as never)
+    await bridge.start()
+    await client.message(textMessage('/permission danger-full-access', 'm-permission'))
+
+    expect(client.replies[0]?.content).toContain('未知或未开放的命令 /permission')
+    expect(client.replies[0]?.content).toContain('没有发送给模型')
     await bridge.stop()
   })
 

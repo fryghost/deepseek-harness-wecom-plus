@@ -18,6 +18,8 @@ export type AccessMode = 'open' | 'allowlist' | 'disabled'
 /** How inbound WeCom images are presented to the selected Harness model. */
 export type ImageInputMode = 'auto' | 'always' | 'never'
 
+const COMMAND_NAME_PATTERN = /^[a-z][a-z0-9_-]*$/u
+
 /** WeCom AI Bot channel configuration. */
 export interface Config {
   botId: string
@@ -31,6 +33,7 @@ export interface Config {
   singleAllowFrom: string[]
   groupPolicy: AccessMode
   groupAllowFrom: string[]
+  allowedHarnessCommands: string[]
   imageInputMode: ImageInputMode
   inboundFileDirectory: string
   welcomeText: string
@@ -62,6 +65,7 @@ export const Config: z<Config> = z.object({
   singleAllowFrom: z.array(z.string()).default([]),
   groupPolicy: z.union(['open', 'allowlist', 'disabled']).default('open'),
   groupAllowFrom: z.array(z.string()).default([]),
+  allowedHarnessCommands: z.array(z.string().pattern(COMMAND_NAME_PATTERN)).default(['compact', 'goal', 'plan']),
   imageInputMode: z.union(['auto', 'always', 'never']).default('auto'),
   inboundFileDirectory: z.string().default(DEFAULT_WECOM_INBOUND_FILE_DIRECTORY),
   welcomeText: z.string().default(''),

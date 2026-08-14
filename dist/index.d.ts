@@ -22,6 +22,7 @@ interface Config {
     singleAllowFrom: string[];
     groupPolicy: AccessMode;
     groupAllowFrom: string[];
+    allowedHarnessCommands: string[];
     imageInputMode: ImageInputMode;
     inboundFileDirectory: string;
     welcomeText: string;
@@ -86,6 +87,7 @@ declare class WeComHarnessBridge {
     private readonly log;
     private readonly conversations;
     private readonly seen;
+    private readonly allowedHarnessCommands;
     private client;
     private stopping;
     constructor(ctx: Context, config: Config, clientFactory?: WeComClientFactory);
@@ -96,6 +98,8 @@ declare class WeComHarnessBridge {
     private createClient;
     private handleWelcome;
     private handleMessage;
+    private helpText;
+    private commandReply;
     private allowed;
     private sendReply;
     private sendLocalFile;

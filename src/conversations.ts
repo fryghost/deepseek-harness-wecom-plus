@@ -2,6 +2,7 @@ import type { Context } from '@deepseek-ai/cordis'
 import type { Agent, AgentHandle } from '@deepseek-ai/dsh-agent'
 import type {} from '@deepseek-ai/dsh-agent-default-model'
 import { resolveSessionPreset } from '@deepseek-ai/dsh-agent-presets'
+import type { CommandExecution } from '@deepseek-ai/dsh-commands'
 import { createUserMessage } from '@deepseek-ai/dsh-llm'
 import { SessionId, type SessionEvent } from '@deepseek-ai/dsh-session'
 import type {} from '@deepseek-ai/dsh-session-persistence'
@@ -19,6 +20,12 @@ export interface ConversationReply {
   images: Array<{ data: Uint8Array; mediaType: string; name?: string }>
 }
 
+/** Direct command outcome plus any model reply triggered by that command. */
+export interface ConversationCommandReply {
+  execution: CommandExecution | undefined
+  response: ConversationReply | undefined
+}
+
 /** Upload one validated local file to the active WeCom reply target. */
 export type ConversationFileSender = (target: string, file: OutboundFile) => Promise<void>
 
@@ -34,6 +41,7 @@ export class ConversationManager {
   private readonly creations = new Map<string, Promise<ConversationAgentBinding>>()
   private readonly queues = new Map<string, Promise<unknown>>()
   private readonly activeTurns = new Map<string, string>()
+  private readonly generations = new Map<string, number>()
   private persistedIds = new Set<string>()
 
   constructor(
@@ -50,19 +58,66 @@ export class ConversationManager {
 
   /** Process one inbound message after earlier work in the same WeCom conversation. */
   process(message: BaseMessage, client: WeComDownloadPort): Promise<ConversationReply> {
-    const id = sessionIdFor(this.config.accountId, message)
-    const previous = this.queues.get(id) ?? Promise.resolve()
-    const current = previous.catch(() => undefined).then(() => this.processNow(id, message, client))
-    const tracked = current.finally(() => {
-      if (this.queues.get(id) === tracked) this.queues.delete(id)
+    const baseId = sessionIdFor(this.config.accountId, message)
+    return this.enqueue(baseId, () => this.processNow(this.currentSessionId(baseId), message, client))
+  }
+
+  /** End the current WeCom conversation session while retaining its history. */
+  async reset(message: BaseMessage): Promise<void> {
+    const baseId = sessionIdFor(this.config.accountId, message)
+    this.cancel(message)
+    await this.enqueue(baseId, async () => {
+      const id = this.currentSessionId(baseId)
+      const binding = this.bindings.get(id)
+      if (binding !== undefined) {
+        this.bindings.delete(id)
+        await binding.release()
+      }
+      const generation = this.generationFor(baseId)
+      if (!Number.isSafeInteger(generation + 1)) throw new Error('WeCom conversation generation is exhausted')
+      this.generations.set(baseId, generation + 1)
+      await this.getOrCreate(this.currentSessionId(baseId))
     })
-    this.queues.set(id, tracked)
-    return current
+  }
+
+  /** Execute a registered Harness command against the current WeCom session. */
+  executeCommand(message: BaseMessage, line: string): Promise<ConversationCommandReply> {
+    const baseId = sessionIdFor(this.config.accountId, message)
+    return this.enqueue(baseId, async () => {
+      const id = this.currentSessionId(baseId)
+      const binding = await this.getOrCreate(id)
+      const agent = binding.agent
+      await withTimeout(
+        agent.whenIdle(),
+        this.config.responseTimeoutMs,
+        'DeepSeek Harness conversation availability',
+      )
+      const start = agent.session.events.length
+      const controller = new AbortController()
+      const timer = setTimeout(() => {
+        controller.abort(new Error(`DeepSeek Harness command timed out after ${this.config.responseTimeoutMs}ms`))
+      }, this.config.responseTimeoutMs)
+      this.activeTurns.set(id, chatTarget(message))
+      try {
+        const execution = await this.ctx.commands.execute(agent, line, controller.signal)
+        if (execution === undefined) return { execution, response: undefined }
+        await withTimeout(agent.whenIdle(), this.config.responseTimeoutMs, 'DeepSeek Harness command response')
+        const events = agent.session.events.slice(start)
+        const response = events.some(event => event.type === 'assistant/message')
+          ? await this.collectReply(agent, events)
+          : undefined
+        return { execution, response }
+      } finally {
+        clearTimeout(timer)
+        this.activeTurns.delete(id)
+      }
+    })
   }
 
   /** Cancel active work for one WeCom conversation. */
   cancel(message: BaseMessage): boolean {
-    const id = sessionIdFor(this.config.accountId, message)
+    const baseId = sessionIdFor(this.config.accountId, message)
+    const id = this.currentSessionId(baseId)
     const agent = this.bindings.get(id)?.agent ?? this.ctx.agents.get(SessionId(id))
     if (agent === undefined || agent.status === 'idle') return false
     agent.cancel({ kind: 'user' })
@@ -75,6 +130,37 @@ export class ConversationManager {
     await Promise.allSettled([...this.bindings.values()].map(binding => binding.release()))
     this.bindings.clear()
     this.activeTurns.clear()
+  }
+
+  private enqueue<T>(baseId: string, operation: () => Promise<T>): Promise<T> {
+    const previous = this.queues.get(baseId) ?? Promise.resolve()
+    const current = previous.catch(() => undefined).then(operation)
+    const tracked = current.finally(() => {
+      if (this.queues.get(baseId) === tracked) this.queues.delete(baseId)
+    })
+    this.queues.set(baseId, tracked)
+    return current
+  }
+
+  private currentSessionId(baseId: string): string {
+    const generation = this.generationFor(baseId)
+    return generation === 0 ? baseId : `${baseId}-n${generation}`
+  }
+
+  private generationFor(baseId: string): number {
+    const cached = this.generations.get(baseId)
+    if (cached !== undefined) return cached
+    const prefix = `${baseId}-n`
+    let generation = 0
+    for (const id of this.persistedIds) {
+      if (!id.startsWith(prefix)) continue
+      const suffix = id.slice(prefix.length)
+      if (!/^[1-9][0-9]*$/u.test(suffix)) continue
+      const candidate = Number(suffix)
+      if (Number.isSafeInteger(candidate)) generation = Math.max(generation, candidate)
+    }
+    this.generations.set(baseId, generation)
+    return generation
   }
 
   private async processNow(

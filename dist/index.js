@@ -653,6 +653,7 @@ async function resolveOutboundFile(cwd, requestedPath, maxBytes) {
 import {
   UserQuestionError
 } from "@deepseek-ai/dsh-user-questions";
+var BUTTON_LABEL_MAX_CHARS = 6;
 function cardEventFacts(event) {
   if (typeof event !== "object" || event === null) return { taskId: void 0, eventKey: void 0 };
   const record = event;
@@ -745,7 +746,7 @@ var WeComQuestionBridge = class {
   /** Ask one question: Markdown carries the full text, the card carries the interaction surface. */
   askOne(target, question, signal) {
     const options = question.options ?? [];
-    const buttons = options.length >= 2 && options.length <= 6 && question.multiSelect !== true;
+    const buttons = options.length >= 2 && options.length <= 6 && question.multiSelect !== true && options.every((option) => option.label.length <= BUTTON_LABEL_MAX_CHARS);
     void this.sendText(target, questionMarkdown(question)).then(void 0, () => void 0);
     const mode = buttons ? "buttons" : "text";
     return new Promise((resolve2, reject) => {
@@ -1275,7 +1276,7 @@ var ConversationManager = class {
     const userQuestions = agentCtx.get("userQuestions");
     return agentCtx.tools.register(defineTool({
       name: "ask_user_question",
-      description: "Ask the user a concise question when you need confirmation, a choice, or missing information before proceeding. Send one or more questions, each with a stable id that will be echoed in the answer. When the current turn comes from WeCom, each question renders as a Markdown message plus a WeCom template card: keep option labels SHORT (at most 10 characters \u2014 the WeCom client truncates them) and put the full explanation of each choice into the question text or the option descriptions instead.",
+      description: "Ask the user a concise question when you need confirmation, a choice, or missing information before proceeding. Send one or more questions, each with a stable id that will be echoed in the answer. When the current turn comes from WeCom, each question renders as a Markdown message plus a WeCom template card: keep option labels SHORT (at most 6 characters \u2014 longer labels are visually truncated by the WeCom client, and the channel then falls back to numbered replies), and put the full explanation of each choice into the question text or the option descriptions instead.",
       parameters: {
         questions: {
           type: "array",
@@ -1414,7 +1415,7 @@ var ConversationManager = class {
   registerCardTool(agentCtx, id) {
     return agentCtx.tools.register(defineTool({
       name: "wecom_send_card",
-      description: "Send one WeCom template card to the user who initiated the current WeCom turn. The card is delivered as a second message right after the main Markdown reply, so one turn becomes one Markdown message plus one card. Prefer this tool when the user must choose among options or confirm/cancel an action: put the FULL option details in your Markdown reply and put SHORT labels (at most 10 characters) on the card buttons, because button text is truncated by the WeCom client. Display text is truncated to the WeCom card limits (title 26, desc 30, subtitle 112 characters), so never duplicate the full reply inside the card. Only valid during an active WeCom turn.",
+      description: "Send one WeCom template card to the user who initiated the current WeCom turn. The card is delivered as a second message right after the main Markdown reply, so one turn becomes one Markdown message plus one card. Prefer this tool when the user must choose among options or confirm/cancel an action: put the FULL option details in your Markdown reply and put SHORT labels (at most 6 characters, or the WeCom client visually truncates them) on the card buttons. Display text is truncated to the WeCom card limits (title 26, desc 30, subtitle 112 characters), so never duplicate the full reply inside the card. Only valid during an active WeCom turn.",
       parameters: {
         card_type: {
           type: "string",
@@ -1747,7 +1748,7 @@ var WeComHarnessBridge = class {
       maxReconnectAttempts: this.config.maxReconnectAttempts,
       maxAuthFailureAttempts: this.config.maxAuthFailureAttempts,
       requestTimeout: this.config.sendTimeoutMs,
-      plug_version: "deepseek-harness-wecom-plus/0.5.4"
+      plug_version: "deepseek-harness-wecom-plus/0.5.5"
     });
   }
   async handleWelcome(frame) {
@@ -2337,7 +2338,7 @@ var Config = z.object({
   maxInboundFileBytes: z.number().step(1).min(1).max(WECOM_FILE_MAX_BYTES).default(WECOM_FILE_MAX_BYTES),
   maxOutboundFileBytes: z.number().step(1).min(1).max(WECOM_FILE_MAX_BYTES).default(WECOM_FILE_MAX_BYTES),
   systemPrompt: z.string().default(
-    "You are replying through WeCom. Keep replies clear and suitable for enterprise chat. Use WeCom-compatible Markdown for headings, lists, links, emphasis, quotes, and code when structure helps. When the WeCom user asks to receive an existing workspace file, use wecom_send_file instead of claiming that file attachments are unavailable or pasting the whole file. When you need the user to decide something, call ask_user_question: the channel renders it as a Markdown message plus a WeCom template card, and the user answers by clicking a button or replying with a number. Keep option labels SHORT (at most 10 characters, or the WeCom client truncates them) and put the full explanation of each choice in the question detail instead. When the user must choose among options or confirm/cancel an action, pair your reply with a card: put the FULL option details (what each choice does) in your Markdown reply, then call wecom_send_card with button_interaction whose buttons carry SHORT labels (at most 10 characters, or the WeCom client truncates them). One turn therefore renders as one Markdown message + one card. For lists of choices you may use vote_interaction (checkbox) or multiple_interaction (dropdowns) instead; keep every label within its cap and never duplicate the whole reply inside the card. When a user clicks a card button or submits a selection, the click arrives as a WeCom message carrying task_id and event_key (plus the selected label when known); answer that click in your reply. Inbound WeCom files are already downloaded and decrypted; their absolute local paths appear in the user message. Use the available file or shell tools to inspect those paths when the user asks you to process an attachment. Do not reveal credentials or internal system data. When a request needs an interactive approval that WeCom cannot provide, explain what approval is needed instead of waiting indefinitely."
+    "You are replying through WeCom. Keep replies clear and suitable for enterprise chat. Use WeCom-compatible Markdown for headings, lists, links, emphasis, quotes, and code when structure helps. When the WeCom user asks to receive an existing workspace file, use wecom_send_file instead of claiming that file attachments are unavailable or pasting the whole file. When you need the user to decide something, call ask_user_question: the channel renders it as a Markdown message plus a WeCom template card, and the user answers by clicking a button or replying with a number. Keep option labels SHORT (at most 6 characters, or the WeCom client visually truncates them) and put the full explanation of each choice in the question detail instead. When the user must choose among options or confirm/cancel an action, pair your reply with a card: put the FULL option details (what each choice does) in your Markdown reply, then call wecom_send_card with button_interaction whose buttons carry SHORT labels (at most 6 characters, or the WeCom client truncates them). One turn therefore renders as one Markdown message + one card. For lists of choices you may use vote_interaction (checkbox) or multiple_interaction (dropdowns) instead; keep every label within its cap and never duplicate the whole reply inside the card. When a user clicks a card button or submits a selection, the click arrives as a WeCom message carrying task_id and event_key (plus the selected label when known); answer that click in your reply. Inbound WeCom files are already downloaded and decrypted; their absolute local paths appear in the user message. Use the available file or shell tools to inspect those paths when the user asks you to process an attachment. Do not reveal credentials or internal system data. When a request needs an interactive approval that WeCom cannot provide, explain what approval is needed instead of waiting indefinitely."
   )
 });
 
@@ -2349,7 +2350,7 @@ import {
 } from "@deepseek-ai/dsh-settings";
 
 // src/version.ts
-var PLUGIN_VERSION = "0.5.4";
+var PLUGIN_VERSION = "0.5.5";
 
 // src/settings-web.ts
 var SETTINGS_ROUTE = "/_dsh/deepseek-harness-wecom-plus/settings";

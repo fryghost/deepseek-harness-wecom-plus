@@ -554,9 +554,9 @@ export class ConversationManager {
       description: 'Ask the user a concise question when you need confirmation, a choice, or missing '
         + 'information before proceeding. Send one or more questions, each with a stable id that will be echoed '
         + 'in the answer. When the current turn comes from WeCom, each question renders as a Markdown message '
-        + 'plus a WeCom template card: keep option labels SHORT (at most 10 characters — the WeCom client '
-        + 'truncates them) and put the full explanation of each choice into the question text or the option '
-        + 'descriptions instead.',
+        + 'plus a WeCom template card: keep option labels SHORT (at most 6 characters — longer labels are '
+        + 'visually truncated by the WeCom client, and the channel then falls back to numbered replies), and '
+        + 'put the full explanation of each choice into the question text or the option descriptions instead.',
       parameters: {
         questions: {
           type: 'array',
@@ -706,7 +706,7 @@ export class ConversationManager {
         + 'The card is delivered as a second message right after the main Markdown reply, so one turn becomes '
         + 'one Markdown message plus one card. Prefer this tool when the user must choose among options or '
         + 'confirm/cancel an action: put the FULL option details in your Markdown reply and put SHORT labels '
-        + '(at most 10 characters) on the card buttons, because button text is truncated by the WeCom client. '
+        + '(at most 6 characters, or the WeCom client visually truncates them) on the card buttons. '
         + 'Display text is truncated to the WeCom card limits (title 26, desc 30, subtitle 112 characters), '
         + 'so never duplicate the full reply inside the card. Only valid during an active WeCom turn.',
       parameters: {

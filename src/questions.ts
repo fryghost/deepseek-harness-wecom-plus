@@ -28,6 +28,13 @@ export type QuestionCardSender = (target: string, card: TemplateCard) => Promise
 /** Push one Markdown message into the active WeCom conversation. */
 export type QuestionTextSender = (target: string, text: string) => Promise<void>
 
+/**
+ * Labels longer than this are visually truncated by the WeCom client on
+ * button cards; questions with any longer option use the numbered-list text
+ * mode instead.
+ */
+export const BUTTON_LABEL_MAX_CHARS = 6
+
 /** Resolved identity fields of one template_card_event, across payload shapes. */
 export interface CardEventFacts {
   taskId: string | undefined
@@ -158,7 +165,12 @@ export class WeComQuestionBridge {
     signal: AbortSignal | undefined,
   ): Promise<AskUserQuestionAnswerItem> {
     const options = question.options ?? []
-    const buttons = options.length >= 2 && options.length <= 6 && question.multiSelect !== true
+    // Button cards only when every label fits the WeCom button width without
+    // truncation; longer options fall back to the numbered Markdown list plus
+    // a numeric-reply card, so the full option text stays readable.
+    const buttons = options.length >= 2 && options.length <= 6
+      && question.multiSelect !== true
+      && options.every(option => option.label.length <= BUTTON_LABEL_MAX_CHARS)
     void this.sendText(target, questionMarkdown(question)).then(undefined, () => undefined)
     const mode: PendingQuestion['mode'] = buttons ? 'buttons' : 'text'
     return new Promise<AskUserQuestionAnswerItem>((resolve, reject) => {

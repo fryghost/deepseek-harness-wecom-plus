@@ -165,6 +165,24 @@ describe('WeComQuestionBridge', () => {
     })
   })
 
+  it('falls back to numbered text mode when any option label is too long for a button', async () => {
+    const { instance, cards } = bridge()
+    const asking = instance.present({
+      questions: [{
+        id: 'q13',
+        question: '选择下一步',
+        options: [
+          { label: '查看说明：我会回一段关于三种卡片类型的总结' },
+          { label: '结束测试' },
+        ],
+      }],
+    }, 'u1')
+    await vi.waitFor(() => { expect(cards).toHaveLength(1) })
+    expect(cards[0]?.card_type).toBe('text_notice')
+    expect(instance.tryAnswerFromText(textMessage('结束测试'))).toBe(true)
+    await expect(asking).resolves.toEqual({ answers: [{ id: 'q13', selected: ['结束测试'] }] })
+  })
+
   it('resolves task_id and event_key nested under event.template_card_event', async () => {
     const { instance, cards } = bridge()
     const asking = instance.present({

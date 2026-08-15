@@ -23,7 +23,7 @@ import { buildTemplateCard, deriveAdaptiveCard, type CardInput } from './card.js
 import type { Config } from './config.js'
 import { inboundContent, type WeComDownloadPort } from './inbound.js'
 import { resolveOutboundFile, type OutboundFile } from './outbound-file.js'
-import { WeComQuestionBridge, type QuestionCardSender, type QuestionTextSender } from './questions.js'
+import { WeComQuestionBridge, cardEventFacts, type QuestionCardSender, type QuestionTextSender } from './questions.js'
 import { chatTarget, sessionIdFor, withTimeout } from './util.js'
 
 /** Completed response from one WeCom-triggered Harness turn. */
@@ -340,8 +340,9 @@ export class ConversationManager {
     const binding = await this.getOrCreate(id)
     const agent = binding.agent
     const scope = message.chattype === 'group' ? 'WeCom group' : 'WeCom private chat'
-    const taskId = message.event.task_id?.trim() || '（无）'
-    const eventKey = message.event.event_key?.trim() || '（无）'
+    const facts = cardEventFacts(message.event)
+    const taskId = facts.taskId?.trim() || '（无）'
+    const eventKey = facts.eventKey?.trim() || '（无）'
     const content = [{
       type: 'text' as const,
       text: [

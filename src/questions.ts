@@ -28,6 +28,37 @@ export type QuestionCardSender = (target: string, card: TemplateCard) => Promise
 /** Push one Markdown message into the active WeCom conversation. */
 export type QuestionTextSender = (target: string, text: string) => Promise<void>
 
+/** Resolved identity fields of one template_card_event, across payload shapes. */
+export interface CardEventFacts {
+  taskId: string | undefined
+  eventKey: string | undefined
+}
+
+/**
+ * The WeCom platform nests the card event fields under
+ * `event.template_card_event` (the SDK's flat `TemplateCardEventData` type
+ * describes an older shape). Read both shapes so either one resolves.
+ */
+export function cardEventFacts(event: unknown): CardEventFacts {
+  if (typeof event !== 'object' || event === null) return { taskId: undefined, eventKey: undefined }
+  const record = event as Record<string, unknown>
+  if (typeof record.task_id === 'string' || typeof record.event_key === 'string') {
+    return {
+      taskId: typeof record.task_id === 'string' ? record.task_id : undefined,
+      eventKey: typeof record.event_key === 'string' ? record.event_key : undefined,
+    }
+  }
+  const nested = record.template_card_event
+  if (typeof nested === 'object' && nested !== null) {
+    const inner = nested as Record<string, unknown>
+    return {
+      taskId: typeof inner.task_id === 'string' ? inner.task_id : undefined,
+      eventKey: typeof inner.event_key === 'string' ? inner.event_key : undefined,
+    }
+  }
+  return { taskId: undefined, eventKey: undefined }
+}
+
 /**
  * One in-flight question presented through the WeCom channel. The promise
  * settles when the user clicks a button or replies in chat, when the question
@@ -73,9 +104,9 @@ export class WeComQuestionBridge {
     const target = chatTarget(message)
     const pending = this.pending.get(target)
     if (pending === undefined || pending.mode !== 'buttons') return undefined
-    const key = message.event.event_key
-    if (key === undefined || message.event.task_id !== pending.taskId) return undefined
-    return pending.byKey?.get(key)
+    const { taskId, eventKey } = cardEventFacts(message.event)
+    if (eventKey === undefined || taskId !== pending.taskId) return undefined
+    return pending.byKey?.get(eventKey)
   }
 
   /**
@@ -87,9 +118,9 @@ export class WeComQuestionBridge {
     const target = chatTarget(message)
     const pending = this.pending.get(target)
     if (pending === undefined || pending.mode !== 'buttons') return false
-    const key = message.event.event_key
-    if (key === undefined || message.event.task_id !== pending.taskId) return false
-    const label = pending.byKey?.get(key)
+    const { taskId, eventKey } = cardEventFacts(message.event)
+    if (eventKey === undefined || taskId !== pending.taskId) return false
+    const label = pending.byKey?.get(eventKey)
     if (label === undefined) return false
     this.settle(target, pending, { id: pending.questionId, selected: [label] })
     return true

@@ -31,6 +31,7 @@ import {
 } from './conversations.js'
 import type { WeComDownloadPort } from './inbound.js'
 import type { OutboundFile } from './outbound-file.js'
+import { cardEventFacts } from './questions.js'
 import { chatTarget, SeenMessageIds, truncateUtf8, withTimeout } from './util.js'
 
 const OUTBOUND_TEST_PNG = Buffer.from(
@@ -223,7 +224,7 @@ export class WeComHarnessBridge {
       maxReconnectAttempts: this.config.maxReconnectAttempts,
       maxAuthFailureAttempts: this.config.maxAuthFailureAttempts,
       requestTimeout: this.config.sendTimeoutMs,
-      plug_version: 'deepseek-harness-wecom-plus/0.5.3',
+      plug_version: 'deepseek-harness-wecom-plus/0.5.4',
     })
   }
 
@@ -251,7 +252,9 @@ export class WeComHarnessBridge {
   private async handleCardEvent(frame: WsFrame<EventMessageWith<TemplateCardEventData>>): Promise<void> {
     const body = frame.body
     if (body === undefined || this.seen.hasOrAdd(body.msgid) || !this.allowedEvent(body)) return
-    const taskId = body.event.task_id?.trim()
+    const facts = cardEventFacts(body.event)
+    const taskId = facts.taskId?.trim()
+    const eventKey = facts.eventKey?.trim()
     // A click on a pending ask_user_question card is the ANSWER: settle the
     // question FIRST (no await in between, no race window), then acknowledge
     // the choice on the card, and let the running turn continue.
@@ -263,7 +266,7 @@ export class WeComHarnessBridge {
       '[wecom-plus] card click msgid=%s task=%s key=%s questionLabel=%s answered=%s raw=%s',
       body.msgid,
       taskId ?? '',
-      body.event.event_key ?? '',
+      eventKey ?? '',
       questionLabel ?? '',
       String(answered),
       JSON.stringify(body.event),
@@ -272,7 +275,7 @@ export class WeComHarnessBridge {
       'WeCom card click msgid=%s task=%s key=%s questionLabel=%s answered=%s',
       body.msgid,
       taskId ?? '',
-      body.event.event_key ?? '',
+      eventKey ?? '',
       questionLabel ?? '',
       String(answered),
     )
@@ -312,7 +315,7 @@ export class WeComHarnessBridge {
     try {
       await this.conversations.processCardEvent(
         body,
-        this.conversations.cardLabel(taskId, body.event.event_key),
+        this.conversations.cardLabel(taskId, eventKey),
         transport,
       )
     } catch (error) {

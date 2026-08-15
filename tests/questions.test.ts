@@ -165,6 +165,33 @@ describe('WeComQuestionBridge', () => {
     })
   })
 
+  it('resolves task_id and event_key nested under event.template_card_event', async () => {
+    const { instance, cards } = bridge()
+    const asking = instance.present({
+      questions: [{ id: 'q12', question: '选择', options: [{ label: '甲' }, { label: '乙' }] }],
+    }, 'u1')
+    await vi.waitFor(() => { expect(cards).toHaveLength(1) })
+    const nested = {
+      msgid: 'ev-nested',
+      aibotid: 'bot',
+      chattype: 'single',
+      from: { userid: 'u1' },
+      msgtype: 'event',
+      create_time: 1,
+      event: {
+        eventtype: EventType.TemplateCardEvent,
+        template_card_event: {
+          card_type: 'button_interaction',
+          task_id: cards[0]?.task_id,
+          event_key: 'q-opt-1',
+        },
+      },
+    } as never
+    expect(instance.questionLabel(nested)).toBe('甲')
+    expect(instance.tryAnswerFromClick(nested)).toBe(true)
+    await expect(asking).resolves.toEqual({ answers: [{ id: 'q12', selected: ['甲'] }] })
+  })
+
   it('peeks the clicked option label without settling the question', async () => {
     const { instance, cards } = bridge()
     const asking = instance.present({

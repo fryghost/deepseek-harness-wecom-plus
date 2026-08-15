@@ -653,6 +653,25 @@ async function resolveOutboundFile(cwd, requestedPath, maxBytes) {
 import {
   UserQuestionError
 } from "@deepseek-ai/dsh-user-questions";
+function cardEventFacts(event) {
+  if (typeof event !== "object" || event === null) return { taskId: void 0, eventKey: void 0 };
+  const record = event;
+  if (typeof record.task_id === "string" || typeof record.event_key === "string") {
+    return {
+      taskId: typeof record.task_id === "string" ? record.task_id : void 0,
+      eventKey: typeof record.event_key === "string" ? record.event_key : void 0
+    };
+  }
+  const nested = record.template_card_event;
+  if (typeof nested === "object" && nested !== null) {
+    const inner = nested;
+    return {
+      taskId: typeof inner.task_id === "string" ? inner.task_id : void 0,
+      eventKey: typeof inner.event_key === "string" ? inner.event_key : void 0
+    };
+  }
+  return { taskId: void 0, eventKey: void 0 };
+}
 var WeComQuestionBridge = class {
   constructor(config, sendCard, sendText) {
     this.config = config;
@@ -680,9 +699,9 @@ var WeComQuestionBridge = class {
     const target = chatTarget(message);
     const pending = this.pending.get(target);
     if (pending === void 0 || pending.mode !== "buttons") return void 0;
-    const key = message.event.event_key;
-    if (key === void 0 || message.event.task_id !== pending.taskId) return void 0;
-    return pending.byKey?.get(key);
+    const { taskId, eventKey } = cardEventFacts(message.event);
+    if (eventKey === void 0 || taskId !== pending.taskId) return void 0;
+    return pending.byKey?.get(eventKey);
   }
   /**
    * Settle a pending question with a card button click. Returns true when the
@@ -693,9 +712,9 @@ var WeComQuestionBridge = class {
     const target = chatTarget(message);
     const pending = this.pending.get(target);
     if (pending === void 0 || pending.mode !== "buttons") return false;
-    const key = message.event.event_key;
-    if (key === void 0 || message.event.task_id !== pending.taskId) return false;
-    const label = pending.byKey?.get(key);
+    const { taskId, eventKey } = cardEventFacts(message.event);
+    if (eventKey === void 0 || taskId !== pending.taskId) return false;
+    const label = pending.byKey?.get(eventKey);
     if (label === void 0) return false;
     this.settle(target, pending, { id: pending.questionId, selected: [label] });
     return true;
@@ -1060,8 +1079,9 @@ var ConversationManager = class {
     const binding = await this.getOrCreate(id);
     const agent = binding.agent;
     const scope = message.chattype === "group" ? "WeCom group" : "WeCom private chat";
-    const taskId = message.event.task_id?.trim() || "\uFF08\u65E0\uFF09";
-    const eventKey = message.event.event_key?.trim() || "\uFF08\u65E0\uFF09";
+    const facts = cardEventFacts(message.event);
+    const taskId = facts.taskId?.trim() || "\uFF08\u65E0\uFF09";
+    const eventKey = facts.eventKey?.trim() || "\uFF08\u65E0\uFF09";
     const content = [{
       type: "text",
       text: [
@@ -1727,7 +1747,7 @@ var WeComHarnessBridge = class {
       maxReconnectAttempts: this.config.maxReconnectAttempts,
       maxAuthFailureAttempts: this.config.maxAuthFailureAttempts,
       requestTimeout: this.config.sendTimeoutMs,
-      plug_version: "deepseek-harness-wecom-plus/0.5.3"
+      plug_version: "deepseek-harness-wecom-plus/0.5.4"
     });
   }
   async handleWelcome(frame) {
@@ -1753,14 +1773,16 @@ var WeComHarnessBridge = class {
   async handleCardEvent(frame) {
     const body = frame.body;
     if (body === void 0 || this.seen.hasOrAdd(body.msgid) || !this.allowedEvent(body)) return;
-    const taskId = body.event.task_id?.trim();
+    const facts = cardEventFacts(body.event);
+    const taskId = facts.taskId?.trim();
+    const eventKey = facts.eventKey?.trim();
     const questionLabel = this.conversations.pendingQuestionLabel(body);
     const answered = this.conversations.tryAnswerFromClick(body);
     console.error(
       "[wecom-plus] card click msgid=%s task=%s key=%s questionLabel=%s answered=%s raw=%s",
       body.msgid,
       taskId ?? "",
-      body.event.event_key ?? "",
+      eventKey ?? "",
       questionLabel ?? "",
       String(answered),
       JSON.stringify(body.event)
@@ -1769,7 +1791,7 @@ var WeComHarnessBridge = class {
       "WeCom card click msgid=%s task=%s key=%s questionLabel=%s answered=%s",
       body.msgid,
       taskId ?? "",
-      body.event.event_key ?? "",
+      eventKey ?? "",
       questionLabel ?? "",
       String(answered)
     );
@@ -1803,7 +1825,7 @@ var WeComHarnessBridge = class {
     try {
       await this.conversations.processCardEvent(
         body,
-        this.conversations.cardLabel(taskId, body.event.event_key),
+        this.conversations.cardLabel(taskId, eventKey),
         transport
       );
     } catch (error) {
@@ -2327,7 +2349,7 @@ import {
 } from "@deepseek-ai/dsh-settings";
 
 // src/version.ts
-var PLUGIN_VERSION = "0.5.3";
+var PLUGIN_VERSION = "0.5.4";
 
 // src/settings-web.ts
 var SETTINGS_ROUTE = "/_dsh/deepseek-harness-wecom-plus/settings";

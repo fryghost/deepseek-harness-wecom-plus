@@ -10,8 +10,9 @@
 - **自适应成对消息（`cardMode: auto`，默认）**：一次回复呈现为「一条 Markdown 消息 + 一张交互卡片」——回复以选项列表或确认类问句结尾时自动生成按钮卡片（Markdown 承载完整选项说明、按钮承载短标签）；普通陈述回复不配卡，日常对话保持干净。
 - **按钮点击入站**：订阅官方 `template_card_event`，点击在 5 秒窗口内先由插件本地确认更新（"正在处理…"，不经过模型），随后通过 key → 标签注册表还原用户选中的选项文案，连同 `task_id` / `event_key` 注入对应会话，模型回复通过主动发送通道推送（Markdown + 卡片）。
 - **网页端设置页**：设置面板新增「WeCom 企微」页面，Bot ID / Secret / 卡片模式 / 访问策略 / 欢迎语全部界面化配置；Secret 走 DSH 凭据服务只写不读；保存即热重连（无需重启 DSH），页面实时显示连接状态与最近错误。
+- **ask_user_question 卡片桥接**：模型在企微会话里调用 `ask_user_question` 提问时，自动呈现为「Markdown 完整说明 + 模板卡片」——2~6 个单选选项用按钮卡片，点按钮即作答；更多选项/多选/开放问题用文字卡片，用户回复数字（`1` 或 `1,3`）、选项名或直接文字作答；答案回填后模型继续本轮，不再挂起超时。
 - 新增 `/bot-card-test` 自检命令，无需模型即可验证卡片与按钮交互链路。
-- 新增 `cardMode`、`cardTaskIdPrefix`、`cardClickAckTitle`、`cardClickAckSubtitle` 配置项。
+- 新增 `cardMode`、`cardTaskIdPrefix`、`cardClickAckTitle`、`cardClickAckSubtitle`、`questionTimeoutMs` 配置项。
 
 ## 功能
 
@@ -26,6 +27,7 @@
 - 支持文本、内联图片回复；其他图片格式通过临时素材上传后主动发送
 - 支持模板卡片：模型调用 `wecom_send_card` 发送文本/图文/按钮交互卡片，或 `cardMode: auto` 自动配摘要卡片，一条回复呈现为「Markdown + 卡片」成对消息
 - 支持模板卡片按钮点击入站（`template_card_event`），点击后 5 秒内本地确认更新，并把点击作为用户消息交给模型
+- 支持 `ask_user_question` 桥接为企微卡片：模型提问自动变成 Markdown + 按钮/文字卡片，点击或回复数字作答
 - 提供仅当前企微回合可用的 `wecom_send_file` 工具，并校验工作目录范围和文件大小
 - 通过官方流式回复字段发送企微 Markdown
 - 每个单聊或群聊对应一个独立、可恢复的 Harness 会话

@@ -155,7 +155,7 @@ function agentContext(
       create: vi.fn(async (options: { setup?: (ctx: never) => Promise<void> }) => {
         await options.setup?.({
           systemPrompt: { section: vi.fn(() => vi.fn()) },
-          tools: { register: vi.fn(() => vi.fn()) },
+          tools: { register: vi.fn(() => vi.fn()) }, reflect: { provide: vi.fn(() => vi.fn()) }, effect: vi.fn((callback: unknown) => { if (typeof callback !== "function") return () => {}; const generator = (callback as () => Generator)(); const first = generator.next(); return typeof first.value === "function" ? first.value as () => void : () => {} }),
         } as never)
         return { agent, dispose: vi.fn(async () => undefined) }
       }),

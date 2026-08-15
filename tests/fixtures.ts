@@ -19,6 +19,7 @@ export function testConfig(overrides: Partial<Config> = {}): Config {
     cardTaskIdPrefix: 'dshp-test',
     cardClickAckTitle: '正在处理…',
     cardClickAckSubtitle: '已收到按钮点击，正在处理，请稍候。',
+    questionTimeoutMs: 60_000,
     inboundFileDirectory: '/tmp/deepseek-harness-wecom-test/inbound',
     welcomeText: '',
     startupTimeoutMs: 1_000,

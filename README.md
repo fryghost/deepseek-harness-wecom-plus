@@ -10,7 +10,8 @@ An out-of-tree [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harnes
 - **Adaptive paired messages (`cardMode: auto`, default)**: one reply renders as *one Markdown message + one interaction card* — replies that end in an option list or a confirm question automatically get a button card (Markdown keeps the full option details, buttons keep the short labels), while informational replies get no card.
 - **Card button clicks in**: official `template_card_event` handling — a 5-second local card acknowledgement, key → label resolution back to the chosen option, then the click injected as a user message and the model's reply pushed proactively (Markdown + card).
 - **Web Settings page**: a dedicated "WeCom 企微" section in the DSH Settings panel — Bot ID, Secret (credentials seam, write-only), card mode, access policies, and welcome text are all UI-editable; saving reconnects the channel live, and the page shows the connection state and the latest error.
-- **`/bot-card-test`** self-check command and `cardMode`, `cardTaskIdPrefix`, `cardClickAckTitle`, `cardClickAckSubtitle` configuration.
+- **ask_user_question card bridge**: when the agent calls `ask_user_question` inside a WeCom session, the channel renders it as a Markdown message (full explanation) plus a template card — button cards for 2–6 single-choice options (click to answer), text cards for longer/multi-select/open questions (reply with `1` or `1,3`, a label, or free text). The answer flows back and the turn continues instead of hanging.
+- **`/bot-card-test`** self-check command and `cardMode`, `cardTaskIdPrefix`, `cardClickAckTitle`, `cardClickAckSubtitle`, `questionTimeoutMs` configuration.
 
 ## Features
 

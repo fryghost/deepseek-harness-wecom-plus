@@ -361,6 +361,10 @@ import { resolveSessionPreset } from "@deepseek-ai/dsh-agent-presets";
 import { createUserMessage } from "@deepseek-ai/dsh-llm";
 import { SessionId } from "@deepseek-ai/dsh-session";
 import { defineTool } from "@deepseek-ai/dsh-tools";
+import {
+  UserQuestionError as UserQuestionError2,
+  UserQuestionService
+} from "@deepseek-ai/dsh-user-questions";
 
 // src/inbound-file.ts
 import { createHash } from "crypto";
@@ -646,13 +650,185 @@ async function resolveOutboundFile(cwd, requestedPath, maxBytes) {
   return { path, name: basename(path), bytes: info.size };
 }
 
+// src/questions.ts
+import {
+  UserQuestionError
+} from "@deepseek-ai/dsh-user-questions";
+var WeComQuestionBridge = class {
+  constructor(config, sendCard, sendText) {
+    this.config = config;
+    this.sendCard = sendCard;
+    this.sendText = sendText;
+  }
+  config;
+  sendCard;
+  sendText;
+  pending = /* @__PURE__ */ new Map();
+  /** Present the questions to one conversation and wait for the human answers. */
+  async present(request, target) {
+    const answers = [];
+    for (const question of request.questions) {
+      answers.push(await this.askOne(target, question, request.signal));
+    }
+    return { answers };
+  }
+  /**
+   * Settle a pending question with a card button click. Returns true when the
+   * click belonged to a pending question (the bridge must not start a model
+   * turn for it), false otherwise.
+   */
+  tryAnswerFromClick(message) {
+    const target = chatTarget(message);
+    const pending = this.pending.get(target);
+    if (pending === void 0 || pending.mode !== "buttons") return false;
+    const key = message.event.event_key;
+    if (key === void 0 || message.event.task_id !== pending.taskId) return false;
+    const label = pending.byKey?.get(key);
+    if (label === void 0) return false;
+    this.settle(target, pending, { id: pending.questionId, selected: [label] });
+    return true;
+  }
+  /**
+   * Settle a pending question with the user's chat reply. While a question is
+   * open, any incoming text is the answer: a number resolves to the numbered
+   * option, an exact label matches an option, anything else becomes the
+   * custom free-text answer.
+   */
+  tryAnswerFromText(message) {
+    const target = chatTarget(message);
+    const pending = this.pending.get(target);
+    if (pending === void 0) return false;
+    const text = plainTextOf(message).trim();
+    if (text.length === 0) return false;
+    this.settle(target, pending, parseQuestionReply(pending.question, text));
+    return true;
+  }
+  /** Reject every open question; called when the channel stops. */
+  dispose() {
+    for (const pending of this.pending.values()) {
+      this.release(pending);
+      pending.reject(new UserQuestionError("the WeCom channel was disposed before the user answered", "ASK_ABORTED"));
+    }
+    this.pending.clear();
+  }
+  /** Ask one question: Markdown carries the full text, the card carries the interaction surface. */
+  askOne(target, question, signal) {
+    const options = question.options ?? [];
+    const buttons = options.length >= 2 && options.length <= 6 && question.multiSelect !== true;
+    void this.sendText(target, questionMarkdown(question)).then(void 0, () => void 0);
+    const mode = buttons ? "buttons" : "text";
+    return new Promise((resolve2, reject) => {
+      const timer = setTimeout(() => {
+        const pending2 = this.pending.get(target);
+        if (pending2 !== void 0) {
+          this.pending.delete(target);
+          pending2.reject(new UserQuestionError(
+            `ask_user_question timed out after ${this.config.questionTimeoutMs}ms without an answer`,
+            "ASK_TIMEOUT"
+          ));
+        }
+      }, this.config.questionTimeoutMs);
+      const clearTimer = () => clearTimeout(timer);
+      const pending = {
+        questionId: question.id,
+        question,
+        mode,
+        taskId: void 0,
+        resolve: resolve2,
+        reject,
+        clearTimer
+      };
+      if (signal !== void 0) {
+        const handler = () => {
+          if (this.pending.get(target) !== pending) return;
+          this.pending.delete(target);
+          clearTimer();
+          reject(new UserQuestionError("ask_user_question was aborted before the user answered", "ASK_ABORTED"));
+        };
+        pending.abort = { signal, handler };
+        signal.addEventListener("abort", handler, { once: true });
+      }
+      this.pending.set(target, pending);
+      const card = buttons ? buildTemplateCard({
+        cardType: "button_interaction",
+        title: question.question,
+        ...question.header === void 0 ? {} : { desc: question.header },
+        buttons: options.map((option, index) => ({ text: option.label, key: `q-opt-${index + 1}` }))
+      }, this.config.cardTaskIdPrefix) : buildTemplateCard({
+        cardType: "text_notice",
+        title: "\u8BF7\u76F4\u63A5\u56DE\u590D",
+        desc: question.multiSelect === true ? "\u56DE\u590D\u6570\u5B57\u591A\u9009\uFF08\u5982 1,3\uFF09\u6216\u9009\u9879\u540D\u79F0" : options.length > 0 ? "\u56DE\u590D\u6570\u5B57\u6216\u9009\u9879\u540D\u79F0" : "\u8BF7\u7528\u6587\u5B57\u56DE\u7B54\u4E0A\u9762\u7684\u95EE\u9898"
+      }, this.config.cardTaskIdPrefix);
+      pending.taskId = card.task_id;
+      if (buttons) {
+        pending.byKey = new Map(card.button_list?.map((button) => [button.key, button.text]));
+      }
+      this.sendCard(target, card).then(() => void 0, (error) => {
+        if (this.pending.get(target) !== pending) return;
+        this.pending.delete(target);
+        clearTimer();
+        reject(error instanceof Error ? error : new Error(String(error)));
+      });
+    });
+  }
+  /** Remove the entry, timer, and abort listener, then resolve. */
+  settle(target, pending, answer) {
+    if (this.pending.get(target) !== pending) return;
+    this.pending.delete(target);
+    this.release(pending);
+    pending.resolve(answer);
+  }
+  /** Remove the entry, timer, and abort listener, then reject. */
+  release(pending) {
+    pending.clearTimer();
+    if (pending.abort !== void 0) pending.abort.signal.removeEventListener("abort", pending.abort.handler);
+  }
+};
+function plainTextOf(message) {
+  if (message.msgtype === "text") return message.text?.content ?? "";
+  if (message.msgtype === "mixed") {
+    const mixed = message.mixed;
+    return (mixed?.msg_item ?? []).filter((item) => item.msgtype === "text").map((item) => item.text?.content ?? "").join("");
+  }
+  return "";
+}
+function parseQuestionReply(question, text) {
+  const options = question.options ?? [];
+  const normalized = text.trim();
+  const id = question.id;
+  if (options.length > 0) {
+    const numbers = normalized.split(/[,，、\s]+/u).map((part) => Number(part));
+    if (numbers.length > 0 && numbers.every(Number.isSafeInteger) && numbers.every((n) => n >= 1 && n <= options.length)) {
+      return { id, selected: [...new Set(numbers.map((n) => options[n - 1]?.label ?? String(n)))] };
+    }
+    const label = options.find((option) => option.label === normalized);
+    if (label !== void 0) return { id, selected: [label.label] };
+  }
+  return { id, selected: [], custom: normalized };
+}
+function questionMarkdown(question) {
+  const lines = [
+    question.header === void 0 ? null : `### ${question.header}`,
+    question.question,
+    question.detail === void 0 ? null : `
+${question.detail}`
+  ].filter((line) => line !== null);
+  const options = question.options ?? [];
+  if (options.length > 0) {
+    lines.push("", "**\u9009\u9879**", options.map((option, index) => `${index + 1}. ${option.label}`).join("\n"));
+  }
+  lines.push("", "\u4F60\u53EF\u4EE5\u70B9\u51FB\u5361\u7247\u6309\u94AE\uFF0C\u6216\u76F4\u63A5\u56DE\u590D\u6570\u5B57\uFF08\u591A\u9009\u7528\u9017\u53F7\u5206\u9694\uFF0C\u5982 1,3\uFF09\u3002");
+  return lines.join("\n");
+}
+
 // src/conversations.ts
 var MAX_CARD_LABEL_TASKS = 500;
 var ConversationManager = class {
-  constructor(ctx, config, sendFile) {
+  constructor(ctx, config, sendFile, sendQuestionCard, sendQuestionText) {
     this.ctx = ctx;
     this.config = config;
     this.sendFile = sendFile;
+    this.questions = new WeComQuestionBridge(config, sendQuestionCard, sendQuestionText);
   }
   ctx;
   config;
@@ -663,6 +839,7 @@ var ConversationManager = class {
   activeTurns = /* @__PURE__ */ new Map();
   pendingCards = /* @__PURE__ */ new Map();
   cardLabels = /* @__PURE__ */ new Map();
+  questions;
   generations = /* @__PURE__ */ new Map();
   persistedIds = /* @__PURE__ */ new Set();
   /** Snapshot persisted identities once before accepting traffic. */
@@ -690,6 +867,23 @@ var ConversationManager = class {
       return void 0;
     }
     return this.cardLabels.get(taskId)?.get(eventKey);
+  }
+  /**
+   * Settle a pending ask_user_question with a card button click. Returns true
+   * when the click belonged to a pending question (the bridge must not start
+   * a model turn for it), false otherwise.
+   */
+  tryAnswerFromClick(message) {
+    return this.questions.tryAnswerFromClick(message);
+  }
+  /**
+   * Settle a pending ask_user_question with the user's chat reply. While a
+   * question is open, any incoming text (or mixed text) is the answer: a
+   * number resolves to the numbered option, an exact label matches an option,
+   * anything else becomes the custom free-text answer.
+   */
+  tryAnswerFromText(message) {
+    return this.questions.tryAnswerFromText(message);
   }
   /** End the current WeCom conversation session while retaining its history. */
   async reset(message) {
@@ -756,6 +950,7 @@ var ConversationManager = class {
   async dispose() {
     await Promise.allSettled(this.queues.values());
     await Promise.allSettled([...this.bindings.values()].map((binding) => binding.release()));
+    this.questions.dispose();
     this.bindings.clear();
     this.activeTurns.clear();
     this.pendingCards.clear();
@@ -951,12 +1146,14 @@ var ConversationManager = class {
     const disposeInstructions = this.registerWeComInstructions(agent.ctx, id);
     const disposeFileTool = this.registerFileTool(agent.ctx, id);
     const disposeCardTool = this.registerCardTool(agent.ctx, id);
+    const disposeQuestions = this.registerQuestionBridge(agent.ctx, id);
     let released = false;
     return {
       agent,
       release: async () => {
         if (released) return;
         released = true;
+        disposeQuestions();
         disposeCardTool();
         disposeFileTool();
         disposeInstructions();
@@ -971,6 +1168,31 @@ var ConversationManager = class {
     this.registerWeComInstructions(agentCtx, id);
     this.registerFileTool(agentCtx, id);
     this.registerCardTool(agentCtx, id);
+    this.registerQuestionBridge(agentCtx, id);
+  }
+  /**
+   * Isolate ask_user_question inside this agent: a private userQuestions
+   * service instance shadows the shared host instance (whose only provider is
+   * the Web app and can never be answered from WeCom), and a channel provider
+   * presents every question as Markdown + a template card.
+   */
+  registerQuestionBridge(agentCtx, id) {
+    const service = new UserQuestionService(agentCtx);
+    const disposeProvider = service.registerProvider({
+      ask: (request) => {
+        const target = this.activeTurns.get(id);
+        if (target === void 0) {
+          throw new UserQuestionError2(
+            "ask_user_question is unavailable outside an active WeCom turn; the WeCom user must initiate the conversation",
+            "NO_ACTIVE_TURN"
+          );
+        }
+        return this.questions.present(request, target);
+      }
+    });
+    return () => {
+      disposeProvider();
+    };
   }
   registerWeComInstructions(agentCtx, id) {
     return agentCtx.systemPrompt.section({
@@ -1239,7 +1461,13 @@ var WeComHarnessBridge = class {
       );
     }
     this.log = ctx.logger("deepseek-harness-wecom-plus");
-    this.conversations = new ConversationManager(ctx, config, (target, file) => this.sendLocalFile(target, file));
+    this.conversations = new ConversationManager(
+      ctx,
+      config,
+      (target, file) => this.sendLocalFile(target, file),
+      (target, card) => this.sendCards(target, [card]),
+      (target, text) => this.sendProactive(target, { text, images: [], cards: [] })
+    );
     this.seen = new SeenMessageIds(config.maxSeenMessageIds);
     this.allowedHarnessCommands = new Set(config.allowedHarnessCommands);
   }
@@ -1348,7 +1576,7 @@ var WeComHarnessBridge = class {
       maxReconnectAttempts: this.config.maxReconnectAttempts,
       maxAuthFailureAttempts: this.config.maxAuthFailureAttempts,
       requestTimeout: this.config.sendTimeoutMs,
-      plug_version: "deepseek-harness-wecom-plus/0.3.3"
+      plug_version: "deepseek-harness-wecom-plus/0.4.0"
     });
   }
   async handleWelcome(frame) {
@@ -1375,6 +1603,7 @@ var WeComHarnessBridge = class {
     const body = frame.body;
     if (body === void 0 || this.seen.hasOrAdd(body.msgid) || !this.allowedEvent(body)) return;
     const taskId = body.event.task_id?.trim();
+    if (this.conversations.tryAnswerFromClick(body)) return;
     if (taskId !== void 0 && taskId.length > 0) {
       try {
         await withTimeout(this.requireClient().updateTemplateCard(frame, {
@@ -1480,6 +1709,7 @@ var WeComHarnessBridge = class {
         });
         return;
       }
+      if (this.conversations.tryAnswerFromText(message)) return;
       if (command?.name === "bot-status") {
         await this.sendReply(frame, {
           text: "\u4F01\u5FAE\u957F\u8FDE\u63A5\u6B63\u5E38\uFF0CDeepSeek Harness \u4F1A\u8BDD\u6309\u5355\u804A/\u7FA4\u804A\u72EC\u7ACB\u6301\u4E45\u5316\u3002",
@@ -1725,6 +1955,7 @@ var Config = z.object({
   cardTaskIdPrefix: z.string().default("dshp"),
   cardClickAckTitle: z.string().default("\u6B63\u5728\u5904\u7406\u2026"),
   cardClickAckSubtitle: z.string().default("\u5DF2\u6536\u5230\u6309\u94AE\u70B9\u51FB\uFF0C\u6B63\u5728\u5904\u7406\uFF0C\u8BF7\u7A0D\u5019\u3002"),
+  questionTimeoutMs: z.number().step(1).min(1e4).max(36e5).default(3e5),
   inboundFileDirectory: z.string().default(DEFAULT_WECOM_INBOUND_FILE_DIRECTORY),
   welcomeText: z.string().default(""),
   startupTimeoutMs: z.number().step(1).min(1).default(3e4),
@@ -1740,7 +1971,7 @@ var Config = z.object({
   maxInboundFileBytes: z.number().step(1).min(1).max(WECOM_FILE_MAX_BYTES).default(WECOM_FILE_MAX_BYTES),
   maxOutboundFileBytes: z.number().step(1).min(1).max(WECOM_FILE_MAX_BYTES).default(WECOM_FILE_MAX_BYTES),
   systemPrompt: z.string().default(
-    "You are replying through WeCom. Keep replies clear and suitable for enterprise chat. Use WeCom-compatible Markdown for headings, lists, links, emphasis, quotes, and code when structure helps. When the WeCom user asks to receive an existing workspace file, use wecom_send_file instead of claiming that file attachments are unavailable or pasting the whole file. When the user must choose among options or confirm/cancel an action, pair your reply with a card: put the FULL option details (what each choice does) in your Markdown reply, then call wecom_send_card with button_interaction whose buttons carry SHORT labels (at most 10 characters, or the WeCom client truncates them). One turn therefore renders as one Markdown message + one card. For lists of choices you may use vote_interaction (checkbox) or multiple_interaction (dropdowns) instead; keep every label within its cap and never duplicate the whole reply inside the card. When a user clicks a card button or submits a selection, the click arrives as a WeCom message carrying task_id and event_key (plus the selected label when known); answer that click in your reply. Inbound WeCom files are already downloaded and decrypted; their absolute local paths appear in the user message. Use the available file or shell tools to inspect those paths when the user asks you to process an attachment. Do not reveal credentials or internal system data. When a request needs an interactive approval that WeCom cannot provide, explain what approval is needed instead of waiting indefinitely."
+    "You are replying through WeCom. Keep replies clear and suitable for enterprise chat. Use WeCom-compatible Markdown for headings, lists, links, emphasis, quotes, and code when structure helps. When the WeCom user asks to receive an existing workspace file, use wecom_send_file instead of claiming that file attachments are unavailable or pasting the whole file. When you need the user to decide something, call ask_user_question: the channel renders it as a Markdown message plus a WeCom template card, and the user answers by clicking a button or replying with a number. Keep option labels SHORT (at most 10 characters, or the WeCom client truncates them) and put the full explanation of each choice in the question detail instead. When the user must choose among options or confirm/cancel an action, pair your reply with a card: put the FULL option details (what each choice does) in your Markdown reply, then call wecom_send_card with button_interaction whose buttons carry SHORT labels (at most 10 characters, or the WeCom client truncates them). One turn therefore renders as one Markdown message + one card. For lists of choices you may use vote_interaction (checkbox) or multiple_interaction (dropdowns) instead; keep every label within its cap and never duplicate the whole reply inside the card. When a user clicks a card button or submits a selection, the click arrives as a WeCom message carrying task_id and event_key (plus the selected label when known); answer that click in your reply. Inbound WeCom files are already downloaded and decrypted; their absolute local paths appear in the user message. Use the available file or shell tools to inspect those paths when the user asks you to process an attachment. Do not reveal credentials or internal system data. When a request needs an interactive approval that WeCom cannot provide, explain what approval is needed instead of waiting indefinitely."
   )
 });
 
@@ -1752,7 +1983,7 @@ import {
 } from "@deepseek-ai/dsh-settings";
 
 // src/version.ts
-var PLUGIN_VERSION = "0.3.3";
+var PLUGIN_VERSION = "0.4.0";
 
 // src/settings-web.ts
 var SETTINGS_ROUTE = "/_dsh/deepseek-harness-wecom-plus/settings";

@@ -111,7 +111,13 @@ export class WeComHarnessBridge {
       )
     }
     this.log = ctx.logger('deepseek-harness-wecom-plus')
-    this.conversations = new ConversationManager(ctx, config, (target, file) => this.sendLocalFile(target, file))
+    this.conversations = new ConversationManager(
+      ctx,
+      config,
+      (target, file) => this.sendLocalFile(target, file),
+      (target, card) => this.sendCards(target, [card]),
+      (target, text) => this.sendProactive(target, { text, images: [], cards: [] }),
+    )
     this.seen = new SeenMessageIds(config.maxSeenMessageIds)
     this.allowedHarnessCommands = new Set(config.allowedHarnessCommands)
   }
@@ -216,7 +222,7 @@ export class WeComHarnessBridge {
       maxReconnectAttempts: this.config.maxReconnectAttempts,
       maxAuthFailureAttempts: this.config.maxAuthFailureAttempts,
       requestTimeout: this.config.sendTimeoutMs,
-      plug_version: 'deepseek-harness-wecom-plus/0.3.3',
+      plug_version: 'deepseek-harness-wecom-plus/0.4.0',
     })
   }
 
@@ -245,6 +251,9 @@ export class WeComHarnessBridge {
     const body = frame.body
     if (body === undefined || this.seen.hasOrAdd(body.msgid) || !this.allowedEvent(body)) return
     const taskId = body.event.task_id?.trim()
+    // A click on a pending ask_user_question card is the ANSWER, not a new
+    // user message: settle the question and let the running turn continue.
+    if (this.conversations.tryAnswerFromClick(body)) return
     if (taskId !== undefined && taskId.length > 0) {
       try {
         await withTimeout(this.requireClient().updateTemplateCard(frame, {
@@ -351,6 +360,10 @@ export class WeComHarnessBridge {
         })
         return
       }
+      // While an ask_user_question is open, the user's reply IS the answer:
+      // settle the question and let the running turn continue instead of
+      // starting a new one.
+      if (this.conversations.tryAnswerFromText(message)) return
       if (command?.name === 'bot-status') {
         await this.sendReply(frame, {
           text: '企微长连接正常，DeepSeek Harness 会话按单聊/群聊独立持久化。',

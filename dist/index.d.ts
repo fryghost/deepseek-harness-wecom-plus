@@ -42,6 +42,7 @@ interface Config {
     cardTaskIdPrefix: string;
     cardClickAckTitle: string;
     cardClickAckSubtitle: string;
+    questionTimeoutMs: number;
     inboundFileDirectory: string;
     welcomeText: string;
     startupTimeoutMs: number;

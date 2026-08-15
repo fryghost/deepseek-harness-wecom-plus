@@ -52,6 +52,7 @@ export interface Config {
   cardTaskIdPrefix: string
   cardClickAckTitle: string
   cardClickAckSubtitle: string
+  questionTimeoutMs: number
   inboundFileDirectory: string
   welcomeText: string
   startupTimeoutMs: number
@@ -88,6 +89,7 @@ export const Config: z<Config> = z.object({
   cardTaskIdPrefix: z.string().default('dshp'),
   cardClickAckTitle: z.string().default('正在处理…'),
   cardClickAckSubtitle: z.string().default('已收到按钮点击，正在处理，请稍候。'),
+  questionTimeoutMs: z.number().step(1).min(10_000).max(3_600_000).default(300_000),
   inboundFileDirectory: z.string().default(DEFAULT_WECOM_INBOUND_FILE_DIRECTORY),
   welcomeText: z.string().default(''),
   startupTimeoutMs: z.number().step(1).min(1).default(30_000),
@@ -107,6 +109,10 @@ export const Config: z<Config> = z.object({
     + 'Use WeCom-compatible Markdown for headings, lists, links, emphasis, quotes, and code when structure helps. '
     + 'When the WeCom user asks to receive an existing workspace file, use wecom_send_file instead of '
     + 'claiming that file attachments are unavailable or pasting the whole file. '
+    + 'When you need the user to decide something, call ask_user_question: the channel renders it as a Markdown '
+    + 'message plus a WeCom template card, and the user answers by clicking a button or replying with a number. '
+    + 'Keep option labels SHORT (at most 10 characters, or the WeCom client truncates them) and put the full '
+    + 'explanation of each choice in the question detail instead. '
     + 'When the user must choose among options or confirm/cancel an action, pair your reply with a card: '
     + 'put the FULL option details (what each choice does) in your Markdown reply, then call wecom_send_card '
     + 'with button_interaction whose buttons carry SHORT labels (at most 10 characters, or the WeCom client '

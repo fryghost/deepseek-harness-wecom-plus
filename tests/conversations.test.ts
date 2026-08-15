@@ -7,6 +7,21 @@ import { testConfig } from './fixtures.js'
 
 const downloadPort = { downloadFile: vi.fn() as never }
 
+/** Minimal agent-scope context: enough for the channel tool and question-bridge registrations. */
+function mockAgentCtx(section: unknown, register: unknown): never {
+  return {
+    systemPrompt: { section },
+    tools: { register },
+    reflect: { provide: vi.fn(() => vi.fn()) },
+    effect: vi.fn((callback: unknown) => {
+      if (typeof callback !== 'function') return () => {}
+      const generator = (callback as () => Generator)()
+      const first = generator.next()
+      return typeof first.value === 'function' ? (first.value as () => void) : () => {}
+    }),
+  } as never
+}
+
 function textMessage(userid: string, msgid: string, content = 'hello'): never {
   return {
     msgid,
@@ -46,7 +61,7 @@ describe('ConversationManager', () => {
     const mount = vi.fn(async () => ({ id: 'standard' }))
     const register = vi.fn(() => vi.fn())
     const create = vi.fn(async (options: { setup?: (ctx: never) => Promise<void> }) => {
-      await options.setup?.({ systemPrompt: { section }, tools: { register } } as never)
+      await options.setup?.(mockAgentCtx(section, register))
       return { agent, dispose }
     })
     const ctx = {
@@ -59,7 +74,7 @@ describe('ConversationManager', () => {
         imageLimits: { maxImagesPerMessage: 4, maxMessageImageBytes: 10_000, maxImageBytes: 10_000 },
       },
     } as never
-    const manager = new ConversationManager(ctx, config, vi.fn(async () => undefined))
+    const manager = new ConversationManager(ctx, config, vi.fn(async () => undefined), vi.fn(async () => undefined), vi.fn(async () => undefined))
     await manager.initialize()
 
     const reply = await manager.process(textMessage('u1', 'm1'), downloadPort)
@@ -102,7 +117,7 @@ describe('ConversationManager', () => {
     const section = vi.fn(() => vi.fn())
     const register = vi.fn(() => vi.fn())
     const resume = vi.fn(async (options: { setup?: (ctx: never) => Promise<void> }) => {
-      await options.setup?.({ systemPrompt: { section }, tools: { register } } as never)
+      await options.setup?.(mockAgentCtx(section, register))
       return { agent, dispose }
     })
     const inspect = vi.fn(async () => ({
@@ -119,7 +134,7 @@ describe('ConversationManager', () => {
         imageLimits: { maxImagesPerMessage: 4, maxMessageImageBytes: 10_000, maxImageBytes: 10_000 },
       },
     } as never
-    const manager = new ConversationManager(ctx, config, vi.fn(async () => undefined))
+    const manager = new ConversationManager(ctx, config, vi.fn(async () => undefined), vi.fn(async () => undefined), vi.fn(async () => undefined))
     await manager.initialize()
 
     await expect(manager.process(message, downloadPort)).resolves.toEqual({ text: 'Resumed reply', images: [], cards: [] })
@@ -147,7 +162,7 @@ describe('ConversationManager', () => {
       status: 'idle',
       options: { provider: 'deepseek', model: 'deepseek-chat' },
       session: { events },
-      ctx: { systemPrompt: { section }, tools: { register } },
+      ctx: mockAgentCtx(section, register),
       followup: vi.fn(() => {
         events.push({
           type: 'assistant/message',
@@ -179,7 +194,7 @@ describe('ConversationManager', () => {
         imageLimits: { maxImagesPerMessage: 4, maxMessageImageBytes: 10_000, maxImageBytes: 10_000 },
       },
     } as never
-    const manager = new ConversationManager(ctx, config, vi.fn(async () => undefined))
+    const manager = new ConversationManager(ctx, config, vi.fn(async () => undefined), vi.fn(async () => undefined), vi.fn(async () => undefined))
     await manager.initialize()
 
     await expect(manager.process(message, downloadPort)).resolves.toEqual({ text: 'WeCom reply', images: [], cards: [] })
@@ -231,7 +246,7 @@ describe('ConversationManager', () => {
         create: vi.fn(async (options: { setup?: (ctx: never) => Promise<void> }) => {
           await options.setup?.({
             systemPrompt: { section: vi.fn(() => vi.fn()) },
-            tools: { register },
+            tools: { register }, reflect: { provide: vi.fn(() => vi.fn()) }, effect: vi.fn((callback: unknown) => { if (typeof callback !== "function") return () => {}; const generator = (callback as () => Generator)(); const first = generator.next(); return typeof first.value === "function" ? first.value as () => void : () => {} }),
           } as never)
           return { agent, dispose: vi.fn(async () => undefined) }
         }),
@@ -241,7 +256,7 @@ describe('ConversationManager', () => {
         imageLimits: { maxImagesPerMessage: 4, maxMessageImageBytes: 10_000, maxImageBytes: 10_000 },
       },
     } as never
-    const manager = new ConversationManager(ctx, config, sendFile)
+    const manager = new ConversationManager(ctx, config, sendFile, vi.fn(async () => undefined), vi.fn(async () => undefined))
     await manager.initialize()
 
     await expect(manager.process(textMessage('u3', 'm3', '把 README.md 发给我'), downloadPort))
@@ -287,7 +302,7 @@ describe('ConversationManager', () => {
       }
       await options.setup?.({
         systemPrompt: { section: vi.fn(() => vi.fn()) },
-        tools: { register: vi.fn(() => vi.fn()) },
+        tools: { register: vi.fn(() => vi.fn()) }, reflect: { provide: vi.fn(() => vi.fn()) }, effect: vi.fn((callback: unknown) => { if (typeof callback !== "function") return () => {}; const generator = (callback as () => Generator)(); const first = generator.next(); return typeof first.value === "function" ? first.value as () => void : () => {} }),
       } as never)
       live.set(id, agent)
       return {
@@ -311,7 +326,7 @@ describe('ConversationManager', () => {
         imageLimits: { maxImagesPerMessage: 4, maxMessageImageBytes: 10_000, maxImageBytes: 10_000 },
       },
     } as never
-    const manager = new ConversationManager(ctx, config, vi.fn(async () => undefined))
+    const manager = new ConversationManager(ctx, config, vi.fn(async () => undefined), vi.fn(async () => undefined), vi.fn(async () => undefined))
     await manager.initialize()
 
     await expect(manager.process(message, downloadPort)).resolves.toEqual({
@@ -378,7 +393,7 @@ describe('ConversationManager', () => {
         create: vi.fn(async (options: { setup?: (ctx: never) => Promise<void> }) => {
           await options.setup?.({
             systemPrompt: { section: vi.fn(() => vi.fn()) },
-            tools: { register },
+            tools: { register }, reflect: { provide: vi.fn(() => vi.fn()) }, effect: vi.fn((callback: unknown) => { if (typeof callback !== "function") return () => {}; const generator = (callback as () => Generator)(); const first = generator.next(); return typeof first.value === "function" ? first.value as () => void : () => {} }),
           } as never)
           return { agent, dispose: vi.fn(async () => undefined) }
         }),
@@ -388,7 +403,7 @@ describe('ConversationManager', () => {
         imageLimits: { maxImagesPerMessage: 4, maxMessageImageBytes: 10_000, maxImageBytes: 10_000 },
       },
     } as never
-    const manager = new ConversationManager(ctx, config, vi.fn(async () => undefined))
+    const manager = new ConversationManager(ctx, config, vi.fn(async () => undefined), vi.fn(async () => undefined), vi.fn(async () => undefined))
     await manager.initialize()
 
     const reply = await manager.process(textMessage('u-card', 'm-card', '给我几个选项'), downloadPort)
@@ -453,7 +468,7 @@ describe('ConversationManager', () => {
         create: vi.fn(async (options: { setup?: (ctx: never) => Promise<void> }) => {
           await options.setup?.({
             systemPrompt: { section: vi.fn(() => vi.fn()) },
-            tools: { register: vi.fn(() => vi.fn()) },
+            tools: { register: vi.fn(() => vi.fn()) }, reflect: { provide: vi.fn(() => vi.fn()) }, effect: vi.fn((callback: unknown) => { if (typeof callback !== "function") return () => {}; const generator = (callback as () => Generator)(); const first = generator.next(); return typeof first.value === "function" ? first.value as () => void : () => {} }),
           } as never)
           return { agent, dispose: vi.fn(async () => undefined) }
         }),
@@ -463,7 +478,7 @@ describe('ConversationManager', () => {
         imageLimits: { maxImagesPerMessage: 4, maxMessageImageBytes: 10_000, maxImageBytes: 10_000 },
       },
     } as never
-    const manager = new ConversationManager(ctx, config, vi.fn(async () => undefined))
+    const manager = new ConversationManager(ctx, config, vi.fn(async () => undefined), vi.fn(async () => undefined), vi.fn(async () => undefined))
     await manager.initialize()
 
     const reply = await manager.process(textMessage('u-auto', 'm-auto', '我该选哪个方案？'), downloadPort)
@@ -510,7 +525,7 @@ describe('ConversationManager', () => {
         create: vi.fn(async (options: { setup?: (ctx: never) => Promise<void> }) => {
           await options.setup?.({
             systemPrompt: { section: vi.fn(() => vi.fn()) },
-            tools: { register: vi.fn(() => vi.fn()) },
+            tools: { register: vi.fn(() => vi.fn()) }, reflect: { provide: vi.fn(() => vi.fn()) }, effect: vi.fn((callback: unknown) => { if (typeof callback !== "function") return () => {}; const generator = (callback as () => Generator)(); const first = generator.next(); return typeof first.value === "function" ? first.value as () => void : () => {} }),
           } as never)
           return { agent, dispose: vi.fn(async () => undefined) }
         }),
@@ -520,7 +535,7 @@ describe('ConversationManager', () => {
         imageLimits: { maxImagesPerMessage: 4, maxMessageImageBytes: 10_000, maxImageBytes: 10_000 },
       },
     } as never
-    const manager = new ConversationManager(ctx, config, vi.fn(async () => undefined))
+    const manager = new ConversationManager(ctx, config, vi.fn(async () => undefined), vi.fn(async () => undefined), vi.fn(async () => undefined))
     await manager.initialize()
 
     const reply = await manager.process(textMessage('u-info', 'm-info', '部署好了吗'), downloadPort)
@@ -556,7 +571,7 @@ describe('ConversationManager', () => {
         create: vi.fn(async (options: { setup?: (ctx: never) => Promise<void> }) => {
           await options.setup?.({
             systemPrompt: { section: vi.fn(() => vi.fn()) },
-            tools: { register: vi.fn(() => vi.fn()) },
+            tools: { register: vi.fn(() => vi.fn()) }, reflect: { provide: vi.fn(() => vi.fn()) }, effect: vi.fn((callback: unknown) => { if (typeof callback !== "function") return () => {}; const generator = (callback as () => Generator)(); const first = generator.next(); return typeof first.value === "function" ? first.value as () => void : () => {} }),
           } as never)
           return { agent, dispose: vi.fn(async () => undefined) }
         }),
@@ -566,7 +581,7 @@ describe('ConversationManager', () => {
         imageLimits: { maxImagesPerMessage: 4, maxMessageImageBytes: 10_000, maxImageBytes: 10_000 },
       },
     } as never
-    const manager = new ConversationManager(ctx, config, vi.fn(async () => undefined))
+    const manager = new ConversationManager(ctx, config, vi.fn(async () => undefined), vi.fn(async () => undefined), vi.fn(async () => undefined))
     await manager.initialize()
 
     const reply = await manager.processCardEvent({

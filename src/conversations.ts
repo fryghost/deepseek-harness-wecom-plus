@@ -8,6 +8,11 @@ import { SessionId, type SessionEvent } from '@deepseek-ai/dsh-session'
 import type {} from '@deepseek-ai/dsh-session-persistence'
 import type {} from '@deepseek-ai/dsh-system-prompt'
 import { defineTool } from '@deepseek-ai/dsh-tools'
+import {
+  UserQuestionError,
+  UserQuestionService,
+  type AskUserQuestionRequest,
+} from '@deepseek-ai/dsh-user-questions'
 import type {
   BaseMessage,
   EventMessageWith,
@@ -18,6 +23,7 @@ import { buildTemplateCard, deriveAdaptiveCard, type CardInput } from './card.js
 import type { Config } from './config.js'
 import { inboundContent, type WeComDownloadPort } from './inbound.js'
 import { resolveOutboundFile, type OutboundFile } from './outbound-file.js'
+import { WeComQuestionBridge, type QuestionCardSender, type QuestionTextSender } from './questions.js'
 import { chatTarget, sessionIdFor, withTimeout } from './util.js'
 
 /** Completed response from one WeCom-triggered Harness turn. */
@@ -54,6 +60,7 @@ export class ConversationManager {
   private readonly activeTurns = new Map<string, string>()
   private readonly pendingCards = new Map<string, TemplateCard[]>()
   private readonly cardLabels = new Map<string, Map<string, string>>()
+  private readonly questions: WeComQuestionBridge
   private readonly generations = new Map<string, number>()
   private persistedIds = new Set<string>()
 
@@ -61,7 +68,11 @@ export class ConversationManager {
     private readonly ctx: Context,
     private readonly config: Config,
     private readonly sendFile: ConversationFileSender,
-  ) {}
+    sendQuestionCard: QuestionCardSender,
+    sendQuestionText: QuestionTextSender,
+  ) {
+    this.questions = new WeComQuestionBridge(config, sendQuestionCard, sendQuestionText)
+  }
 
   /** Snapshot persisted identities once before accepting traffic. */
   async initialize(): Promise<void> {
@@ -94,6 +105,25 @@ export class ConversationManager {
       return undefined
     }
     return this.cardLabels.get(taskId)?.get(eventKey)
+  }
+
+  /**
+   * Settle a pending ask_user_question with a card button click. Returns true
+   * when the click belonged to a pending question (the bridge must not start
+   * a model turn for it), false otherwise.
+   */
+  tryAnswerFromClick(message: EventMessageWith<TemplateCardEventData>): boolean {
+    return this.questions.tryAnswerFromClick(message)
+  }
+
+  /**
+   * Settle a pending ask_user_question with the user's chat reply. While a
+   * question is open, any incoming text (or mixed text) is the answer: a
+   * number resolves to the numbered option, an exact label matches an option,
+   * anything else becomes the custom free-text answer.
+   */
+  tryAnswerFromText(message: BaseMessage): boolean {
+    return this.questions.tryAnswerFromText(message)
   }
 
   /** End the current WeCom conversation session while retaining its history. */
@@ -166,6 +196,7 @@ export class ConversationManager {
   async dispose(): Promise<void> {
     await Promise.allSettled(this.queues.values())
     await Promise.allSettled([...this.bindings.values()].map(binding => binding.release()))
+    this.questions.dispose()
     this.bindings.clear()
     this.activeTurns.clear()
     this.pendingCards.clear()
@@ -386,12 +417,14 @@ export class ConversationManager {
     const disposeInstructions = this.registerWeComInstructions(agent.ctx, id)
     const disposeFileTool = this.registerFileTool(agent.ctx, id)
     const disposeCardTool = this.registerCardTool(agent.ctx, id)
+    const disposeQuestions = this.registerQuestionBridge(agent.ctx, id)
     let released = false
     return {
       agent,
       release: async () => {
         if (released) return
         released = true
+        disposeQuestions()
         disposeCardTool()
         disposeFileTool()
         disposeInstructions()
@@ -408,6 +441,33 @@ export class ConversationManager {
     this.registerWeComInstructions(agentCtx, id)
     this.registerFileTool(agentCtx, id)
     this.registerCardTool(agentCtx, id)
+    this.registerQuestionBridge(agentCtx, id)
+  }
+
+  /**
+   * Isolate ask_user_question inside this agent: a private userQuestions
+   * service instance shadows the shared host instance (whose only provider is
+   * the Web app and can never be answered from WeCom), and a channel provider
+   * presents every question as Markdown + a template card.
+   */
+  private registerQuestionBridge(agentCtx: Context, id: string): () => void {
+    const service = new UserQuestionService(agentCtx)
+    const disposeProvider = service.registerProvider({
+      ask: (request: AskUserQuestionRequest) => {
+        const target = this.activeTurns.get(id)
+        if (target === undefined) {
+          throw new UserQuestionError(
+            'ask_user_question is unavailable outside an active WeCom turn; '
+            + 'the WeCom user must initiate the conversation',
+            'NO_ACTIVE_TURN',
+          )
+        }
+        return this.questions.present(request, target)
+      },
+    })
+    return () => {
+      disposeProvider()
+    }
   }
 
   private registerWeComInstructions(agentCtx: Context, id: string): () => void {

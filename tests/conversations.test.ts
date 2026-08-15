@@ -13,6 +13,7 @@ function mockAgentCtx(section: unknown, register: unknown): never {
   return {
     systemPrompt: { section },
     tools: { register },
+    get: vi.fn(() => undefined),
     reflect: { provide: vi.fn(() => vi.fn()) },
     effect: vi.fn((callback: unknown) => {
       if (typeof callback !== 'function') return () => {}
@@ -247,7 +248,7 @@ describe('ConversationManager', () => {
         create: vi.fn(async (options: { setup?: (ctx: never) => Promise<void> }) => {
           await options.setup?.({
             systemPrompt: { section: vi.fn(() => vi.fn()) },
-            tools: { register }, reflect: { provide: vi.fn(() => vi.fn()) }, effect: vi.fn((callback: unknown) => { if (typeof callback !== "function") return () => {}; const generator = (callback as () => Generator)(); const first = generator.next(); return typeof first.value === "function" ? first.value as () => void : () => {} }),
+            tools: { register }, get: vi.fn(() => undefined), reflect: { provide: vi.fn(() => vi.fn()) }, effect: vi.fn((callback: unknown) => { if (typeof callback !== "function") return () => {}; const generator = (callback as () => Generator)(); const first = generator.next(); return typeof first.value === "function" ? first.value as () => void : () => {} }),
           } as never)
           return { agent, dispose: vi.fn(async () => undefined) }
         }),
@@ -303,7 +304,7 @@ describe('ConversationManager', () => {
       }
       await options.setup?.({
         systemPrompt: { section: vi.fn(() => vi.fn()) },
-        tools: { register: vi.fn(() => vi.fn()) }, reflect: { provide: vi.fn(() => vi.fn()) }, effect: vi.fn((callback: unknown) => { if (typeof callback !== "function") return () => {}; const generator = (callback as () => Generator)(); const first = generator.next(); return typeof first.value === "function" ? first.value as () => void : () => {} }),
+        tools: { register: vi.fn(() => vi.fn()) }, get: vi.fn(() => undefined), reflect: { provide: vi.fn(() => vi.fn()) }, effect: vi.fn((callback: unknown) => { if (typeof callback !== "function") return () => {}; const generator = (callback as () => Generator)(); const first = generator.next(); return typeof first.value === "function" ? first.value as () => void : () => {} }),
       } as never)
       live.set(id, agent)
       return {
@@ -394,7 +395,7 @@ describe('ConversationManager', () => {
         create: vi.fn(async (options: { setup?: (ctx: never) => Promise<void> }) => {
           await options.setup?.({
             systemPrompt: { section: vi.fn(() => vi.fn()) },
-            tools: { register }, reflect: { provide: vi.fn(() => vi.fn()) }, effect: vi.fn((callback: unknown) => { if (typeof callback !== "function") return () => {}; const generator = (callback as () => Generator)(); const first = generator.next(); return typeof first.value === "function" ? first.value as () => void : () => {} }),
+            tools: { register }, get: vi.fn(() => undefined), reflect: { provide: vi.fn(() => vi.fn()) }, effect: vi.fn((callback: unknown) => { if (typeof callback !== "function") return () => {}; const generator = (callback as () => Generator)(); const first = generator.next(); return typeof first.value === "function" ? first.value as () => void : () => {} }),
           } as never)
           return { agent, dispose: vi.fn(async () => undefined) }
         }),
@@ -469,7 +470,7 @@ describe('ConversationManager', () => {
         create: vi.fn(async (options: { setup?: (ctx: never) => Promise<void> }) => {
           await options.setup?.({
             systemPrompt: { section: vi.fn(() => vi.fn()) },
-            tools: { register: vi.fn(() => vi.fn()) }, reflect: { provide: vi.fn(() => vi.fn()) }, effect: vi.fn((callback: unknown) => { if (typeof callback !== "function") return () => {}; const generator = (callback as () => Generator)(); const first = generator.next(); return typeof first.value === "function" ? first.value as () => void : () => {} }),
+            tools: { register: vi.fn(() => vi.fn()) }, get: vi.fn(() => undefined), reflect: { provide: vi.fn(() => vi.fn()) }, effect: vi.fn((callback: unknown) => { if (typeof callback !== "function") return () => {}; const generator = (callback as () => Generator)(); const first = generator.next(); return typeof first.value === "function" ? first.value as () => void : () => {} }),
           } as never)
           return { agent, dispose: vi.fn(async () => undefined) }
         }),
@@ -526,7 +527,7 @@ describe('ConversationManager', () => {
         create: vi.fn(async (options: { setup?: (ctx: never) => Promise<void> }) => {
           await options.setup?.({
             systemPrompt: { section: vi.fn(() => vi.fn()) },
-            tools: { register: vi.fn(() => vi.fn()) }, reflect: { provide: vi.fn(() => vi.fn()) }, effect: vi.fn((callback: unknown) => { if (typeof callback !== "function") return () => {}; const generator = (callback as () => Generator)(); const first = generator.next(); return typeof first.value === "function" ? first.value as () => void : () => {} }),
+            tools: { register: vi.fn(() => vi.fn()) }, get: vi.fn(() => undefined), reflect: { provide: vi.fn(() => vi.fn()) }, effect: vi.fn((callback: unknown) => { if (typeof callback !== "function") return () => {}; const generator = (callback as () => Generator)(); const first = generator.next(); return typeof first.value === "function" ? first.value as () => void : () => {} }),
           } as never)
           return { agent, dispose: vi.fn(async () => undefined) }
         }),
@@ -571,7 +572,7 @@ describe('ConversationManager', () => {
         create: vi.fn(async (options: { setup?: (ctx: never) => Promise<void> }) => {
           await options.setup?.({
             systemPrompt: { section: vi.fn(() => vi.fn()) },
-            tools: { register: vi.fn(() => vi.fn()) }, reflect: { provide: vi.fn(() => vi.fn()) }, effect: vi.fn((callback: unknown) => { if (typeof callback !== "function") return () => {}; const generator = (callback as () => Generator)(); const first = generator.next(); return typeof first.value === "function" ? first.value as () => void : () => {} }),
+            tools: { register: vi.fn(() => vi.fn()) }, get: vi.fn(() => undefined), reflect: { provide: vi.fn(() => vi.fn()) }, effect: vi.fn((callback: unknown) => { if (typeof callback !== "function") return () => {}; const generator = (callback as () => Generator)(); const first = generator.next(); return typeof first.value === "function" ? first.value as () => void : () => {} }),
           } as never)
           return { agent, dispose: vi.fn(async () => undefined) }
         }),

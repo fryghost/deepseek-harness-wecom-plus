@@ -1172,13 +1172,18 @@ var ConversationManager = class {
   /**
    * Register a channel-scoped `ask_user_question` tool that shadows the
    * preset's Web-UI-backed tool for this agent (the tools registry resolves
-   * the nearest scope layer, so this agent asks through WeCom cards instead
-   * of the Web question panel, whose provider can never be answered here).
+   * the nearest scope layer). Routing follows the turn origin:
+   * - WeCom-initiated turns present the question as Markdown + template card
+   *   and settle it from card clicks or chat replies;
+   * - any other turn (the user continued this same session from the Web UI)
+   *   delegates to the shared userQuestions service, so the Web question panel
+   *   behaves exactly as before.
    */
   registerAskTool(agentCtx, id) {
+    const userQuestions = agentCtx.get("userQuestions");
     return agentCtx.tools.register(defineTool({
       name: "ask_user_question",
-      description: "Ask the WeCom user a concise question when you need confirmation, a choice, or missing information before proceeding. Send one or more questions, each with a stable id that will be echoed in the answer. Each question renders as a Markdown message plus a WeCom template card: keep option labels SHORT (at most 10 characters \u2014 the WeCom client truncates them) and put the full explanation of each choice into the question text or the option descriptions instead.",
+      description: "Ask the user a concise question when you need confirmation, a choice, or missing information before proceeding. Send one or more questions, each with a stable id that will be echoed in the answer. When the current turn comes from WeCom, each question renders as a Markdown message plus a WeCom template card: keep option labels SHORT (at most 10 characters \u2014 the WeCom client truncates them) and put the full explanation of each choice into the question text or the option descriptions instead.",
       parameters: {
         questions: {
           type: "array",
@@ -1237,13 +1242,6 @@ var ConversationManager = class {
         render: (_args, value) => [{ type: "text", text: JSON.stringify(value) }]
       },
       execute: async (args, exec) => {
-        const target = this.activeTurns.get(id);
-        if (target === void 0) {
-          throw new UserQuestionError2(
-            "ask_user_question is unavailable outside an active WeCom turn; the WeCom user must initiate the conversation",
-            "NO_ACTIVE_TURN"
-          );
-        }
         exec.signal.throwIfAborted();
         const request = {
           questions: args.questions.map((question) => ({
@@ -1255,7 +1253,10 @@ var ConversationManager = class {
           })),
           signal: exec.signal
         };
-        const result = await this.questions.present(request, target);
+        const result = this.activeTurns.get(id) === void 0 ? await requireUserQuestions(userQuestions).ask({
+          ...request,
+          ...exec.agent === void 0 ? {} : { agent: exec.agent }
+        }) : await this.questions.present(request, this.activeTurns.get(id));
         return {
           answers: result.answers.map((answer) => ({
             id: answer.id,
@@ -1514,6 +1515,12 @@ var ConversationManager = class {
     return { text: texts.join("\n\n"), images };
   }
 };
+function requireUserQuestions(service) {
+  if (service === void 0) {
+    throw new UserQuestionError2("no user-questions service is available in this agent", "NO_PROVIDER");
+  }
+  return service;
+}
 
 // src/bridge.ts
 var OUTBOUND_TEST_PNG = Buffer.from(
@@ -1648,7 +1655,7 @@ var WeComHarnessBridge = class {
       maxReconnectAttempts: this.config.maxReconnectAttempts,
       maxAuthFailureAttempts: this.config.maxAuthFailureAttempts,
       requestTimeout: this.config.sendTimeoutMs,
-      plug_version: "deepseek-harness-wecom-plus/0.4.1"
+      plug_version: "deepseek-harness-wecom-plus/0.4.2"
     });
   }
   async handleWelcome(frame) {
@@ -2055,7 +2062,7 @@ import {
 } from "@deepseek-ai/dsh-settings";
 
 // src/version.ts
-var PLUGIN_VERSION = "0.4.1";
+var PLUGIN_VERSION = "0.4.2";
 
 // src/settings-web.ts
 var SETTINGS_ROUTE = "/_dsh/deepseek-harness-wecom-plus/settings";

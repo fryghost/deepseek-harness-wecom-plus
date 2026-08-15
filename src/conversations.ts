@@ -447,17 +447,23 @@ export class ConversationManager {
   /**
    * Register a channel-scoped `ask_user_question` tool that shadows the
    * preset's Web-UI-backed tool for this agent (the tools registry resolves
-   * the nearest scope layer, so this agent asks through WeCom cards instead
-   * of the Web question panel, whose provider can never be answered here).
+   * the nearest scope layer). Routing follows the turn origin:
+   * - WeCom-initiated turns present the question as Markdown + template card
+   *   and settle it from card clicks or chat replies;
+   * - any other turn (the user continued this same session from the Web UI)
+   *   delegates to the shared userQuestions service, so the Web question panel
+   *   behaves exactly as before.
    */
   private registerAskTool(agentCtx: Context, id: string): () => void {
+    const userQuestions = agentCtx.get('userQuestions') as Context['userQuestions'] | undefined
     return agentCtx.tools.register(defineTool({
       name: 'ask_user_question',
-      description: 'Ask the WeCom user a concise question when you need confirmation, a choice, or missing '
+      description: 'Ask the user a concise question when you need confirmation, a choice, or missing '
         + 'information before proceeding. Send one or more questions, each with a stable id that will be echoed '
-        + 'in the answer. Each question renders as a Markdown message plus a WeCom template card: keep option '
-        + 'labels SHORT (at most 10 characters — the WeCom client truncates them) and put the full explanation '
-        + 'of each choice into the question text or the option descriptions instead.',
+        + 'in the answer. When the current turn comes from WeCom, each question renders as a Markdown message '
+        + 'plus a WeCom template card: keep option labels SHORT (at most 10 characters — the WeCom client '
+        + 'truncates them) and put the full explanation of each choice into the question text or the option '
+        + 'descriptions instead.',
       parameters: {
         questions: {
           type: 'array',
@@ -516,14 +522,6 @@ export class ConversationManager {
         render: (_args, value) => [{ type: 'text', text: JSON.stringify(value) }],
       },
       execute: async (args, exec) => {
-        const target = this.activeTurns.get(id)
-        if (target === undefined) {
-          throw new UserQuestionError(
-            'ask_user_question is unavailable outside an active WeCom turn; '
-            + 'the WeCom user must initiate the conversation',
-            'NO_ACTIVE_TURN',
-          )
-        }
         exec.signal.throwIfAborted()
         const request: AskUserQuestionRequest = {
           questions: args.questions.map(question => ({
@@ -535,7 +533,12 @@ export class ConversationManager {
           })),
           signal: exec.signal,
         }
-        const result = await this.questions.present(request, target)
+        const result = this.activeTurns.get(id) === undefined
+          ? await requireUserQuestions(userQuestions).ask({
+            ...request,
+            ...(exec.agent === undefined ? {} : { agent: exec.agent }),
+          })
+          : await this.questions.present(request, this.activeTurns.get(id) as string)
         return {
           answers: result.answers.map(answer => ({
             id: answer.id,
@@ -810,4 +813,12 @@ export class ConversationManager {
     }
     return { text: texts.join('\n\n'), images }
   }
+}
+
+/** The shared userQuestions service, or a teaching error when no provider exists. */
+function requireUserQuestions(service: Context['userQuestions'] | undefined): Context['userQuestions'] {
+  if (service === undefined) {
+    throw new UserQuestionError('no user-questions service is available in this agent', 'NO_PROVIDER')
+  }
+  return service
 }

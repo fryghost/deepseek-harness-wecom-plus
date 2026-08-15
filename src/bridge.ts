@@ -223,7 +223,7 @@ export class WeComHarnessBridge {
       maxReconnectAttempts: this.config.maxReconnectAttempts,
       maxAuthFailureAttempts: this.config.maxAuthFailureAttempts,
       requestTimeout: this.config.sendTimeoutMs,
-      plug_version: 'deepseek-harness-wecom-plus/0.5.2',
+      plug_version: 'deepseek-harness-wecom-plus/0.5.3',
     })
   }
 
@@ -260,12 +260,13 @@ export class WeComHarnessBridge {
     // Diagnostic always visible in the launch terminal (console.error is not
     // filtered by the default logger level; the line names every decision).
     console.error(
-      '[wecom-plus] card click msgid=%s task=%s key=%s questionLabel=%s answered=%s',
+      '[wecom-plus] card click msgid=%s task=%s key=%s questionLabel=%s answered=%s raw=%s',
       body.msgid,
       taskId ?? '',
       body.event.event_key ?? '',
       questionLabel ?? '',
       String(answered),
+      JSON.stringify(body.event),
     )
     this.log.info(
       'WeCom card click msgid=%s task=%s key=%s questionLabel=%s answered=%s',

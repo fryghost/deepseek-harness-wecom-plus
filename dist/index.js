@@ -1727,7 +1727,7 @@ var WeComHarnessBridge = class {
       maxReconnectAttempts: this.config.maxReconnectAttempts,
       maxAuthFailureAttempts: this.config.maxAuthFailureAttempts,
       requestTimeout: this.config.sendTimeoutMs,
-      plug_version: "deepseek-harness-wecom-plus/0.5.2"
+      plug_version: "deepseek-harness-wecom-plus/0.5.3"
     });
   }
   async handleWelcome(frame) {
@@ -1757,12 +1757,13 @@ var WeComHarnessBridge = class {
     const questionLabel = this.conversations.pendingQuestionLabel(body);
     const answered = this.conversations.tryAnswerFromClick(body);
     console.error(
-      "[wecom-plus] card click msgid=%s task=%s key=%s questionLabel=%s answered=%s",
+      "[wecom-plus] card click msgid=%s task=%s key=%s questionLabel=%s answered=%s raw=%s",
       body.msgid,
       taskId ?? "",
       body.event.event_key ?? "",
       questionLabel ?? "",
-      String(answered)
+      String(answered),
+      JSON.stringify(body.event)
     );
     this.log.info(
       "WeCom card click msgid=%s task=%s key=%s questionLabel=%s answered=%s",
@@ -2326,7 +2327,7 @@ import {
 } from "@deepseek-ai/dsh-settings";
 
 // src/version.ts
-var PLUGIN_VERSION = "0.5.2";
+var PLUGIN_VERSION = "0.5.3";
 
 // src/settings-web.ts
 var SETTINGS_ROUTE = "/_dsh/deepseek-harness-wecom-plus/settings";

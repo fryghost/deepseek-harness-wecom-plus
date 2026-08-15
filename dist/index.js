@@ -1727,7 +1727,7 @@ var WeComHarnessBridge = class {
       maxReconnectAttempts: this.config.maxReconnectAttempts,
       maxAuthFailureAttempts: this.config.maxAuthFailureAttempts,
       requestTimeout: this.config.sendTimeoutMs,
-      plug_version: "deepseek-harness-wecom-plus/0.5.0"
+      plug_version: "deepseek-harness-wecom-plus/0.5.1"
     });
   }
   async handleWelcome(frame) {
@@ -1755,6 +1755,15 @@ var WeComHarnessBridge = class {
     if (body === void 0 || this.seen.hasOrAdd(body.msgid) || !this.allowedEvent(body)) return;
     const taskId = body.event.task_id?.trim();
     const questionLabel = this.conversations.pendingQuestionLabel(body);
+    const answered = this.conversations.tryAnswerFromClick(body);
+    this.log.info(
+      "WeCom card click msgid=%s task=%s key=%s questionLabel=%s answered=%s",
+      body.msgid,
+      taskId ?? "",
+      body.event.event_key ?? "",
+      questionLabel ?? "",
+      String(answered)
+    );
     if (taskId !== void 0 && taskId.length > 0) {
       try {
         await withTimeout(this.requireClient().updateTemplateCard(frame, {
@@ -1769,7 +1778,18 @@ var WeComHarnessBridge = class {
         this.log.warn("WeCom card click acknowledgement failed: %s", String(error));
       }
     }
-    if (this.conversations.tryAnswerFromClick(body)) return;
+    if (answered) {
+      try {
+        await this.sendProactive(chatTarget(body), {
+          text: questionLabel === void 0 ? "\u5DF2\u6536\u5230\u4F60\u7684\u9009\u62E9\uFF0C\u6B63\u5728\u751F\u6210\u56DE\u590D\u2026" : `\u5DF2\u6536\u5230\u4F60\u7684\u9009\u62E9\u300C${questionLabel}\u300D\uFF0C\u6B63\u5728\u751F\u6210\u56DE\u590D\u2026`,
+          images: [],
+          cards: []
+        });
+      } catch (error) {
+        this.log.warn("WeCom question click acknowledgement failed: %s", String(error));
+      }
+      return;
+    }
     const transport = this.beginProactiveTransport(chatTarget(body));
     try {
       await this.conversations.processCardEvent(
@@ -2027,18 +2047,30 @@ ${outcome.response.text}` : direct;
           }
         }));
         const fallback = reply.images.length > 0 ? "\u56FE\u7247\u56DE\u590D" : "\u5904\u7406\u5B8C\u6210\u3002";
-        await this.retry(async () => withTimeout(
-          this.requireClient().replyStream(
-            frame,
-            streamId,
-            truncateUtf8(reply.text || fallback, this.config.maxReplyBytes, ""),
-            true,
-            msgItems
-          ),
-          this.config.sendTimeoutMs,
-          "WeCom reply send"
-        ));
         const target = chatTargetOf(frame);
+        try {
+          await this.retry(async () => withTimeout(
+            this.requireClient().replyStream(
+              frame,
+              streamId,
+              truncateUtf8(reply.text || fallback, this.config.maxReplyBytes, ""),
+              true,
+              msgItems
+            ),
+            this.config.sendTimeoutMs,
+            "WeCom reply send"
+          ));
+        } catch (error) {
+          this.log.warn("WeCom stream finish failed, falling back to proactive send: %s", String(error));
+          await this.retry(async () => withTimeout(
+            this.requireClient().sendMessage(target, {
+              msgtype: "markdown",
+              markdown: { content: truncateUtf8(reply.text || fallback, this.config.maxReplyBytes, "") }
+            }),
+            this.config.sendTimeoutMs,
+            "WeCom proactive fallback send"
+          ));
+        }
         for (const image of active) {
           const filename = image.name?.trim() || imageFilename(image.mediaType);
           await this.sendMedia(target, Buffer.from(image.data), "image", filename, "WeCom image");
@@ -2049,11 +2081,27 @@ ${outcome.response.text}` : direct;
         if (settled) return;
         settled = true;
         if (timer !== void 0) clearTimeout(timer);
-        await this.retry(async () => withTimeout(
-          this.requireClient().replyStream(frame, streamId, truncateUtf8(message, this.config.maxReplyBytes, ""), true),
-          this.config.sendTimeoutMs,
-          "WeCom failure reply"
-        ));
+        try {
+          await this.retry(async () => withTimeout(
+            this.requireClient().replyStream(frame, streamId, truncateUtf8(message, this.config.maxReplyBytes, ""), true),
+            this.config.sendTimeoutMs,
+            "WeCom failure reply"
+          ));
+        } catch (error) {
+          this.log.warn("WeCom failure stream failed, falling back to proactive send: %s", String(error));
+          try {
+            await this.retry(async () => withTimeout(
+              this.requireClient().sendMessage(chatTargetOf(frame), {
+                msgtype: "markdown",
+                markdown: { content: truncateUtf8(message, this.config.maxReplyBytes, "") }
+              }),
+              this.config.sendTimeoutMs,
+              "WeCom proactive failure fallback"
+            ));
+          } catch (fallbackError) {
+            this.log.error("WeCom proactive failure fallback failed: %s", String(fallbackError));
+          }
+        }
       }
     };
   }
@@ -2270,7 +2318,7 @@ import {
 } from "@deepseek-ai/dsh-settings";
 
 // src/version.ts
-var PLUGIN_VERSION = "0.5.0";
+var PLUGIN_VERSION = "0.5.1";
 
 // src/settings-web.ts
 var SETTINGS_ROUTE = "/_dsh/deepseek-harness-wecom-plus/settings";

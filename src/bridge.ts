@@ -223,7 +223,7 @@ export class WeComHarnessBridge {
       maxReconnectAttempts: this.config.maxReconnectAttempts,
       maxAuthFailureAttempts: this.config.maxAuthFailureAttempts,
       requestTimeout: this.config.sendTimeoutMs,
-      plug_version: 'deepseek-harness-wecom-plus/0.5.0',
+      plug_version: 'deepseek-harness-wecom-plus/0.5.1',
     })
   }
 
@@ -252,9 +252,19 @@ export class WeComHarnessBridge {
     const body = frame.body
     if (body === undefined || this.seen.hasOrAdd(body.msgid) || !this.allowedEvent(body)) return
     const taskId = body.event.task_id?.trim()
-    // The clicked option's label for a pending question, resolved without
-    // settling so the acknowledgement below can name the choice.
+    // A click on a pending ask_user_question card is the ANSWER: settle the
+    // question FIRST (no await in between, no race window), then acknowledge
+    // the choice on the card, and let the running turn continue.
     const questionLabel = this.conversations.pendingQuestionLabel(body)
+    const answered = this.conversations.tryAnswerFromClick(body)
+    this.log.info(
+      'WeCom card click msgid=%s task=%s key=%s questionLabel=%s answered=%s',
+      body.msgid,
+      taskId ?? '',
+      body.event.event_key ?? '',
+      questionLabel ?? '',
+      String(answered),
+    )
     if (taskId !== undefined && taskId.length > 0) {
       try {
         await withTimeout(this.requireClient().updateTemplateCard(frame, {
@@ -271,9 +281,20 @@ export class WeComHarnessBridge {
         this.log.warn('WeCom card click acknowledgement failed: %s', String(error))
       }
     }
-    // A click on a pending ask_user_question card is the ANSWER, not a new
-    // user message: settle the question and let the running turn continue.
-    if (this.conversations.tryAnswerFromClick(body)) return
+    if (answered) {
+      // Immediate feedback beyond the card update: the model's reply takes
+      // time, so say so now — even if the stream channel were wedged.
+      try {
+        await this.sendProactive(chatTarget(body), {
+          text: questionLabel === undefined ? '已收到你的选择，正在生成回复…' : `已收到你的选择「${questionLabel}」，正在生成回复…`,
+          images: [],
+          cards: [],
+        })
+      } catch (error) {
+        this.log.warn('WeCom question click acknowledgement failed: %s', String(error))
+      }
+      return
+    }
     // Card-click turns have no stream channel in the protocol; the proactive
     // transport buffers the model's text and delivers one Markdown message.
     const transport = this.beginProactiveTransport(chatTarget(body))
@@ -545,18 +566,33 @@ export class WeComHarnessBridge {
           },
         }))
         const fallback = reply.images.length > 0 ? '图片回复' : '处理完成。'
-        await this.retry(async () => withTimeout(
-          this.requireClient().replyStream(
-            frame,
-            streamId,
-            truncateUtf8(reply.text || fallback, this.config.maxReplyBytes, ''),
-            true,
-            msgItems,
-          ),
-          this.config.sendTimeoutMs,
-          'WeCom reply send',
-        ))
         const target = chatTargetOf(frame)
+        try {
+          await this.retry(async () => withTimeout(
+            this.requireClient().replyStream(
+              frame,
+              streamId,
+              truncateUtf8(reply.text || fallback, this.config.maxReplyBytes, ''),
+              true,
+              msgItems,
+            ),
+            this.config.sendTimeoutMs,
+            'WeCom reply send',
+          ))
+        } catch (error) {
+          // The stream channel is wedged (e.g. a queued frame never got its
+          // ack): never leave the user without the reply — fall back to the
+          // proactive channel and continue with media and cards.
+          this.log.warn('WeCom stream finish failed, falling back to proactive send: %s', String(error))
+          await this.retry(async () => withTimeout(
+            this.requireClient().sendMessage(target, {
+              msgtype: 'markdown',
+              markdown: { content: truncateUtf8(reply.text || fallback, this.config.maxReplyBytes, '') },
+            }),
+            this.config.sendTimeoutMs,
+            'WeCom proactive fallback send',
+          ))
+        }
         for (const image of active) {
           const filename = image.name?.trim() || imageFilename(image.mediaType)
           await this.sendMedia(target, Buffer.from(image.data), 'image', filename, 'WeCom image')
@@ -567,11 +603,27 @@ export class WeComHarnessBridge {
         if (settled) return
         settled = true
         if (timer !== undefined) clearTimeout(timer)
-        await this.retry(async () => withTimeout(
-          this.requireClient().replyStream(frame, streamId, truncateUtf8(message, this.config.maxReplyBytes, ''), true),
-          this.config.sendTimeoutMs,
-          'WeCom failure reply',
-        ))
+        try {
+          await this.retry(async () => withTimeout(
+            this.requireClient().replyStream(frame, streamId, truncateUtf8(message, this.config.maxReplyBytes, ''), true),
+            this.config.sendTimeoutMs,
+            'WeCom failure reply',
+          ))
+        } catch (error) {
+          this.log.warn('WeCom failure stream failed, falling back to proactive send: %s', String(error))
+          try {
+            await this.retry(async () => withTimeout(
+              this.requireClient().sendMessage(chatTargetOf(frame), {
+                msgtype: 'markdown',
+                markdown: { content: truncateUtf8(message, this.config.maxReplyBytes, '') },
+              }),
+              this.config.sendTimeoutMs,
+              'WeCom proactive failure fallback',
+            ))
+          } catch (fallbackError) {
+            this.log.error('WeCom proactive failure fallback failed: %s', String(fallbackError))
+          }
+        }
       },
     }
   }

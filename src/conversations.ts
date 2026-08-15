@@ -43,6 +43,31 @@ export interface ConversationCommandReply {
 /** Upload one validated local file to the active WeCom reply target. */
 export type ConversationFileSender = (target: string, file: OutboundFile) => Promise<void>
 
+/**
+ * Per-turn reply transport. The message-initiated implementation streams the
+ * model's text live (throttled `replyStream` frames plus a "thinking" and
+ * tool-activity surface); the proactive implementation buffers and sends one
+ * Markdown message at finish, because card-click events have no stream
+ * channel in the WeCom protocol.
+ */
+export interface TurnTransport {
+  /** Append a text delta from the model; the transport throttles the wire. */
+  pushText(delta: string): void
+  /** Show a transient activity line (e.g. the tool being executed). */
+  setActivity(line: string): void
+  /** Deliver the complete reply (final stream frame / Markdown + media + cards). */
+  finish(reply: ConversationReply): Promise<void>
+  /** Deliver an error reply and stop the stream. */
+  fail(text: string): Promise<void>
+}
+
+/** Streaming state owned by the manager for one active turn. */
+interface ActiveStream {
+  transport: TurnTransport
+  text: string
+  activity: string | undefined
+}
+
 /** Bound on remembered card label registries; oldest tasks are evicted first. */
 const MAX_CARD_LABEL_TASKS = 500
 
@@ -58,11 +83,13 @@ export class ConversationManager {
   private readonly creations = new Map<string, Promise<ConversationAgentBinding>>()
   private readonly queues = new Map<string, Promise<unknown>>()
   private readonly activeTurns = new Map<string, string>()
+  private readonly activeStreams = new Map<string, ActiveStream>()
   private readonly pendingCards = new Map<string, TemplateCard[]>()
   private readonly cardLabels = new Map<string, Map<string, string>>()
   private readonly questions: WeComQuestionBridge
   private readonly generations = new Map<string, number>()
   private persistedIds = new Set<string>()
+  private readonly disposeSessionEvents: () => void
 
   constructor(
     private readonly ctx: Context,
@@ -72,6 +99,26 @@ export class ConversationManager {
     sendQuestionText: QuestionTextSender,
   ) {
     this.questions = new WeComQuestionBridge(config, sendQuestionCard, sendQuestionText)
+    // One global feed: route the model's chunk stream to the turn that owns it.
+    this.disposeSessionEvents = ctx.on('session/event', (session, event) => {
+      const active = this.activeStreams.get(String(session.id))
+      if (active === undefined) return
+      if (event.type === 'step/start') {
+        // A new step (possibly after a retried request) restarts the visible text.
+        active.text = ''
+        active.activity = undefined
+        return
+      }
+      if (event.type !== 'assistant/chunk') return
+      const chunk = event.data.chunk
+      if (chunk.type === 'text-delta') {
+        active.activity = undefined
+        active.text += chunk.text
+        active.transport.pushText(chunk.text)
+      } else if (chunk.type === 'tool-call-delta' && chunk.name !== undefined) {
+        active.transport.setActivity(`正在执行工具 \`${chunk.name}\`…`)
+      }
+    })
   }
 
   /** Snapshot persisted identities once before accepting traffic. */
@@ -81,18 +128,19 @@ export class ConversationManager {
   }
 
   /** Process one inbound message after earlier work in the same WeCom conversation. */
-  process(message: BaseMessage, client: WeComDownloadPort): Promise<ConversationReply> {
+  process(message: BaseMessage, client: WeComDownloadPort, transport: TurnTransport): Promise<ConversationReply> {
     const baseId = sessionIdFor(this.config.accountId, message)
-    return this.enqueue(baseId, () => this.processNow(this.currentSessionId(baseId), message, client))
+    return this.enqueue(baseId, () => this.processNow(this.currentSessionId(baseId), message, client, transport))
   }
 
   /** Process one template card button click as a user message into the same conversation. */
   processCardEvent(
     message: EventMessageWith<TemplateCardEventData>,
-    selectedLabel?: string,
+    selectedLabel: string | undefined,
+    transport: TurnTransport,
   ): Promise<ConversationReply> {
     const baseId = sessionIdFor(this.config.accountId, message)
-    return this.enqueue(baseId, () => this.processCardEventNow(this.currentSessionId(baseId), message, selectedLabel))
+    return this.enqueue(baseId, () => this.processCardEventNow(this.currentSessionId(baseId), message, selectedLabel, transport))
   }
 
   /**
@@ -204,9 +252,11 @@ export class ConversationManager {
   async dispose(): Promise<void> {
     await Promise.allSettled(this.queues.values())
     await Promise.allSettled([...this.bindings.values()].map(binding => binding.release()))
+    this.disposeSessionEvents()
     this.questions.dispose()
     this.bindings.clear()
     this.activeTurns.clear()
+    this.activeStreams.clear()
     this.pendingCards.clear()
     this.cardLabels.clear()
   }
@@ -246,6 +296,7 @@ export class ConversationManager {
     id: string,
     message: BaseMessage,
     client: WeComDownloadPort,
+    transport: TurnTransport,
   ): Promise<ConversationReply> {
     const binding = await this.getOrCreate(id)
     const agent = binding.agent
@@ -253,12 +304,29 @@ export class ConversationManager {
     await withTimeout(agent.whenIdle(), this.config.responseTimeoutMs, 'DeepSeek Harness conversation availability')
     const start = agent.session.events.length
     this.activeTurns.set(id, chatTarget(message))
+    const stream: ActiveStream = { transport, text: '', activity: undefined }
+    this.activeStreams.set(id, stream)
     try {
       agent.followup(createUserMessage({ content, source: { kind: 'user' } }))
-      await withTimeout(agent.whenIdle(), this.config.responseTimeoutMs, 'DeepSeek Harness response')
+      try {
+        await withTimeout(agent.whenIdle(), this.config.responseTimeoutMs, 'DeepSeek Harness response')
+      } catch (error) {
+        // A wedged turn blocks the conversation queue forever; cancel it and
+        // say so through the live stream instead of a silent error card.
+        agent.cancel({ kind: 'user' })
+        await agent.whenIdle()
+        await transport.fail('处理超时，已取消本次生成，请重新发送。')
+        throw error
+      }
       const collected = await this.collectReply(agent, agent.session.events.slice(start))
-      return this.finalizeReply(id, collected)
+      const reply = this.finalizeReply(id, {
+        text: stream.text.trim() || collected.text,
+        images: collected.images,
+      })
+      await transport.finish(reply)
+      return reply
     } finally {
+      this.activeStreams.delete(id)
       this.activeTurns.delete(id)
     }
   }
@@ -266,7 +334,8 @@ export class ConversationManager {
   private async processCardEventNow(
     id: string,
     message: EventMessageWith<TemplateCardEventData>,
-    selectedLabel?: string,
+    selectedLabel: string | undefined,
+    transport: TurnTransport,
   ): Promise<ConversationReply> {
     const binding = await this.getOrCreate(id)
     const agent = binding.agent
@@ -288,12 +357,27 @@ export class ConversationManager {
     await withTimeout(agent.whenIdle(), this.config.responseTimeoutMs, 'DeepSeek Harness conversation availability')
     const start = agent.session.events.length
     this.activeTurns.set(id, chatTarget(message))
+    const stream: ActiveStream = { transport, text: '', activity: undefined }
+    this.activeStreams.set(id, stream)
     try {
       agent.followup(createUserMessage({ content, source: { kind: 'user' } }))
-      await withTimeout(agent.whenIdle(), this.config.responseTimeoutMs, 'DeepSeek Harness response')
+      try {
+        await withTimeout(agent.whenIdle(), this.config.responseTimeoutMs, 'DeepSeek Harness response')
+      } catch (error) {
+        agent.cancel({ kind: 'user' })
+        await agent.whenIdle()
+        await transport.fail('处理超时，已取消本次生成，请重新发送。')
+        throw error
+      }
       const collected = await this.collectReply(agent, agent.session.events.slice(start))
-      return this.finalizeReply(id, collected)
+      const reply = this.finalizeReply(id, {
+        text: stream.text.trim() || collected.text,
+        images: collected.images,
+      })
+      await transport.finish(reply)
+      return reply
     } finally {
+      this.activeStreams.delete(id)
       this.activeTurns.delete(id)
     }
   }

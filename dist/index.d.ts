@@ -146,6 +146,19 @@ declare class WeComHarnessBridge {
     /** Access policy check for an event frame (its chattype is optional). */
     private allowedEvent;
     private allowedScope;
+    /**
+     * Live streaming transport for message-initiated turns. The model's text
+     * deltas flow through throttled `replyStream` frames (200ms), a transient
+     * activity line shows tool executions, and finish() sends the final frame
+     * with inline images, then media uploads and queued cards.
+     */
+    private beginMessageTransport;
+    /**
+     * Buffering transport for card-click turns: the protocol gives event frames
+     * no stream channel, so the model's text accumulates and one Markdown
+     * message (plus media and cards) goes out at finish.
+     */
+    private beginProactiveTransport;
     private sendReply;
     /**
      * Proactive outbound path for turns without a respondable frame (template

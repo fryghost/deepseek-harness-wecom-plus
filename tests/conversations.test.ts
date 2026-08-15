@@ -8,6 +8,16 @@ import { testConfig } from './fixtures.js'
 
 const downloadPort = { downloadFile: vi.fn() as never }
 
+/** No-op turn transport: records nothing, finishes and fails silently. */
+function noopTransport(): import('../src/conversations.js').TurnTransport {
+  return {
+    pushText: vi.fn(),
+    setActivity: vi.fn(),
+    finish: vi.fn(async () => undefined),
+    fail: vi.fn(async () => undefined),
+  }
+}
+
 /** Minimal agent-scope context: enough for the channel tool and question-bridge registrations. */
 function mockAgentCtx(section: unknown, register: unknown): never {
   return {
@@ -67,6 +77,7 @@ describe('ConversationManager', () => {
       return { agent, dispose }
     })
     const ctx = {
+      on: vi.fn(() => vi.fn()),
       sessionPersistence: { list: vi.fn(async () => []) },
       agentDefaultModel: { currentSelection: vi.fn(() => ({ provider: 'deepseek', model: 'deepseek-chat' })) },
       agentPresets: { defaultId: 'standard', mount },
@@ -79,7 +90,7 @@ describe('ConversationManager', () => {
     const manager = new ConversationManager(ctx, config, vi.fn(async () => undefined), vi.fn(async () => undefined), vi.fn(async () => undefined))
     await manager.initialize()
 
-    const reply = await manager.process(textMessage('u1', 'm1'), downloadPort)
+    const reply = await manager.process(textMessage('u1', 'm1'), downloadPort, noopTransport())
 
     expect(create).toHaveBeenCalledWith(expect.objectContaining({
       meta: { cwd: '/tmp/wecom-test', agentPreset: 'standard' },
@@ -127,6 +138,7 @@ describe('ConversationManager', () => {
       events: [],
     }))
     const ctx = {
+      on: vi.fn(() => vi.fn()),
       sessionPersistence: { list: vi.fn(async () => [{ id }]), inspect },
       agentDefaultModel: { currentSelection: vi.fn(() => ({ provider: 'deepseek', model: 'deepseek-chat' })) },
       agentPresets: { defaultId: 'standard', mount },
@@ -139,7 +151,7 @@ describe('ConversationManager', () => {
     const manager = new ConversationManager(ctx, config, vi.fn(async () => undefined), vi.fn(async () => undefined), vi.fn(async () => undefined))
     await manager.initialize()
 
-    await expect(manager.process(message, downloadPort)).resolves.toEqual({ text: 'Resumed reply', images: [], cards: [] })
+    await expect(manager.process(message, downloadPort, noopTransport())).resolves.toEqual({ text: 'Resumed reply', images: [], cards: [] })
 
     expect(inspect).toHaveBeenCalledWith(id)
     expect(resume).toHaveBeenCalledWith(expect.objectContaining({ setup: expect.any(Function) }))
@@ -187,6 +199,7 @@ describe('ConversationManager', () => {
     const resume = vi.fn()
     const create = vi.fn()
     const ctx = {
+      on: vi.fn(() => vi.fn()),
       sessionPersistence: { list: vi.fn(async () => [{ id }]), inspect },
       agentDefaultModel: { currentSelection: vi.fn() },
       agentPresets: { defaultId: 'standard', mount: vi.fn() },
@@ -199,7 +212,7 @@ describe('ConversationManager', () => {
     const manager = new ConversationManager(ctx, config, vi.fn(async () => undefined), vi.fn(async () => undefined), vi.fn(async () => undefined))
     await manager.initialize()
 
-    await expect(manager.process(message, downloadPort)).resolves.toEqual({ text: 'WeCom reply', images: [], cards: [] })
+    await expect(manager.process(message, downloadPort, noopTransport())).resolves.toEqual({ text: 'WeCom reply', images: [], cards: [] })
 
     expect(section).toHaveBeenCalledWith(expect.objectContaining({ name: 'channel:wecom', order: 190 }))
     expect(inspect).not.toHaveBeenCalled()
@@ -240,6 +253,7 @@ describe('ConversationManager', () => {
       return vi.fn()
     })
     const ctx = {
+      on: vi.fn(() => vi.fn()),
       sessionPersistence: { list: vi.fn(async () => []) },
       agentDefaultModel: { currentSelection: vi.fn(() => ({ provider: 'deepseek', model: 'deepseek-chat' })) },
       agentPresets: { defaultId: 'standard', mount: vi.fn(async () => ({ id: 'standard' })) },
@@ -261,7 +275,7 @@ describe('ConversationManager', () => {
     const manager = new ConversationManager(ctx, config, sendFile, vi.fn(async () => undefined), vi.fn(async () => undefined))
     await manager.initialize()
 
-    await expect(manager.process(textMessage('u3', 'm3', '把 README.md 发给我'), downloadPort))
+    await expect(manager.process(textMessage('u3', 'm3', '把 README.md 发给我'), downloadPort, noopTransport()))
       .resolves.toEqual({ text: '文件已发送。', images: [], cards: [] })
 
     expect(register).toHaveBeenCalledWith(expect.objectContaining({ name: 'wecom_send_file' }))
@@ -316,6 +330,7 @@ describe('ConversationManager', () => {
       }
     })
     const ctx = {
+      on: vi.fn(() => vi.fn()),
       sessionPersistence: { list: vi.fn(async () => []) },
       agentDefaultModel: { currentSelection: vi.fn(() => ({ provider: 'deepseek', model: 'deepseek-chat' })) },
       agentPresets: { defaultId: 'standard', mount: vi.fn(async () => ({ id: 'standard' })) },
@@ -331,13 +346,13 @@ describe('ConversationManager', () => {
     const manager = new ConversationManager(ctx, config, vi.fn(async () => undefined), vi.fn(async () => undefined), vi.fn(async () => undefined))
     await manager.initialize()
 
-    await expect(manager.process(message, downloadPort)).resolves.toEqual({
+    await expect(manager.process(message, downloadPort, noopTransport())).resolves.toEqual({
       text: `reply from ${baseId}`,
       images: [],
       cards: [],
     })
     await manager.reset(textMessage('u-new', 'm-new', '/new'))
-    await expect(manager.process(textMessage('u-new', 'm-after'), downloadPort)).resolves.toEqual({
+    await expect(manager.process(textMessage('u-new', 'm-after'), downloadPort, noopTransport())).resolves.toEqual({
       text: `reply from ${baseId}-n1`,
       images: [],
       cards: [],
@@ -387,6 +402,7 @@ describe('ConversationManager', () => {
       return vi.fn()
     })
     const ctx = {
+      on: vi.fn(() => vi.fn()),
       sessionPersistence: { list: vi.fn(async () => []) },
       agentDefaultModel: { currentSelection: vi.fn(() => ({ provider: 'deepseek', model: 'deepseek-chat' })) },
       agentPresets: { defaultId: 'standard', mount: vi.fn(async () => ({ id: 'standard' })) },
@@ -408,7 +424,7 @@ describe('ConversationManager', () => {
     const manager = new ConversationManager(ctx, config, vi.fn(async () => undefined), vi.fn(async () => undefined), vi.fn(async () => undefined))
     await manager.initialize()
 
-    const reply = await manager.process(textMessage('u-card', 'm-card', '给我几个选项'), downloadPort)
+    const reply = await manager.process(textMessage('u-card', 'm-card', '给我几个选项'), downloadPort, noopTransport())
 
     expect(register).toHaveBeenCalledWith(expect.objectContaining({ name: 'wecom_send_card' }))
     expect(reply.cards).toHaveLength(2)
@@ -462,6 +478,7 @@ describe('ConversationManager', () => {
       whenIdle: vi.fn(async () => undefined),
     }
     const ctx = {
+      on: vi.fn(() => vi.fn()),
       sessionPersistence: { list: vi.fn(async () => []) },
       agentDefaultModel: { currentSelection: vi.fn(() => ({ provider: 'deepseek', model: 'deepseek-chat' })) },
       agentPresets: { defaultId: 'standard', mount: vi.fn(async () => ({ id: 'standard' })) },
@@ -483,7 +500,7 @@ describe('ConversationManager', () => {
     const manager = new ConversationManager(ctx, config, vi.fn(async () => undefined), vi.fn(async () => undefined), vi.fn(async () => undefined))
     await manager.initialize()
 
-    const reply = await manager.process(textMessage('u-auto', 'm-auto', '我该选哪个方案？'), downloadPort)
+    const reply = await manager.process(textMessage('u-auto', 'm-auto', '我该选哪个方案？'), downloadPort, noopTransport())
 
     expect(reply.cards).toHaveLength(1)
     expect(reply.cards[0]).toEqual(expect.objectContaining({
@@ -519,6 +536,7 @@ describe('ConversationManager', () => {
       whenIdle: vi.fn(async () => undefined),
     }
     const ctx = {
+      on: vi.fn(() => vi.fn()),
       sessionPersistence: { list: vi.fn(async () => []) },
       agentDefaultModel: { currentSelection: vi.fn(() => ({ provider: 'deepseek', model: 'deepseek-chat' })) },
       agentPresets: { defaultId: 'standard', mount: vi.fn(async () => ({ id: 'standard' })) },
@@ -540,7 +558,7 @@ describe('ConversationManager', () => {
     const manager = new ConversationManager(ctx, config, vi.fn(async () => undefined), vi.fn(async () => undefined), vi.fn(async () => undefined))
     await manager.initialize()
 
-    const reply = await manager.process(textMessage('u-info', 'm-info', '部署好了吗'), downloadPort)
+    const reply = await manager.process(textMessage('u-info', 'm-info', '部署好了吗'), downloadPort, noopTransport())
 
     expect(reply.cards).toEqual([])
     await manager.dispose()
@@ -564,6 +582,7 @@ describe('ConversationManager', () => {
       whenIdle: vi.fn(async () => undefined),
     }
     const ctx = {
+      on: vi.fn(() => vi.fn()),
       sessionPersistence: { list: vi.fn(async () => []) },
       agentDefaultModel: { currentSelection: vi.fn(() => ({ provider: 'deepseek', model: 'deepseek-chat' })) },
       agentPresets: { defaultId: 'standard', mount: vi.fn(async () => ({ id: 'standard' })) },
@@ -593,7 +612,7 @@ describe('ConversationManager', () => {
       msgtype: 'event',
       event: { eventtype: EventType.TemplateCardEvent, event_key: 'btn-ok', task_id: 'task-1' },
       create_time: 1,
-    }, '确认')
+    }, '确认', noopTransport())
 
     expect(reply).toEqual({ text: '已为你确认。', images: [], cards: [] })
     expect(followedUp).toEqual(expect.objectContaining({
@@ -606,6 +625,76 @@ describe('ConversationManager', () => {
     expect(text).toContain('event_key: btn-ok')
     expect(text).toContain('selected option: 确认')
     expect(text).toContain('template card button click')
+    await manager.dispose()
+  })
+
+  it('streams assistant chunks and tool activity into the turn transport', async () => {
+    const config = testConfig()
+    const listeners: Record<string, unknown> = {}
+    const transport = {
+      pushText: vi.fn(),
+      setActivity: vi.fn(),
+      finish: vi.fn(async () => undefined),
+      fail: vi.fn(async () => undefined),
+    }
+    const message = textMessage('u-stream', 'm-stream', 'stream please')
+    const sessionId = sessionIdFor(config.accountId, message)
+    const events: unknown[] = []
+    const emit = (session: unknown, event: unknown): void => {
+      const listener = listeners['session/event']
+      if (typeof listener === 'function') (listener as (s: unknown, e: unknown) => void)(session, event)
+    }
+    const agent = {
+      status: 'idle',
+      options: { provider: 'deepseek', model: 'deepseek-chat' },
+      session: { events },
+      followup: vi.fn(() => {
+        emit({ id: sessionId }, { type: 'assistant/chunk', data: { chunk: { type: 'text-delta', index: 0, text: 'Hello' } } })
+        emit({ id: sessionId }, { type: 'assistant/chunk', data: { chunk: { type: 'tool-call-delta', index: 0, name: 'bash' } } })
+        emit({ id: sessionId }, { type: 'assistant/chunk', data: { chunk: { type: 'text-delta', index: 0, text: ' world' } } })
+        events.push({
+          type: 'assistant/message',
+          data: { message: { content: [{ type: 'text', text: 'Hello world' }] } },
+        })
+        events.push({ type: 'turn/end', data: { reason: { kind: 'stop' } } })
+      }),
+      whenIdle: vi.fn(async () => undefined),
+    }
+    const ctx = {
+      on: vi.fn((name: string, fn: unknown) => {
+        listeners[name] = fn
+        return vi.fn()
+      }),
+      sessionPersistence: { list: vi.fn(async () => []) },
+      agentDefaultModel: { currentSelection: vi.fn(() => ({ provider: 'deepseek', model: 'deepseek-chat' })) },
+      agentPresets: { defaultId: 'standard', mount: vi.fn(async () => ({ id: 'standard' })) },
+      llm: { resolveModelInfo: vi.fn(async () => ({ inputModalities: ['text'] })) },
+      agents: {
+        create: vi.fn(async (options: { setup?: (ctx: never) => Promise<void> }) => {
+          await options.setup?.(mockAgentCtx(vi.fn(() => vi.fn()), vi.fn(() => vi.fn())))
+          return { agent, dispose: vi.fn(async () => undefined) }
+        }),
+        get: vi.fn(),
+      },
+      attachments: {
+        imageLimits: { maxImagesPerMessage: 4, maxMessageImageBytes: 10_000, maxImageBytes: 10_000 },
+      },
+    } as never
+    const manager = new ConversationManager(
+      ctx,
+      config,
+      vi.fn(async () => undefined),
+      vi.fn(async () => undefined),
+      vi.fn(async () => undefined),
+    )
+    await manager.initialize()
+
+    await manager.process(message, downloadPort, transport)
+
+    expect(transport.pushText).toHaveBeenCalledWith('Hello')
+    expect(transport.setActivity).toHaveBeenCalledWith(expect.stringContaining('bash'))
+    expect(transport.pushText).toHaveBeenCalledWith(' world')
+    expect(transport.finish).toHaveBeenCalledWith(expect.objectContaining({ text: 'Hello world' }))
     await manager.dispose()
   })
 
@@ -641,6 +730,7 @@ describe('ConversationManager', () => {
       return vi.fn()
     })
     const ctx = {
+      on: vi.fn(() => vi.fn()),
       sessionPersistence: { list: vi.fn(async () => []) },
       agentDefaultModel: { currentSelection: vi.fn(() => ({ provider: 'deepseek', model: 'deepseek-chat' })) },
       agentPresets: { defaultId: 'standard', mount: vi.fn(async () => ({ id: 'standard' })) },
@@ -665,7 +755,7 @@ describe('ConversationManager', () => {
     )
     await manager.initialize()
 
-    const processing = manager.process(textMessage('u-ask', 'm-ask', '问我一个问题'), downloadPort)
+    const processing = manager.process(textMessage('u-ask', 'm-ask', '问我一个问题'), downloadPort, noopTransport())
     await vi.waitFor(() => { expect(sentCards).toHaveLength(1) })
     const settled = manager.tryAnswerFromClick({
       msgid: 'ev-ask',

@@ -109,6 +109,7 @@ function commandContext(secret: string | undefined): never {
   const logger = { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() }
   return {
     logger: vi.fn(() => logger),
+    on: vi.fn(() => vi.fn()),
     credentials: { resolve: vi.fn(async () => secret === undefined ? undefined : { value: secret, source: 'test' }) },
     sessionPersistence: { list: vi.fn(async () => []) },
   } as never
@@ -145,6 +146,7 @@ function agentContext(
   }
   return {
     logger: vi.fn(() => logger),
+    on: vi.fn(() => vi.fn()),
     credentials: { resolve: vi.fn(async () => ({ value: 'resolved-secret', source: 'test' })) },
     commands: { execute: executeCommand },
     sessionPersistence: { list: vi.fn(async () => []) },
@@ -250,15 +252,18 @@ describe('WeComHarnessBridge', () => {
     await bridge.stop()
   })
 
-  it('runs an ordinary message through Harness and preserves Markdown plus images', async () => {
+  it('runs an ordinary message through Harness and streams the final Markdown plus images', async () => {
     const client = new FakeClient()
     const bridge = new WeComHarnessBridge(agentContext(), testConfig(), () => client as never)
     await bridge.start()
     await client.message(textMessage('hello model', 'm-model'))
 
-    expect(client.replies).toHaveLength(1)
-    expect(client.replies[0]?.content).toBe('# Model reply\n\n- first\n- second')
-    expect(client.replies[0]?.items).toHaveLength(1)
+    // The stream opens with a thinking frame, then finishes with the reply.
+    expect(client.replies[0]?.content).toBe('正在思考…')
+    expect(client.replies[0]?.finish).toBe(false)
+    const final = client.replies.find(reply => reply.finish !== false)
+    expect(final?.content).toBe('# Model reply\n\n- first\n- second')
+    expect(final?.items).toHaveLength(1)
     await bridge.stop()
   })
 

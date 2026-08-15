@@ -27,6 +27,7 @@ import {
   ConversationManager,
   type ConversationCommandReply,
   type ConversationReply,
+  type TurnTransport,
 } from './conversations.js'
 import type { WeComDownloadPort } from './inbound.js'
 import type { OutboundFile } from './outbound-file.js'
@@ -222,7 +223,7 @@ export class WeComHarnessBridge {
       maxReconnectAttempts: this.config.maxReconnectAttempts,
       maxAuthFailureAttempts: this.config.maxAuthFailureAttempts,
       requestTimeout: this.config.sendTimeoutMs,
-      plug_version: 'deepseek-harness-wecom-plus/0.4.3',
+      plug_version: 'deepseek-harness-wecom-plus/0.5.0',
     })
   }
 
@@ -273,23 +274,18 @@ export class WeComHarnessBridge {
     // A click on a pending ask_user_question card is the ANSWER, not a new
     // user message: settle the question and let the running turn continue.
     if (this.conversations.tryAnswerFromClick(body)) return
+    // Card-click turns have no stream channel in the protocol; the proactive
+    // transport buffers the model's text and delivers one Markdown message.
+    const transport = this.beginProactiveTransport(chatTarget(body))
     try {
-      const reply = await this.conversations.processCardEvent(
+      await this.conversations.processCardEvent(
         body,
         this.conversations.cardLabel(taskId, body.event.event_key),
+        transport,
       )
-      await this.sendProactive(chatTarget(body), reply)
     } catch (error) {
       this.log.error('WeCom card click %s failed: %s', body.msgid, String(error))
-      try {
-        await this.sendProactive(chatTarget(body), {
-          text: '处理按钮点击时发生错误，请稍后重试。',
-          images: [],
-          cards: [],
-        })
-      } catch (sendError) {
-        this.log.error('WeCom card click error reply failed: %s', String(sendError))
-      }
+      await transport.fail('处理按钮点击时发生错误，请稍后重试。')
     }
   }
 
@@ -410,8 +406,15 @@ export class WeComHarnessBridge {
         return
       }
 
-      const reply = await this.conversations.process(message, this.requireClient())
-      await this.sendReply(frame, reply)
+      // Ordinary messages stream the model's reply live through the message
+      // frame; the transport owns the wire, the manager drives the turn.
+      const transport = this.beginMessageTransport(frame)
+      try {
+        await this.conversations.process(message, this.requireClient(), transport)
+      } catch (error) {
+        this.log.error('WeCom message %s failed: %s', message.msgid, String(error))
+        await transport.fail('处理消息时发生错误，请稍后重试。')
+      }
     } catch (error) {
       this.log.error('WeCom message %s failed: %s', message.msgid, String(error))
       try {
@@ -473,6 +476,127 @@ export class WeComHarnessBridge {
     const allow = group ? this.config.groupAllowFrom : this.config.singleAllowFrom
     if (policy === 'disabled') return false
     return policy === 'open' || allow.includes(userid)
+  }
+
+  /**
+   * Live streaming transport for message-initiated turns. The model's text
+   * deltas flow through throttled `replyStream` frames (200ms), a transient
+   * activity line shows tool executions, and finish() sends the final frame
+   * with inline images, then media uploads and queued cards.
+   */
+  private beginMessageTransport(frame: WsFrameHeaders): TurnTransport {
+    const streamId = generateReqId('dsh')
+    let text = ''
+    let activity: string | undefined
+    let timer: ReturnType<typeof setTimeout> | undefined
+    let pending = false
+    let settled = false
+    const content = (): string => truncateUtf8(
+      activity ?? (text || '正在思考…'),
+      this.config.maxReplyBytes,
+      '',
+    )
+    const flush = async (): Promise<void> => {
+      if (settled) return
+      try {
+        await this.retry(async () => withTimeout(
+          this.requireClient().replyStream(frame, streamId, content(), false),
+          this.config.sendTimeoutMs,
+          'WeCom stream update',
+        ))
+      } catch (error) {
+        this.log.warn('WeCom stream update failed: %s', String(error))
+      }
+    }
+    const schedule = (): void => {
+      if (pending || settled) return
+      pending = true
+      timer = setTimeout(() => {
+        pending = false
+        void flush()
+      }, 200)
+    }
+    void flush()
+    return {
+      pushText: (delta) => {
+        if (settled) return
+        activity = undefined
+        text += delta
+        schedule()
+      },
+      setActivity: (line) => {
+        if (settled) return
+        activity = line
+        schedule()
+      },
+      finish: async (reply) => {
+        settled = true
+        if (timer !== undefined) clearTimeout(timer)
+        const inline = reply.images.filter(image =>
+          (image.mediaType === 'image/png' || image.mediaType === 'image/jpeg') && image.data.byteLength <= 10 * 1024 * 1024,
+        ).slice(0, 10)
+        const inlineSet = new Set(inline)
+        const active = reply.images.filter(image => !inlineSet.has(image))
+        const msgItems: ReplyMsgItem[] = inline.map(image => ({
+          msgtype: 'image',
+          image: {
+            base64: Buffer.from(image.data).toString('base64'),
+            md5: createHash('md5').update(image.data).digest('hex'),
+          },
+        }))
+        const fallback = reply.images.length > 0 ? '图片回复' : '处理完成。'
+        await this.retry(async () => withTimeout(
+          this.requireClient().replyStream(
+            frame,
+            streamId,
+            truncateUtf8(reply.text || fallback, this.config.maxReplyBytes, ''),
+            true,
+            msgItems,
+          ),
+          this.config.sendTimeoutMs,
+          'WeCom reply send',
+        ))
+        const target = chatTargetOf(frame)
+        for (const image of active) {
+          const filename = image.name?.trim() || imageFilename(image.mediaType)
+          await this.sendMedia(target, Buffer.from(image.data), 'image', filename, 'WeCom image')
+        }
+        await this.sendCards(target, reply.cards)
+      },
+      fail: async (message) => {
+        if (settled) return
+        settled = true
+        if (timer !== undefined) clearTimeout(timer)
+        await this.retry(async () => withTimeout(
+          this.requireClient().replyStream(frame, streamId, truncateUtf8(message, this.config.maxReplyBytes, ''), true),
+          this.config.sendTimeoutMs,
+          'WeCom failure reply',
+        ))
+      },
+    }
+  }
+
+  /**
+   * Buffering transport for card-click turns: the protocol gives event frames
+   * no stream channel, so the model's text accumulates and one Markdown
+   * message (plus media and cards) goes out at finish.
+   */
+  private beginProactiveTransport(target: string): TurnTransport {
+    let settled = false
+    return {
+      pushText: () => {},
+      setActivity: () => {},
+      finish: async (reply) => {
+        if (settled) return
+        settled = true
+        await this.sendProactive(target, reply)
+      },
+      fail: async (message) => {
+        if (settled) return
+        settled = true
+        await this.sendProactive(target, { text: message, images: [], cards: [] })
+      },
+    }
   }
 
   private async sendReply(frame: WsFrame<BaseMessage>, reply: ConversationReply): Promise<void> {
@@ -621,4 +745,11 @@ function imageFilename(mediaType: string): string {
   if (mediaType === 'image/gif') return 'image.gif'
   if (mediaType === 'image/webp') return 'image.webp'
   return 'image.png'
+}
+
+/** Outbound target of one stream frame's message body. */
+function chatTargetOf(frame: WsFrameHeaders): string {
+  const body = (frame as { body?: BaseMessage }).body
+  if (body === undefined) throw new Error('WeCom stream frame has no message body')
+  return chatTarget(body)
 }

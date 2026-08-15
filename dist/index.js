@@ -841,6 +841,24 @@ var ConversationManager = class {
     this.config = config;
     this.sendFile = sendFile;
     this.questions = new WeComQuestionBridge(config, sendQuestionCard, sendQuestionText);
+    this.disposeSessionEvents = ctx.on("session/event", (session, event) => {
+      const active = this.activeStreams.get(String(session.id));
+      if (active === void 0) return;
+      if (event.type === "step/start") {
+        active.text = "";
+        active.activity = void 0;
+        return;
+      }
+      if (event.type !== "assistant/chunk") return;
+      const chunk = event.data.chunk;
+      if (chunk.type === "text-delta") {
+        active.activity = void 0;
+        active.text += chunk.text;
+        active.transport.pushText(chunk.text);
+      } else if (chunk.type === "tool-call-delta" && chunk.name !== void 0) {
+        active.transport.setActivity(`\u6B63\u5728\u6267\u884C\u5DE5\u5177 \`${chunk.name}\`\u2026`);
+      }
+    });
   }
   ctx;
   config;
@@ -849,25 +867,27 @@ var ConversationManager = class {
   creations = /* @__PURE__ */ new Map();
   queues = /* @__PURE__ */ new Map();
   activeTurns = /* @__PURE__ */ new Map();
+  activeStreams = /* @__PURE__ */ new Map();
   pendingCards = /* @__PURE__ */ new Map();
   cardLabels = /* @__PURE__ */ new Map();
   questions;
   generations = /* @__PURE__ */ new Map();
   persistedIds = /* @__PURE__ */ new Set();
+  disposeSessionEvents;
   /** Snapshot persisted identities once before accepting traffic. */
   async initialize() {
     const headers = await this.ctx.sessionPersistence.list();
     this.persistedIds = new Set(headers.map((header) => String(header.id)));
   }
   /** Process one inbound message after earlier work in the same WeCom conversation. */
-  process(message, client) {
+  process(message, client, transport) {
     const baseId = sessionIdFor(this.config.accountId, message);
-    return this.enqueue(baseId, () => this.processNow(this.currentSessionId(baseId), message, client));
+    return this.enqueue(baseId, () => this.processNow(this.currentSessionId(baseId), message, client, transport));
   }
   /** Process one template card button click as a user message into the same conversation. */
-  processCardEvent(message, selectedLabel) {
+  processCardEvent(message, selectedLabel, transport) {
     const baseId = sessionIdFor(this.config.accountId, message);
-    return this.enqueue(baseId, () => this.processCardEventNow(this.currentSessionId(baseId), message, selectedLabel));
+    return this.enqueue(baseId, () => this.processCardEventNow(this.currentSessionId(baseId), message, selectedLabel, transport));
   }
   /**
    * Resolve one card click back to the visible option label the card carried.
@@ -969,9 +989,11 @@ var ConversationManager = class {
   async dispose() {
     await Promise.allSettled(this.queues.values());
     await Promise.allSettled([...this.bindings.values()].map((binding) => binding.release()));
+    this.disposeSessionEvents();
     this.questions.dispose();
     this.bindings.clear();
     this.activeTurns.clear();
+    this.activeStreams.clear();
     this.pendingCards.clear();
     this.cardLabels.clear();
   }
@@ -1003,23 +1025,38 @@ var ConversationManager = class {
     this.generations.set(baseId, generation);
     return generation;
   }
-  async processNow(id, message, client) {
+  async processNow(id, message, client, transport) {
     const binding = await this.getOrCreate(id);
     const agent = binding.agent;
     const content = await inboundContent(this.ctx, this.config, client, message, await this.includeImages(agent));
     await withTimeout(agent.whenIdle(), this.config.responseTimeoutMs, "DeepSeek Harness conversation availability");
     const start = agent.session.events.length;
     this.activeTurns.set(id, chatTarget(message));
+    const stream = { transport, text: "", activity: void 0 };
+    this.activeStreams.set(id, stream);
     try {
       agent.followup(createUserMessage({ content, source: { kind: "user" } }));
-      await withTimeout(agent.whenIdle(), this.config.responseTimeoutMs, "DeepSeek Harness response");
+      try {
+        await withTimeout(agent.whenIdle(), this.config.responseTimeoutMs, "DeepSeek Harness response");
+      } catch (error) {
+        agent.cancel({ kind: "user" });
+        await agent.whenIdle();
+        await transport.fail("\u5904\u7406\u8D85\u65F6\uFF0C\u5DF2\u53D6\u6D88\u672C\u6B21\u751F\u6210\uFF0C\u8BF7\u91CD\u65B0\u53D1\u9001\u3002");
+        throw error;
+      }
       const collected = await this.collectReply(agent, agent.session.events.slice(start));
-      return this.finalizeReply(id, collected);
+      const reply = this.finalizeReply(id, {
+        text: stream.text.trim() || collected.text,
+        images: collected.images
+      });
+      await transport.finish(reply);
+      return reply;
     } finally {
+      this.activeStreams.delete(id);
       this.activeTurns.delete(id);
     }
   }
-  async processCardEventNow(id, message, selectedLabel) {
+  async processCardEventNow(id, message, selectedLabel, transport) {
     const binding = await this.getOrCreate(id);
     const agent = binding.agent;
     const scope = message.chattype === "group" ? "WeCom group" : "WeCom private chat";
@@ -1039,12 +1076,27 @@ var ConversationManager = class {
     await withTimeout(agent.whenIdle(), this.config.responseTimeoutMs, "DeepSeek Harness conversation availability");
     const start = agent.session.events.length;
     this.activeTurns.set(id, chatTarget(message));
+    const stream = { transport, text: "", activity: void 0 };
+    this.activeStreams.set(id, stream);
     try {
       agent.followup(createUserMessage({ content, source: { kind: "user" } }));
-      await withTimeout(agent.whenIdle(), this.config.responseTimeoutMs, "DeepSeek Harness response");
+      try {
+        await withTimeout(agent.whenIdle(), this.config.responseTimeoutMs, "DeepSeek Harness response");
+      } catch (error) {
+        agent.cancel({ kind: "user" });
+        await agent.whenIdle();
+        await transport.fail("\u5904\u7406\u8D85\u65F6\uFF0C\u5DF2\u53D6\u6D88\u672C\u6B21\u751F\u6210\uFF0C\u8BF7\u91CD\u65B0\u53D1\u9001\u3002");
+        throw error;
+      }
       const collected = await this.collectReply(agent, agent.session.events.slice(start));
-      return this.finalizeReply(id, collected);
+      const reply = this.finalizeReply(id, {
+        text: stream.text.trim() || collected.text,
+        images: collected.images
+      });
+      await transport.finish(reply);
+      return reply;
     } finally {
+      this.activeStreams.delete(id);
       this.activeTurns.delete(id);
     }
   }
@@ -1675,7 +1727,7 @@ var WeComHarnessBridge = class {
       maxReconnectAttempts: this.config.maxReconnectAttempts,
       maxAuthFailureAttempts: this.config.maxAuthFailureAttempts,
       requestTimeout: this.config.sendTimeoutMs,
-      plug_version: "deepseek-harness-wecom-plus/0.4.3"
+      plug_version: "deepseek-harness-wecom-plus/0.5.0"
     });
   }
   async handleWelcome(frame) {
@@ -1718,23 +1770,16 @@ var WeComHarnessBridge = class {
       }
     }
     if (this.conversations.tryAnswerFromClick(body)) return;
+    const transport = this.beginProactiveTransport(chatTarget(body));
     try {
-      const reply = await this.conversations.processCardEvent(
+      await this.conversations.processCardEvent(
         body,
-        this.conversations.cardLabel(taskId, body.event.event_key)
+        this.conversations.cardLabel(taskId, body.event.event_key),
+        transport
       );
-      await this.sendProactive(chatTarget(body), reply);
     } catch (error) {
       this.log.error("WeCom card click %s failed: %s", body.msgid, String(error));
-      try {
-        await this.sendProactive(chatTarget(body), {
-          text: "\u5904\u7406\u6309\u94AE\u70B9\u51FB\u65F6\u53D1\u751F\u9519\u8BEF\uFF0C\u8BF7\u7A0D\u540E\u91CD\u8BD5\u3002",
-          images: [],
-          cards: []
-        });
-      } catch (sendError) {
-        this.log.error("WeCom card click error reply failed: %s", String(sendError));
-      }
+      await transport.fail("\u5904\u7406\u6309\u94AE\u70B9\u51FB\u65F6\u53D1\u751F\u9519\u8BEF\uFF0C\u8BF7\u7A0D\u540E\u91CD\u8BD5\u3002");
     }
   }
   async handleMessage(frame) {
@@ -1850,8 +1895,13 @@ var WeComHarnessBridge = class {
         });
         return;
       }
-      const reply = await this.conversations.process(message, this.requireClient());
-      await this.sendReply(frame, reply);
+      const transport = this.beginMessageTransport(frame);
+      try {
+        await this.conversations.process(message, this.requireClient(), transport);
+      } catch (error) {
+        this.log.error("WeCom message %s failed: %s", message.msgid, String(error));
+        await transport.fail("\u5904\u7406\u6D88\u606F\u65F6\u53D1\u751F\u9519\u8BEF\uFF0C\u8BF7\u7A0D\u540E\u91CD\u8BD5\u3002");
+      }
     } catch (error) {
       this.log.error("WeCom message %s failed: %s", message.msgid, String(error));
       try {
@@ -1909,6 +1959,127 @@ ${outcome.response.text}` : direct;
     const allow = group ? this.config.groupAllowFrom : this.config.singleAllowFrom;
     if (policy === "disabled") return false;
     return policy === "open" || allow.includes(userid);
+  }
+  /**
+   * Live streaming transport for message-initiated turns. The model's text
+   * deltas flow through throttled `replyStream` frames (200ms), a transient
+   * activity line shows tool executions, and finish() sends the final frame
+   * with inline images, then media uploads and queued cards.
+   */
+  beginMessageTransport(frame) {
+    const streamId = generateReqId("dsh");
+    let text = "";
+    let activity;
+    let timer;
+    let pending = false;
+    let settled = false;
+    const content = () => truncateUtf8(
+      activity ?? (text || "\u6B63\u5728\u601D\u8003\u2026"),
+      this.config.maxReplyBytes,
+      ""
+    );
+    const flush = async () => {
+      if (settled) return;
+      try {
+        await this.retry(async () => withTimeout(
+          this.requireClient().replyStream(frame, streamId, content(), false),
+          this.config.sendTimeoutMs,
+          "WeCom stream update"
+        ));
+      } catch (error) {
+        this.log.warn("WeCom stream update failed: %s", String(error));
+      }
+    };
+    const schedule = () => {
+      if (pending || settled) return;
+      pending = true;
+      timer = setTimeout(() => {
+        pending = false;
+        void flush();
+      }, 200);
+    };
+    void flush();
+    return {
+      pushText: (delta) => {
+        if (settled) return;
+        activity = void 0;
+        text += delta;
+        schedule();
+      },
+      setActivity: (line) => {
+        if (settled) return;
+        activity = line;
+        schedule();
+      },
+      finish: async (reply) => {
+        settled = true;
+        if (timer !== void 0) clearTimeout(timer);
+        const inline = reply.images.filter(
+          (image) => (image.mediaType === "image/png" || image.mediaType === "image/jpeg") && image.data.byteLength <= 10 * 1024 * 1024
+        ).slice(0, 10);
+        const inlineSet = new Set(inline);
+        const active = reply.images.filter((image) => !inlineSet.has(image));
+        const msgItems = inline.map((image) => ({
+          msgtype: "image",
+          image: {
+            base64: Buffer.from(image.data).toString("base64"),
+            md5: createHash3("md5").update(image.data).digest("hex")
+          }
+        }));
+        const fallback = reply.images.length > 0 ? "\u56FE\u7247\u56DE\u590D" : "\u5904\u7406\u5B8C\u6210\u3002";
+        await this.retry(async () => withTimeout(
+          this.requireClient().replyStream(
+            frame,
+            streamId,
+            truncateUtf8(reply.text || fallback, this.config.maxReplyBytes, ""),
+            true,
+            msgItems
+          ),
+          this.config.sendTimeoutMs,
+          "WeCom reply send"
+        ));
+        const target = chatTargetOf(frame);
+        for (const image of active) {
+          const filename = image.name?.trim() || imageFilename(image.mediaType);
+          await this.sendMedia(target, Buffer.from(image.data), "image", filename, "WeCom image");
+        }
+        await this.sendCards(target, reply.cards);
+      },
+      fail: async (message) => {
+        if (settled) return;
+        settled = true;
+        if (timer !== void 0) clearTimeout(timer);
+        await this.retry(async () => withTimeout(
+          this.requireClient().replyStream(frame, streamId, truncateUtf8(message, this.config.maxReplyBytes, ""), true),
+          this.config.sendTimeoutMs,
+          "WeCom failure reply"
+        ));
+      }
+    };
+  }
+  /**
+   * Buffering transport for card-click turns: the protocol gives event frames
+   * no stream channel, so the model's text accumulates and one Markdown
+   * message (plus media and cards) goes out at finish.
+   */
+  beginProactiveTransport(target) {
+    let settled = false;
+    return {
+      pushText: () => {
+      },
+      setActivity: () => {
+      },
+      finish: async (reply) => {
+        if (settled) return;
+        settled = true;
+        await this.sendProactive(target, reply);
+      },
+      fail: async (message) => {
+        if (settled) return;
+        settled = true;
+        await this.sendProactive(target, { text: message, images: [], cards: [] });
+      }
+    };
   }
   async sendReply(frame, reply) {
     const message = frame.body;
@@ -2036,6 +2207,11 @@ function imageFilename(mediaType) {
   if (mediaType === "image/webp") return "image.webp";
   return "image.png";
 }
+function chatTargetOf(frame) {
+  const body = frame.body;
+  if (body === void 0) throw new Error("WeCom stream frame has no message body");
+  return chatTarget(body);
+}
 
 // src/config.ts
 import { tmpdir } from "os";
@@ -2094,7 +2270,7 @@ import {
 } from "@deepseek-ai/dsh-settings";
 
 // src/version.ts
-var PLUGIN_VERSION = "0.4.3";
+var PLUGIN_VERSION = "0.5.0";
 
 // src/settings-web.ts
 var SETTINGS_ROUTE = "/_dsh/deepseek-harness-wecom-plus/settings";

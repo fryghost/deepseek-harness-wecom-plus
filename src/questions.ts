@@ -65,6 +65,20 @@ export class WeComQuestionBridge {
   }
 
   /**
+   * Peek at one click without settling: when it targets a pending button
+   * question, return the clicked option's visible label so the bridge can
+   * acknowledge the click on the card itself inside the 5-second window.
+   */
+  questionLabel(message: EventMessageWith<TemplateCardEventData>): string | undefined {
+    const target = chatTarget(message)
+    const pending = this.pending.get(target)
+    if (pending === undefined || pending.mode !== 'buttons') return undefined
+    const key = message.event.event_key
+    if (key === undefined || message.event.task_id !== pending.taskId) return undefined
+    return pending.byKey?.get(key)
+  }
+
+  /**
    * Settle a pending question with a card button click. Returns true when the
    * click belonged to a pending question (the bridge must not start a model
    * turn for it), false otherwise.

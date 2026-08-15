@@ -222,7 +222,7 @@ export class WeComHarnessBridge {
       maxReconnectAttempts: this.config.maxReconnectAttempts,
       maxAuthFailureAttempts: this.config.maxAuthFailureAttempts,
       requestTimeout: this.config.sendTimeoutMs,
-      plug_version: 'deepseek-harness-wecom-plus/0.4.2',
+      plug_version: 'deepseek-harness-wecom-plus/0.4.3',
     })
   }
 
@@ -251,15 +251,17 @@ export class WeComHarnessBridge {
     const body = frame.body
     if (body === undefined || this.seen.hasOrAdd(body.msgid) || !this.allowedEvent(body)) return
     const taskId = body.event.task_id?.trim()
-    // A click on a pending ask_user_question card is the ANSWER, not a new
-    // user message: settle the question and let the running turn continue.
-    if (this.conversations.tryAnswerFromClick(body)) return
+    // The clicked option's label for a pending question, resolved without
+    // settling so the acknowledgement below can name the choice.
+    const questionLabel = this.conversations.pendingQuestionLabel(body)
     if (taskId !== undefined && taskId.length > 0) {
       try {
         await withTimeout(this.requireClient().updateTemplateCard(frame, {
           card_type: 'text_notice',
           main_title: {
-            title: truncateChars(this.config.cardClickAckTitle, CARD_LIMITS.title),
+            title: questionLabel === undefined
+              ? truncateChars(this.config.cardClickAckTitle, CARD_LIMITS.title)
+              : truncateChars(`已选择「${questionLabel}」`, CARD_LIMITS.title),
             desc: truncateChars(this.config.cardClickAckSubtitle, CARD_LIMITS.titleDesc),
           },
           task_id: taskId,
@@ -268,6 +270,9 @@ export class WeComHarnessBridge {
         this.log.warn('WeCom card click acknowledgement failed: %s', String(error))
       }
     }
+    // A click on a pending ask_user_question card is the ANSWER, not a new
+    // user message: settle the question and let the running turn continue.
+    if (this.conversations.tryAnswerFromClick(body)) return
     try {
       const reply = await this.conversations.processCardEvent(
         body,
@@ -361,9 +366,20 @@ export class WeComHarnessBridge {
         return
       }
       // While an ask_user_question is open, the user's reply IS the answer:
-      // settle the question and let the running turn continue instead of
-      // starting a new one.
-      if (this.conversations.tryAnswerFromText(message)) return
+      // settle the question, acknowledge the answer immediately, and let the
+      // running turn continue instead of starting a new one.
+      if (this.conversations.tryAnswerFromText(message)) {
+        try {
+          await this.sendProactive(chatTarget(message), {
+            text: '已收到你的回答，正在处理…',
+            images: [],
+            cards: [],
+          })
+        } catch (error) {
+          this.log.warn('WeCom question answer acknowledgement failed: %s', String(error))
+        }
+        return
+      }
       if (command?.name === 'bot-status') {
         await this.sendReply(frame, {
           text: '企微长连接正常，DeepSeek Harness 会话按单聊/群聊独立持久化。',

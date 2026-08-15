@@ -672,6 +672,19 @@ var WeComQuestionBridge = class {
     return { answers };
   }
   /**
+   * Peek at one click without settling: when it targets a pending button
+   * question, return the clicked option's visible label so the bridge can
+   * acknowledge the click on the card itself inside the 5-second window.
+   */
+  questionLabel(message) {
+    const target = chatTarget(message);
+    const pending = this.pending.get(target);
+    if (pending === void 0 || pending.mode !== "buttons") return void 0;
+    const key = message.event.event_key;
+    if (key === void 0 || message.event.task_id !== pending.taskId) return void 0;
+    return pending.byKey?.get(key);
+  }
+  /**
    * Settle a pending question with a card button click. Returns true when the
    * click belonged to a pending question (the bridge must not start a model
    * turn for it), false otherwise.
@@ -866,6 +879,13 @@ var ConversationManager = class {
       return void 0;
     }
     return this.cardLabels.get(taskId)?.get(eventKey);
+  }
+  /**
+   * Peek at one click without settling: when it targets a pending button
+   * question, return the clicked option's visible label.
+   */
+  pendingQuestionLabel(message) {
+    return this.questions.questionLabel(message);
   }
   /**
    * Settle a pending ask_user_question with a card button click. Returns true
@@ -1655,7 +1675,7 @@ var WeComHarnessBridge = class {
       maxReconnectAttempts: this.config.maxReconnectAttempts,
       maxAuthFailureAttempts: this.config.maxAuthFailureAttempts,
       requestTimeout: this.config.sendTimeoutMs,
-      plug_version: "deepseek-harness-wecom-plus/0.4.2"
+      plug_version: "deepseek-harness-wecom-plus/0.4.3"
     });
   }
   async handleWelcome(frame) {
@@ -1682,13 +1702,13 @@ var WeComHarnessBridge = class {
     const body = frame.body;
     if (body === void 0 || this.seen.hasOrAdd(body.msgid) || !this.allowedEvent(body)) return;
     const taskId = body.event.task_id?.trim();
-    if (this.conversations.tryAnswerFromClick(body)) return;
+    const questionLabel = this.conversations.pendingQuestionLabel(body);
     if (taskId !== void 0 && taskId.length > 0) {
       try {
         await withTimeout(this.requireClient().updateTemplateCard(frame, {
           card_type: "text_notice",
           main_title: {
-            title: truncateChars(this.config.cardClickAckTitle, CARD_LIMITS.title),
+            title: questionLabel === void 0 ? truncateChars(this.config.cardClickAckTitle, CARD_LIMITS.title) : truncateChars(`\u5DF2\u9009\u62E9\u300C${questionLabel}\u300D`, CARD_LIMITS.title),
             desc: truncateChars(this.config.cardClickAckSubtitle, CARD_LIMITS.titleDesc)
           },
           task_id: taskId
@@ -1697,6 +1717,7 @@ var WeComHarnessBridge = class {
         this.log.warn("WeCom card click acknowledgement failed: %s", String(error));
       }
     }
+    if (this.conversations.tryAnswerFromClick(body)) return;
     try {
       const reply = await this.conversations.processCardEvent(
         body,
@@ -1788,7 +1809,18 @@ var WeComHarnessBridge = class {
         });
         return;
       }
-      if (this.conversations.tryAnswerFromText(message)) return;
+      if (this.conversations.tryAnswerFromText(message)) {
+        try {
+          await this.sendProactive(chatTarget(message), {
+            text: "\u5DF2\u6536\u5230\u4F60\u7684\u56DE\u7B54\uFF0C\u6B63\u5728\u5904\u7406\u2026",
+            images: [],
+            cards: []
+          });
+        } catch (error) {
+          this.log.warn("WeCom question answer acknowledgement failed: %s", String(error));
+        }
+        return;
+      }
       if (command?.name === "bot-status") {
         await this.sendReply(frame, {
           text: "\u4F01\u5FAE\u957F\u8FDE\u63A5\u6B63\u5E38\uFF0CDeepSeek Harness \u4F1A\u8BDD\u6309\u5355\u804A/\u7FA4\u804A\u72EC\u7ACB\u6301\u4E45\u5316\u3002",
@@ -2062,7 +2094,7 @@ import {
 } from "@deepseek-ai/dsh-settings";
 
 // src/version.ts
-var PLUGIN_VERSION = "0.4.2";
+var PLUGIN_VERSION = "0.4.3";
 
 // src/settings-web.ts
 var SETTINGS_ROUTE = "/_dsh/deepseek-harness-wecom-plus/settings";

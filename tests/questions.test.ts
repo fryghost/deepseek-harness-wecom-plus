@@ -165,6 +165,20 @@ describe('WeComQuestionBridge', () => {
     })
   })
 
+  it('peeks the clicked option label without settling the question', async () => {
+    const { instance, cards } = bridge()
+    const asking = instance.present({
+      questions: [{ id: 'q11', question: '选择', options: [{ label: '甲' }, { label: '乙' }] }],
+    }, 'u1')
+    await vi.waitFor(() => { expect(cards).toHaveLength(1) })
+    expect(instance.questionLabel(clickEvent(cards[0]?.task_id, 'q-opt-1'))).toBe('甲')
+    expect(instance.questionLabel(clickEvent(cards[0]?.task_id, 'unknown'))).toBeUndefined()
+    // The peek settled nothing: the question is still open for a text answer.
+    expect(instance.tryAnswerFromText(textMessage('乙'))).toBe(true)
+    await expect(asking).resolves.toEqual({ answers: [{ id: 'q11', selected: ['乙'] }] })
+    expect(instance.questionLabel(clickEvent(cards[0]?.task_id, 'q-opt-1'))).toBeUndefined()
+  })
+
   it('rejects every open question on dispose', async () => {
     const { instance } = bridge()
     const asking = instance.present({

@@ -108,6 +108,14 @@ export class ConversationManager {
   }
 
   /**
+   * Peek at one click without settling: when it targets a pending button
+   * question, return the clicked option's visible label.
+   */
+  pendingQuestionLabel(message: EventMessageWith<TemplateCardEventData>): string | undefined {
+    return this.questions.questionLabel(message)
+  }
+
+  /**
    * Settle a pending ask_user_question with a card button click. Returns true
    * when the click belonged to a pending question (the bridge must not start
    * a model turn for it), false otherwise.

@@ -165,6 +165,18 @@ describe('WeComQuestionBridge', () => {
     })
   })
 
+  it('sends only the card for a short button question with no extra explanations', async () => {
+    const { instance, cards, texts } = bridge()
+    const asking = instance.present({
+      questions: [{ id: 'q14', question: '请选择', options: [{ label: '继续' }, { label: '取消' }] }],
+    }, 'u1')
+    await vi.waitFor(() => { expect(cards).toHaveLength(1) })
+    expect(cards[0]?.card_type).toBe('button_interaction')
+    expect(texts).toEqual([])
+    expect(instance.tryAnswerFromClick(clickEvent(cards[0]?.task_id, 'q-opt-1'))).toBe(true)
+    await expect(asking).resolves.toEqual({ answers: [{ id: 'q14', selected: ['继续'] }] })
+  })
+
   it('falls back to numbered text mode when any option label is too long for a button', async () => {
     const { instance, cards } = bridge()
     const asking = instance.present({

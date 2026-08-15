@@ -743,11 +743,14 @@ var WeComQuestionBridge = class {
     }
     this.pending.clear();
   }
-  /** Ask one question: Markdown carries the full text, the card carries the interaction surface. */
+  /** Ask one question: the card carries the question, the Markdown only carries what does not fit. */
   askOne(target, question, signal) {
     const options = question.options ?? [];
     const buttons = options.length >= 2 && options.length <= 6 && question.multiSelect !== true && options.every((option) => option.label.length <= BUTTON_LABEL_MAX_CHARS);
-    void this.sendText(target, questionMarkdown(question)).then(void 0, () => void 0);
+    const needsExplanation = !buttons || (question.detail?.trim().length ?? 0) > 0 || options.some((option) => (option.description?.trim().length ?? 0) > 0) || question.question.length > CARD_LIMITS.title;
+    if (needsExplanation) {
+      void this.sendText(target, questionMarkdown(question, buttons)).then(void 0, () => void 0);
+    }
     const mode = buttons ? "buttons" : "text";
     return new Promise((resolve2, reject) => {
       const timer = setTimeout(() => {
@@ -838,7 +841,7 @@ function parseQuestionReply(question, text) {
   }
   return { id, selected: [], custom: normalized };
 }
-function questionMarkdown(question) {
+function questionMarkdown(question, buttons) {
   const lines = [
     question.header === void 0 ? null : `### ${question.header}`,
     question.question,
@@ -849,7 +852,7 @@ ${question.detail}`
   if (options.length > 0) {
     lines.push("", "**\u9009\u9879**", options.map((option, index) => option.description === void 0 || option.description.trim().length === 0 ? `${index + 1}. ${option.label}` : `${index + 1}. ${option.label} \u2014 ${option.description}`).join("\n"));
   }
-  lines.push("", "\u4F60\u53EF\u4EE5\u70B9\u51FB\u5361\u7247\u6309\u94AE\uFF0C\u6216\u76F4\u63A5\u56DE\u590D\u6570\u5B57\uFF08\u591A\u9009\u7528\u9017\u53F7\u5206\u9694\uFF0C\u5982 1,3\uFF09\u3002");
+  lines.push("", buttons ? "\u70B9\u51FB\u5361\u7247\u6309\u94AE\uFF0C\u6216\u76F4\u63A5\u56DE\u590D\u6570\u5B57\u4F5C\u7B54\u3002" : question.multiSelect === true ? "\u76F4\u63A5\u56DE\u590D\u6570\u5B57\u591A\u9009\uFF08\u5982 1,3\uFF09\u6216\u9009\u9879\u540D\u79F0\u3002" : "\u76F4\u63A5\u56DE\u590D\u6570\u5B57\u6216\u9009\u9879\u540D\u79F0\u3002");
   return lines.join("\n");
 }
 
@@ -1748,7 +1751,7 @@ var WeComHarnessBridge = class {
       maxReconnectAttempts: this.config.maxReconnectAttempts,
       maxAuthFailureAttempts: this.config.maxAuthFailureAttempts,
       requestTimeout: this.config.sendTimeoutMs,
-      plug_version: "deepseek-harness-wecom-plus/0.5.5"
+      plug_version: "deepseek-harness-wecom-plus/0.5.6"
     });
   }
   async handleWelcome(frame) {
@@ -1811,15 +1814,6 @@ var WeComHarnessBridge = class {
       }
     }
     if (answered) {
-      try {
-        await this.sendProactive(chatTarget(body), {
-          text: questionLabel === void 0 ? "\u5DF2\u6536\u5230\u4F60\u7684\u9009\u62E9\uFF0C\u6B63\u5728\u751F\u6210\u56DE\u590D\u2026" : `\u5DF2\u6536\u5230\u4F60\u7684\u9009\u62E9\u300C${questionLabel}\u300D\uFF0C\u6B63\u5728\u751F\u6210\u56DE\u590D\u2026`,
-          images: [],
-          cards: []
-        });
-      } catch (error) {
-        this.log.warn("WeCom question click acknowledgement failed: %s", String(error));
-      }
       return;
     }
     const transport = this.beginProactiveTransport(chatTarget(body));
@@ -2350,7 +2344,7 @@ import {
 } from "@deepseek-ai/dsh-settings";
 
 // src/version.ts
-var PLUGIN_VERSION = "0.5.5";
+var PLUGIN_VERSION = "0.5.6";
 
 // src/settings-web.ts
 var SETTINGS_ROUTE = "/_dsh/deepseek-harness-wecom-plus/settings";

@@ -224,7 +224,7 @@ export class WeComHarnessBridge {
       maxReconnectAttempts: this.config.maxReconnectAttempts,
       maxAuthFailureAttempts: this.config.maxAuthFailureAttempts,
       requestTimeout: this.config.sendTimeoutMs,
-      plug_version: 'deepseek-harness-wecom-plus/0.5.5',
+      plug_version: 'deepseek-harness-wecom-plus/0.5.6',
     })
   }
 
@@ -296,17 +296,8 @@ export class WeComHarnessBridge {
       }
     }
     if (answered) {
-      // Immediate feedback beyond the card update: the model's reply takes
-      // time, so say so now — even if the stream channel were wedged.
-      try {
-        await this.sendProactive(chatTarget(body), {
-          text: questionLabel === undefined ? '已收到你的选择，正在生成回复…' : `已收到你的选择「${questionLabel}」，正在生成回复…`,
-          images: [],
-          cards: [],
-        })
-      } catch (error) {
-        this.log.warn('WeCom question click acknowledgement failed: %s', String(error))
-      }
+      // The in-place card update above already confirms the choice; no extra
+      // status message, so the conversation stays clean.
       return
     }
     // Card-click turns have no stream channel in the protocol; the proactive

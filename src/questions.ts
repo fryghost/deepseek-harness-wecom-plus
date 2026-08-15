@@ -18,7 +18,7 @@ import {
   type AskUserQuestionRequest,
 } from '@deepseek-ai/dsh-user-questions'
 import type { BaseMessage, EventMessageWith, TemplateCard, TemplateCardEventData } from '@wecom/aibot-node-sdk'
-import { buildTemplateCard } from './card.js'
+import { buildTemplateCard, CARD_LIMITS } from './card.js'
 import type { Config } from './config.js'
 import { chatTarget } from './util.js'
 
@@ -158,7 +158,7 @@ export class WeComQuestionBridge {
     this.pending.clear()
   }
 
-  /** Ask one question: Markdown carries the full text, the card carries the interaction surface. */
+  /** Ask one question: the card carries the question, the Markdown only carries what does not fit. */
   private askOne(
     target: string,
     question: AskUserQuestionItem,
@@ -171,7 +171,16 @@ export class WeComQuestionBridge {
     const buttons = options.length >= 2 && options.length <= 6
       && question.multiSelect !== true
       && options.every(option => option.label.length <= BUTTON_LABEL_MAX_CHARS)
-    void this.sendText(target, questionMarkdown(question)).then(undefined, () => undefined)
+    // A Markdown message duplicates the card unless something needs the room:
+    // numbered answers (text mode), option descriptions, extra detail, or a
+    // question that exceeds the card title.
+    const needsExplanation = !buttons
+      || (question.detail?.trim().length ?? 0) > 0
+      || options.some(option => (option.description?.trim().length ?? 0) > 0)
+      || question.question.length > CARD_LIMITS.title
+    if (needsExplanation) {
+      void this.sendText(target, questionMarkdown(question, buttons)).then(undefined, () => undefined)
+    }
     const mode: PendingQuestion['mode'] = buttons ? 'buttons' : 'text'
     return new Promise<AskUserQuestionAnswerItem>((resolve, reject) => {
       const timer = setTimeout(() => {
@@ -283,8 +292,8 @@ function parseQuestionReply(question: AskUserQuestionItem, text: string): AskUse
   return { id, selected: [], custom: normalized }
 }
 
-/** Markdown presentation of one question: the full text lives here, the card only carries the surface. */
-function questionMarkdown(question: AskUserQuestionItem): string {
+/** Markdown explanation of one question: only the text that does not fit the card. */
+function questionMarkdown(question: AskUserQuestionItem, buttons: boolean): string {
   const lines = [
     question.header === undefined ? null : `### ${question.header}`,
     question.question,
@@ -297,6 +306,10 @@ function questionMarkdown(question: AskUserQuestionItem): string {
         ? `${index + 1}. ${option.label}`
         : `${index + 1}. ${option.label} — ${option.description}`).join('\n'))
   }
-  lines.push('', '你可以点击卡片按钮，或直接回复数字（多选用逗号分隔，如 1,3）。')
+  lines.push('', buttons
+    ? '点击卡片按钮，或直接回复数字作答。'
+    : question.multiSelect === true
+      ? '直接回复数字多选（如 1,3）或选项名称。'
+      : '直接回复数字或选项名称。')
   return lines.join('\n')
 }

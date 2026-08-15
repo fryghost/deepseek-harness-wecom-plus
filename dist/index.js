@@ -362,8 +362,7 @@ import { createUserMessage } from "@deepseek-ai/dsh-llm";
 import { SessionId } from "@deepseek-ai/dsh-session";
 import { defineTool } from "@deepseek-ai/dsh-tools";
 import {
-  UserQuestionError as UserQuestionError2,
-  UserQuestionService
+  UserQuestionError as UserQuestionError2
 } from "@deepseek-ai/dsh-user-questions";
 
 // src/inbound-file.ts
@@ -815,7 +814,7 @@ ${question.detail}`
   ].filter((line) => line !== null);
   const options = question.options ?? [];
   if (options.length > 0) {
-    lines.push("", "**\u9009\u9879**", options.map((option, index) => `${index + 1}. ${option.label}`).join("\n"));
+    lines.push("", "**\u9009\u9879**", options.map((option, index) => option.description === void 0 || option.description.trim().length === 0 ? `${index + 1}. ${option.label}` : `${index + 1}. ${option.label} \u2014 ${option.description}`).join("\n"));
   }
   lines.push("", "\u4F60\u53EF\u4EE5\u70B9\u51FB\u5361\u7247\u6309\u94AE\uFF0C\u6216\u76F4\u63A5\u56DE\u590D\u6570\u5B57\uFF08\u591A\u9009\u7528\u9017\u53F7\u5206\u9694\uFF0C\u5982 1,3\uFF09\u3002");
   return lines.join("\n");
@@ -1146,7 +1145,7 @@ var ConversationManager = class {
     const disposeInstructions = this.registerWeComInstructions(agent.ctx, id);
     const disposeFileTool = this.registerFileTool(agent.ctx, id);
     const disposeCardTool = this.registerCardTool(agent.ctx, id);
-    const disposeQuestions = this.registerQuestionBridge(agent.ctx, id);
+    const disposeQuestions = this.registerAskTool(agent.ctx, id);
     let released = false;
     return {
       agent,
@@ -1168,18 +1167,76 @@ var ConversationManager = class {
     this.registerWeComInstructions(agentCtx, id);
     this.registerFileTool(agentCtx, id);
     this.registerCardTool(agentCtx, id);
-    this.registerQuestionBridge(agentCtx, id);
+    this.registerAskTool(agentCtx, id);
   }
   /**
-   * Isolate ask_user_question inside this agent: a private userQuestions
-   * service instance shadows the shared host instance (whose only provider is
-   * the Web app and can never be answered from WeCom), and a channel provider
-   * presents every question as Markdown + a template card.
+   * Register a channel-scoped `ask_user_question` tool that shadows the
+   * preset's Web-UI-backed tool for this agent (the tools registry resolves
+   * the nearest scope layer, so this agent asks through WeCom cards instead
+   * of the Web question panel, whose provider can never be answered here).
    */
-  registerQuestionBridge(agentCtx, id) {
-    const service = new UserQuestionService(agentCtx);
-    const disposeProvider = service.registerProvider({
-      ask: (request) => {
+  registerAskTool(agentCtx, id) {
+    return agentCtx.tools.register(defineTool({
+      name: "ask_user_question",
+      description: "Ask the WeCom user a concise question when you need confirmation, a choice, or missing information before proceeding. Send one or more questions, each with a stable id that will be echoed in the answer. Each question renders as a Markdown message plus a WeCom template card: keep option labels SHORT (at most 10 characters \u2014 the WeCom client truncates them) and put the full explanation of each choice into the question text or the option descriptions instead.",
+      parameters: {
+        questions: {
+          type: "array",
+          required: true,
+          description: "Questions to ask the user before continuing.",
+          items: {
+            type: "object",
+            additionalProperties: true,
+            properties: {
+              id: { type: "string", required: true, description: "Stable id for this question; echoed in the answer." },
+              question: { type: "string", required: true, description: "The specific question to ask the user." },
+              header: {
+                type: "string",
+                description: 'Optional short heading for the question, such as "Confirm" or "Choose Mode".'
+              },
+              options: {
+                type: "array",
+                description: 'Optional choices to show the user. If you recommend one, put it first and append "(Recommended)" to that label.',
+                items: {
+                  type: "object",
+                  additionalProperties: true,
+                  properties: {
+                    label: { type: "string", required: true, description: "Short user-facing option label." },
+                    description: { type: "string", description: "One sentence explaining the tradeoff or impact." }
+                  }
+                }
+              },
+              multi_select: {
+                type: "boolean",
+                description: "Whether the user may select more than one option. Defaults to false."
+              }
+            }
+          }
+        }
+      },
+      output: {
+        schema: {
+          type: "object",
+          additionalProperties: false,
+          properties: {
+            answers: {
+              type: "array",
+              required: true,
+              items: {
+                type: "object",
+                additionalProperties: false,
+                properties: {
+                  id: { type: "string", required: true },
+                  selected: { type: "array", required: true, items: { type: "string" } },
+                  custom: { type: "string" }
+                }
+              }
+            }
+          }
+        },
+        render: (_args, value) => [{ type: "text", text: JSON.stringify(value) }]
+      },
+      execute: async (args, exec) => {
         const target = this.activeTurns.get(id);
         if (target === void 0) {
           throw new UserQuestionError2(
@@ -1187,12 +1244,27 @@ var ConversationManager = class {
             "NO_ACTIVE_TURN"
           );
         }
-        return this.questions.present(request, target);
+        exec.signal.throwIfAborted();
+        const request = {
+          questions: args.questions.map((question) => ({
+            id: question.id,
+            question: question.question,
+            ...question.header === void 0 ? {} : { header: question.header },
+            ...question.options === void 0 ? {} : { options: question.options },
+            ...question.multi_select === void 0 ? {} : { multiSelect: question.multi_select }
+          })),
+          signal: exec.signal
+        };
+        const result = await this.questions.present(request, target);
+        return {
+          answers: result.answers.map((answer) => ({
+            id: answer.id,
+            selected: [...answer.selected],
+            ...answer.custom === void 0 ? {} : { custom: answer.custom }
+          }))
+        };
       }
-    });
-    return () => {
-      disposeProvider();
-    };
+    }));
   }
   registerWeComInstructions(agentCtx, id) {
     return agentCtx.systemPrompt.section({
@@ -1576,7 +1648,7 @@ var WeComHarnessBridge = class {
       maxReconnectAttempts: this.config.maxReconnectAttempts,
       maxAuthFailureAttempts: this.config.maxAuthFailureAttempts,
       requestTimeout: this.config.sendTimeoutMs,
-      plug_version: "deepseek-harness-wecom-plus/0.4.0"
+      plug_version: "deepseek-harness-wecom-plus/0.4.1"
     });
   }
   async handleWelcome(frame) {
@@ -1983,7 +2055,7 @@ import {
 } from "@deepseek-ai/dsh-settings";
 
 // src/version.ts
-var PLUGIN_VERSION = "0.4.0";
+var PLUGIN_VERSION = "0.4.1";
 
 // src/settings-web.ts
 var SETTINGS_ROUTE = "/_dsh/deepseek-harness-wecom-plus/settings";

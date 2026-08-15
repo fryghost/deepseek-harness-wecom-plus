@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from 'vitest'
 import { EventType } from '@wecom/aibot-node-sdk'
+import type { TemplateCard } from '@wecom/aibot-node-sdk'
 import type { ToolDefinition } from '@deepseek-ai/dsh-tools'
 import { ConversationManager } from '../src/conversations.js'
 import { sessionIdFor } from '../src/util.js'
@@ -205,7 +206,7 @@ describe('ConversationManager', () => {
     expect(create).not.toHaveBeenCalled()
     expect(agent.whenIdle).toHaveBeenCalledTimes(2)
     await manager.dispose()
-    expect(disposeTool).toHaveBeenCalledTimes(2)
+    expect(disposeTool).toHaveBeenCalledTimes(3)
     expect(disposeInstructions).toHaveBeenCalledOnce()
   })
 
@@ -544,8 +545,7 @@ describe('ConversationManager', () => {
     await manager.dispose()
   })
 
-  it('turns a template card button click into a user message and collects the reply', async () => {
-    const config = testConfig()
+  it('turns a template card button click into a user message and collects the reply', async () => {    const config = testConfig()
     const events: unknown[] = []
     let followedUp: unknown
     const agent = {
@@ -605,6 +605,88 @@ describe('ConversationManager', () => {
     expect(text).toContain('event_key: btn-ok')
     expect(text).toContain('selected option: 确认')
     expect(text).toContain('template card button click')
+    await manager.dispose()
+  })
+
+  it('shadows ask_user_question with a channel tool that settles through WeCom cards', async () => {
+    const config = testConfig()
+    let askTool: ToolDefinition | undefined
+    let runningAsk: Promise<unknown> | undefined
+    const sentCards: TemplateCard[] = []
+    const events: unknown[] = []
+    const agent = {
+      status: 'idle',
+      options: { provider: 'deepseek', model: 'deepseek-chat' },
+      session: { events },
+      followup: vi.fn(() => {
+        if (askTool === undefined) throw new Error('ask_user_question was not registered')
+        runningAsk = askTool.execute({
+          questions: [{
+            id: 'ask-1',
+            question: '请选择下一步',
+            options: [{ label: '继续发布' }, { label: '回滚' }],
+          }],
+        }, { signal: new AbortController().signal } as never)
+        events.push({
+          type: 'assistant/message',
+          data: { message: { content: [{ type: 'text', text: '已完成。' }] } },
+        })
+        events.push({ type: 'turn/end', data: { reason: { kind: 'stop' } } })
+      }),
+      whenIdle: vi.fn(async () => runningAsk),
+    }
+    const register = vi.fn((definition: ToolDefinition) => {
+      if (definition.name === 'ask_user_question') askTool = definition
+      return vi.fn()
+    })
+    const ctx = {
+      sessionPersistence: { list: vi.fn(async () => []) },
+      agentDefaultModel: { currentSelection: vi.fn(() => ({ provider: 'deepseek', model: 'deepseek-chat' })) },
+      agentPresets: { defaultId: 'standard', mount: vi.fn(async () => ({ id: 'standard' })) },
+      llm: { resolveModelInfo: vi.fn(async () => ({ inputModalities: ['text'] })) },
+      agents: {
+        create: vi.fn(async (options: { setup?: (ctx: never) => Promise<void> }) => {
+          await options.setup?.(mockAgentCtx(vi.fn(() => vi.fn()), register))
+          return { agent, dispose: vi.fn(async () => undefined) }
+        }),
+        get: vi.fn(),
+      },
+      attachments: {
+        imageLimits: { maxImagesPerMessage: 4, maxMessageImageBytes: 10_000, maxImageBytes: 10_000 },
+      },
+    } as never
+    const manager = new ConversationManager(
+      ctx,
+      config,
+      vi.fn(async () => undefined),
+      vi.fn(async (_target: string, card: TemplateCard) => { sentCards.push(card) }),
+      vi.fn(async () => undefined),
+    )
+    await manager.initialize()
+
+    const processing = manager.process(textMessage('u-ask', 'm-ask', '问我一个问题'), downloadPort)
+    await vi.waitFor(() => { expect(sentCards).toHaveLength(1) })
+    const settled = manager.tryAnswerFromClick({
+      msgid: 'ev-ask',
+      aibotid: 'bot',
+      chattype: 'single',
+      from: { userid: 'u-ask' },
+      msgtype: 'event',
+      create_time: 1,
+      event: {
+        eventtype: EventType.TemplateCardEvent,
+        ...(sentCards[0]?.task_id === undefined ? {} : { task_id: sentCards[0].task_id }),
+        event_key: 'q-opt-2',
+      },
+    })
+    expect(settled).toBe(true)
+    const reply = await processing
+
+    expect(register).toHaveBeenCalledWith(expect.objectContaining({ name: 'ask_user_question' }))
+    expect(reply.text).toBe('已完成。')
+    await expect(runningAsk).resolves.toEqual({
+      answers: [{ id: 'ask-1', selected: ['回滚'] }],
+    })
     await manager.dispose()
   })
 })

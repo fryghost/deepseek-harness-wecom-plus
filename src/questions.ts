@@ -235,7 +235,10 @@ function questionMarkdown(question: AskUserQuestionItem): string {
   ].filter((line): line is string => line !== null)
   const options = question.options ?? []
   if (options.length > 0) {
-    lines.push('', '**选项**', options.map((option, index) => `${index + 1}. ${option.label}`).join('\n'))
+    lines.push('', '**选项**', options.map((option, index) =>
+      option.description === undefined || option.description.trim().length === 0
+        ? `${index + 1}. ${option.label}`
+        : `${index + 1}. ${option.label} — ${option.description}`).join('\n'))
   }
   lines.push('', '你可以点击卡片按钮，或直接回复数字（多选用逗号分隔，如 1,3）。')
   return lines.join('\n')

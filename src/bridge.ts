@@ -223,7 +223,7 @@ export class WeComHarnessBridge {
       maxReconnectAttempts: this.config.maxReconnectAttempts,
       maxAuthFailureAttempts: this.config.maxAuthFailureAttempts,
       requestTimeout: this.config.sendTimeoutMs,
-      plug_version: 'deepseek-harness-wecom-plus/0.5.1',
+      plug_version: 'deepseek-harness-wecom-plus/0.5.2',
     })
   }
 
@@ -257,6 +257,16 @@ export class WeComHarnessBridge {
     // the choice on the card, and let the running turn continue.
     const questionLabel = this.conversations.pendingQuestionLabel(body)
     const answered = this.conversations.tryAnswerFromClick(body)
+    // Diagnostic always visible in the launch terminal (console.error is not
+    // filtered by the default logger level; the line names every decision).
+    console.error(
+      '[wecom-plus] card click msgid=%s task=%s key=%s questionLabel=%s answered=%s',
+      body.msgid,
+      taskId ?? '',
+      body.event.event_key ?? '',
+      questionLabel ?? '',
+      String(answered),
+    )
     this.log.info(
       'WeCom card click msgid=%s task=%s key=%s questionLabel=%s answered=%s',
       body.msgid,

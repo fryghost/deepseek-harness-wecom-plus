@@ -65,7 +65,7 @@ describe('WeComQuestionBridge', () => {
     await expect(asking).resolves.toEqual({ answers: [{ id: 'q1', selected: ['灰度发布'] }] })
   })
 
-  it('falls back to text mode for more than six options and parses numbers', async () => {
+  it('uses a vote card for more than six options and still parses numeric replies', async () => {
     const { instance, cards } = bridge()
     const options = Array.from({ length: 8 }, (_, index) => ({ label: `方案 ${index + 1}` }))
     const asking = instance.present({
@@ -73,7 +73,7 @@ describe('WeComQuestionBridge', () => {
     }, 'u1')
 
     await vi.waitFor(() => { expect(cards).toHaveLength(1) })
-    expect(cards[0]?.card_type).toBe('text_notice')
+    expect(cards[0]?.card_type).toBe('vote_interaction')
 
     expect(instance.tryAnswerFromText(textMessage('5'))).toBe(true)
     await expect(asking).resolves.toEqual({ answers: [{ id: 'q2', selected: ['方案 5'] }] })
@@ -177,7 +177,7 @@ describe('WeComQuestionBridge', () => {
     await expect(asking).resolves.toEqual({ answers: [{ id: 'q14', selected: ['继续'] }] })
   })
 
-  it('falls back to numbered text mode when any option label is too long for a button', async () => {
+  it('uses a vote card when any option label is too long for a button', async () => {
     const { instance, cards } = bridge()
     const asking = instance.present({
       questions: [{
@@ -190,9 +190,45 @@ describe('WeComQuestionBridge', () => {
       }],
     }, 'u1')
     await vi.waitFor(() => { expect(cards).toHaveLength(1) })
-    expect(cards[0]?.card_type).toBe('text_notice')
+    expect(cards[0]?.card_type).toBe('vote_interaction')
     expect(instance.tryAnswerFromText(textMessage('结束测试'))).toBe(true)
     await expect(asking).resolves.toEqual({ answers: [{ id: 'q13', selected: ['结束测试'] }] })
+  })
+
+  it('renders a multi-select question as a vote card and settles from the submit event', async () => {
+    const { instance, cards } = bridge()
+    const asking = instance.present({
+      questions: [{
+        id: 'q15',
+        question: '选择需要处理的项',
+        multiSelect: true,
+        options: [{ label: '性能' }, { label: '文档' }, { label: '测试' }],
+      }],
+    }, 'u1')
+    await vi.waitFor(() => { expect(cards).toHaveLength(1) })
+    expect(cards[0]?.card_type).toBe('vote_interaction')
+    expect(cards[0]?.checkbox).toEqual(expect.objectContaining({ mode: 1 }))
+    const submit = {
+      msgid: 'ev-vote-submit',
+      aibotid: 'bot',
+      chattype: 'single',
+      from: { userid: 'u1' },
+      msgtype: 'event',
+      create_time: 1,
+      event: {
+        eventtype: EventType.TemplateCardEvent,
+        template_card_event: {
+          card_type: 'vote_interaction',
+          task_id: cards[0]?.task_id,
+          event_key: 'q-submit',
+          selected_items: {
+            selected_item: [{ question_key: 'vote', option_ids: { option_id: ['q-opt-1', 'q-opt-3'] } }],
+          },
+        },
+      },
+    } as never
+    expect(instance.tryAnswerFromClick(submit)).toBe(true)
+    await expect(asking).resolves.toEqual({ answers: [{ id: 'q15', selected: ['性能', '测试'] }] })
   })
 
   it('resolves task_id and event_key nested under event.template_card_event', async () => {

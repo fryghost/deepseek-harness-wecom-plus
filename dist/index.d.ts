@@ -139,6 +139,7 @@ declare class WeComHarnessBridge {
      * as a user message and push the model's reply proactively.
      */
     private handleCardEvent;
+    private handleCardEventInner;
     private handleMessage;
     private helpText;
     private commandReply;

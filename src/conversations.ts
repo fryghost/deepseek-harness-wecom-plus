@@ -264,9 +264,14 @@ export class ConversationManager {
   private enqueue<T>(baseId: string, operation: () => Promise<T>): Promise<T> {
     const previous = this.queues.get(baseId) ?? Promise.resolve()
     const current = previous.catch(() => undefined).then(operation)
-    const tracked = current.finally(() => {
-      if (this.queues.get(baseId) === tracked) this.queues.delete(baseId)
-    })
+    // The queue bookkeeping promise must swallow `current`'s rejection: it is
+    // only awaited by the caller, and an unhandled rejection on it would be
+    // fatal to the whole DSH process (installFailLoud).
+    let tracked: Promise<void>
+    tracked = current.then(
+      () => { if (this.queues.get(baseId) === tracked) this.queues.delete(baseId) },
+      () => { if (this.queues.get(baseId) === tracked) this.queues.delete(baseId) },
+    )
     this.queues.set(baseId, tracked)
     return current
   }

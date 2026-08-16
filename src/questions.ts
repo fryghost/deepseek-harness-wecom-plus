@@ -35,6 +35,32 @@ export type QuestionTextSender = (target: string, text: string) => Promise<void>
  */
 export const BUTTON_LABEL_MAX_CHARS = 6
 
+/** Submit-button key echoed by vote_interaction submissions. */
+const VOTE_SUBMIT_KEY = 'q-submit'
+
+/** Flatten the selected option ids from a vote/multiple submit event. */
+function selectedOptionIds(event: unknown): string[] {
+  if (typeof event !== 'object' || event === null) return []
+  const record = event as Record<string, unknown>
+  const nested = record.template_card_event
+  const holder = typeof nested === 'object' && nested !== null ? nested as Record<string, unknown> : record
+  const selectedItems = holder.selected_items
+  if (typeof selectedItems !== 'object' || selectedItems === null) return []
+  const list = (selectedItems as Record<string, unknown>).selected_item
+  if (!Array.isArray(list)) return []
+  const ids: string[] = []
+  for (const entry of list) {
+    if (typeof entry !== 'object' || entry === null) continue
+    const optionIds = (entry as Record<string, unknown>).option_ids
+    if (typeof optionIds !== 'object' || optionIds === null) continue
+    const optionId = (optionIds as Record<string, unknown>).option_id
+    if (Array.isArray(optionId)) {
+      for (const id of optionId) if (typeof id === 'string') ids.push(id)
+    }
+  }
+  return ids
+}
+
 /** Resolved identity fields of one template_card_event, across payload shapes. */
 export interface CardEventFacts {
   taskId: string | undefined
@@ -74,9 +100,11 @@ export function cardEventFacts(event: unknown): CardEventFacts {
 interface PendingQuestion {
   questionId: string
   question: AskUserQuestionItem
-  mode: 'buttons' | 'text'
+  mode: 'buttons' | 'vote' | 'text'
   taskId: string | undefined
   byKey?: Map<string, string>
+  byId?: Map<string, string>
+  submitKey?: string
   resolve: (answer: AskUserQuestionAnswerItem) => void
   reject: (error: Error) => void
   clearTimer: () => void
@@ -124,13 +152,23 @@ export class WeComQuestionBridge {
   tryAnswerFromClick(message: EventMessageWith<TemplateCardEventData>): boolean {
     const target = chatTarget(message)
     const pending = this.pending.get(target)
-    if (pending === undefined || pending.mode !== 'buttons') return false
+    if (pending === undefined) return false
     const { taskId, eventKey } = cardEventFacts(message.event)
     if (eventKey === undefined || taskId !== pending.taskId) return false
-    const label = pending.byKey?.get(eventKey)
-    if (label === undefined) return false
-    this.settle(target, pending, { id: pending.questionId, selected: [label] })
-    return true
+    if (pending.mode === 'buttons') {
+      const label = pending.byKey?.get(eventKey)
+      if (label === undefined) return false
+      this.settle(target, pending, { id: pending.questionId, selected: [label] })
+      return true
+    }
+    if (pending.mode === 'vote') {
+      if (eventKey !== pending.submitKey) return false
+      const ids = selectedOptionIds(message.event)
+      const labels = ids.map(id => pending.byId?.get(id)).filter((label): label is string => label !== undefined)
+      this.settle(target, pending, { id: pending.questionId, selected: [...new Set(labels)] })
+      return true
+    }
+    return false
   }
 
   /**
@@ -165,12 +203,14 @@ export class WeComQuestionBridge {
     signal: AbortSignal | undefined,
   ): Promise<AskUserQuestionAnswerItem> {
     const options = question.options ?? []
-    // Button cards only when every label fits the WeCom button width without
-    // truncation; longer options fall back to the numbered Markdown list plus
-    // a numeric-reply card, so the full option text stays readable.
+    // Card selection strategy, by label fit and option count:
+    // - buttons: 2-6 single-choice, every label ≤ 6 chars (fits WeCom buttons)
+    // - vote: multi-select, or more than 6 options, or long labels (checkbox + submit)
+    // - text: no options, or more than 20 options (numbered Markdown + reply)
     const buttons = options.length >= 2 && options.length <= 6
       && question.multiSelect !== true
       && options.every(option => option.label.length <= BUTTON_LABEL_MAX_CHARS)
+    const vote = options.length >= 2 && options.length <= 20 && !buttons
     // A Markdown message duplicates the card unless something needs the room:
     // numbered answers (text mode), option descriptions, extra detail, or a
     // question that exceeds the card title.
@@ -179,9 +219,9 @@ export class WeComQuestionBridge {
       || options.some(option => (option.description?.trim().length ?? 0) > 0)
       || question.question.length > CARD_LIMITS.title
     if (needsExplanation) {
-      void this.sendText(target, questionMarkdown(question, buttons)).then(undefined, () => undefined)
+      void this.sendText(target, questionMarkdown(question, buttons, vote)).then(undefined, () => undefined)
     }
-    const mode: PendingQuestion['mode'] = buttons ? 'buttons' : 'text'
+    const mode: PendingQuestion['mode'] = buttons ? 'buttons' : vote ? 'vote' : 'text'
     return new Promise<AskUserQuestionAnswerItem>((resolve, reject) => {
       const timer = setTimeout(() => {
         const pending = this.pending.get(target)
@@ -222,16 +262,27 @@ export class WeComQuestionBridge {
           ...(question.header === undefined ? {} : { desc: question.header }),
           buttons: options.map((option, index) => ({ text: option.label, key: `q-opt-${index + 1}` })),
         }, this.config.cardTaskIdPrefix)
-        : buildTemplateCard({
-          cardType: 'text_notice',
-          title: '请直接回复',
-          desc: question.multiSelect === true
-            ? '回复数字多选（如 1,3）或选项名称'
-            : options.length > 0 ? '回复数字或选项名称' : '请用文字回答上面的问题',
-        }, this.config.cardTaskIdPrefix)
+        : vote
+          ? buildTemplateCard({
+            cardType: 'vote_interaction',
+            title: question.question,
+            ...(question.header === undefined ? {} : { desc: question.header }),
+            options: options.map((option, index) => ({ id: `q-opt-${index + 1}`, text: option.label })),
+            voteMode: question.multiSelect === true ? 1 : 0,
+            submitText: '提交',
+            submitKey: VOTE_SUBMIT_KEY,
+          }, this.config.cardTaskIdPrefix)
+          : buildTemplateCard({
+            cardType: 'text_notice',
+            title: '请直接回复',
+            desc: options.length > 0 ? '回复数字或选项名称' : '请用文字回答上面的问题',
+          }, this.config.cardTaskIdPrefix)
       pending.taskId = card.task_id
       if (buttons) {
         pending.byKey = new Map(card.button_list?.map(button => [button.key, button.text] as const))
+      } else if (vote) {
+        pending.byId = new Map(options.map((option, index) => [`q-opt-${index + 1}`, option.label] as const))
+        pending.submitKey = VOTE_SUBMIT_KEY
       }
       this.sendCard(target, card).then(() => undefined, error => {
         if (this.pending.get(target) !== pending) return
@@ -293,7 +344,7 @@ function parseQuestionReply(question: AskUserQuestionItem, text: string): AskUse
 }
 
 /** Markdown explanation of one question: only the text that does not fit the card. */
-function questionMarkdown(question: AskUserQuestionItem, buttons: boolean): string {
+function questionMarkdown(question: AskUserQuestionItem, buttons: boolean, vote: boolean): string {
   const lines = [
     question.header === undefined ? null : `### ${question.header}`,
     question.question,
@@ -308,8 +359,10 @@ function questionMarkdown(question: AskUserQuestionItem, buttons: boolean): stri
   }
   lines.push('', buttons
     ? '点击卡片按钮，或直接回复数字作答。'
-    : question.multiSelect === true
-      ? '直接回复数字多选（如 1,3）或选项名称。'
-      : '直接回复数字或选项名称。')
+    : vote
+      ? '在卡片里勾选后点「提交」，或直接回复数字（多选用逗号分隔，如 1,3）。'
+      : question.multiSelect === true
+        ? '直接回复数字多选（如 1,3）或选项名称。'
+        : '直接回复数字或选项名称。')
   return lines.join('\n')
 }

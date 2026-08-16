@@ -224,7 +224,7 @@ export class WeComHarnessBridge {
       maxReconnectAttempts: this.config.maxReconnectAttempts,
       maxAuthFailureAttempts: this.config.maxAuthFailureAttempts,
       requestTimeout: this.config.sendTimeoutMs,
-      plug_version: 'deepseek-harness-wecom-plus/0.5.6',
+      plug_version: 'deepseek-harness-wecom-plus/0.5.7',
     })
   }
 
@@ -252,6 +252,19 @@ export class WeComHarnessBridge {
   private async handleCardEvent(frame: WsFrame<EventMessageWith<TemplateCardEventData>>): Promise<void> {
     const body = frame.body
     if (body === undefined || this.seen.hasOrAdd(body.msgid) || !this.allowedEvent(body)) return
+    try {
+      await this.handleCardEventInner(frame, body)
+    } catch (error) {
+      // Never let a rejection escape to the SDK emitter: an unhandled
+      // rejection is fatal to the whole DSH process.
+      this.log.error('WeCom card event %s crashed: %s', body.msgid, String(error))
+    }
+  }
+
+  private async handleCardEventInner(
+    frame: WsFrame<EventMessageWith<TemplateCardEventData>>,
+    body: EventMessageWith<TemplateCardEventData>,
+  ): Promise<void> {
     const facts = cardEventFacts(body.event)
     const taskId = facts.taskId?.trim()
     const eventKey = facts.eventKey?.trim()
@@ -260,25 +273,8 @@ export class WeComHarnessBridge {
     // the choice on the card, and let the running turn continue.
     const questionLabel = this.conversations.pendingQuestionLabel(body)
     const answered = this.conversations.tryAnswerFromClick(body)
-    // Diagnostic always visible in the launch terminal (console.error is not
-    // filtered by the default logger level; the line names every decision).
-    console.error(
-      '[wecom-plus] card click msgid=%s task=%s key=%s questionLabel=%s answered=%s raw=%s',
-      body.msgid,
-      taskId ?? '',
-      eventKey ?? '',
-      questionLabel ?? '',
-      String(answered),
-      JSON.stringify(body.event),
-    )
-    this.log.info(
-      'WeCom card click msgid=%s task=%s key=%s questionLabel=%s answered=%s',
-      body.msgid,
-      taskId ?? '',
-      eventKey ?? '',
-      questionLabel ?? '',
-      String(answered),
-    )
+    // The in-place card acknowledgement outcome is part of the diagnostic.
+    let acked = false
     if (taskId !== undefined && taskId.length > 0) {
       try {
         await withTimeout(this.requireClient().updateTemplateCard(frame, {
@@ -291,10 +287,21 @@ export class WeComHarnessBridge {
           },
           task_id: taskId,
         }, [body.from.userid]), 4_500, 'WeCom card click acknowledgement')
+        acked = true
       } catch (error) {
         this.log.warn('WeCom card click acknowledgement failed: %s', String(error))
       }
     }
+    console.error(
+      '[wecom-plus] card click msgid=%s task=%s key=%s questionLabel=%s answered=%s acked=%s raw=%s',
+      body.msgid,
+      taskId ?? '',
+      eventKey ?? '',
+      questionLabel ?? '',
+      String(answered),
+      String(acked),
+      JSON.stringify(body.event),
+    )
     if (answered) {
       // The in-place card update above already confirms the choice; no extra
       // status message, so the conversation stays clean.

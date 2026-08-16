@@ -654,6 +654,28 @@ import {
   UserQuestionError
 } from "@deepseek-ai/dsh-user-questions";
 var BUTTON_LABEL_MAX_CHARS = 6;
+var VOTE_SUBMIT_KEY = "q-submit";
+function selectedOptionIds(event) {
+  if (typeof event !== "object" || event === null) return [];
+  const record = event;
+  const nested = record.template_card_event;
+  const holder = typeof nested === "object" && nested !== null ? nested : record;
+  const selectedItems = holder.selected_items;
+  if (typeof selectedItems !== "object" || selectedItems === null) return [];
+  const list = selectedItems.selected_item;
+  if (!Array.isArray(list)) return [];
+  const ids = [];
+  for (const entry of list) {
+    if (typeof entry !== "object" || entry === null) continue;
+    const optionIds = entry.option_ids;
+    if (typeof optionIds !== "object" || optionIds === null) continue;
+    const optionId = optionIds.option_id;
+    if (Array.isArray(optionId)) {
+      for (const id of optionId) if (typeof id === "string") ids.push(id);
+    }
+  }
+  return ids;
+}
 function cardEventFacts(event) {
   if (typeof event !== "object" || event === null) return { taskId: void 0, eventKey: void 0 };
   const record = event;
@@ -712,13 +734,23 @@ var WeComQuestionBridge = class {
   tryAnswerFromClick(message) {
     const target = chatTarget(message);
     const pending = this.pending.get(target);
-    if (pending === void 0 || pending.mode !== "buttons") return false;
+    if (pending === void 0) return false;
     const { taskId, eventKey } = cardEventFacts(message.event);
     if (eventKey === void 0 || taskId !== pending.taskId) return false;
-    const label = pending.byKey?.get(eventKey);
-    if (label === void 0) return false;
-    this.settle(target, pending, { id: pending.questionId, selected: [label] });
-    return true;
+    if (pending.mode === "buttons") {
+      const label = pending.byKey?.get(eventKey);
+      if (label === void 0) return false;
+      this.settle(target, pending, { id: pending.questionId, selected: [label] });
+      return true;
+    }
+    if (pending.mode === "vote") {
+      if (eventKey !== pending.submitKey) return false;
+      const ids = selectedOptionIds(message.event);
+      const labels = ids.map((id) => pending.byId?.get(id)).filter((label) => label !== void 0);
+      this.settle(target, pending, { id: pending.questionId, selected: [...new Set(labels)] });
+      return true;
+    }
+    return false;
   }
   /**
    * Settle a pending question with the user's chat reply. While a question is
@@ -747,11 +779,12 @@ var WeComQuestionBridge = class {
   askOne(target, question, signal) {
     const options = question.options ?? [];
     const buttons = options.length >= 2 && options.length <= 6 && question.multiSelect !== true && options.every((option) => option.label.length <= BUTTON_LABEL_MAX_CHARS);
+    const vote = options.length >= 2 && options.length <= 20 && !buttons;
     const needsExplanation = !buttons || (question.detail?.trim().length ?? 0) > 0 || options.some((option) => (option.description?.trim().length ?? 0) > 0) || question.question.length > CARD_LIMITS.title;
     if (needsExplanation) {
-      void this.sendText(target, questionMarkdown(question, buttons)).then(void 0, () => void 0);
+      void this.sendText(target, questionMarkdown(question, buttons, vote)).then(void 0, () => void 0);
     }
-    const mode = buttons ? "buttons" : "text";
+    const mode = buttons ? "buttons" : vote ? "vote" : "text";
     return new Promise((resolve2, reject) => {
       const timer = setTimeout(() => {
         const pending2 = this.pending.get(target);
@@ -789,14 +822,25 @@ var WeComQuestionBridge = class {
         title: question.question,
         ...question.header === void 0 ? {} : { desc: question.header },
         buttons: options.map((option, index) => ({ text: option.label, key: `q-opt-${index + 1}` }))
+      }, this.config.cardTaskIdPrefix) : vote ? buildTemplateCard({
+        cardType: "vote_interaction",
+        title: question.question,
+        ...question.header === void 0 ? {} : { desc: question.header },
+        options: options.map((option, index) => ({ id: `q-opt-${index + 1}`, text: option.label })),
+        voteMode: question.multiSelect === true ? 1 : 0,
+        submitText: "\u63D0\u4EA4",
+        submitKey: VOTE_SUBMIT_KEY
       }, this.config.cardTaskIdPrefix) : buildTemplateCard({
         cardType: "text_notice",
         title: "\u8BF7\u76F4\u63A5\u56DE\u590D",
-        desc: question.multiSelect === true ? "\u56DE\u590D\u6570\u5B57\u591A\u9009\uFF08\u5982 1,3\uFF09\u6216\u9009\u9879\u540D\u79F0" : options.length > 0 ? "\u56DE\u590D\u6570\u5B57\u6216\u9009\u9879\u540D\u79F0" : "\u8BF7\u7528\u6587\u5B57\u56DE\u7B54\u4E0A\u9762\u7684\u95EE\u9898"
+        desc: options.length > 0 ? "\u56DE\u590D\u6570\u5B57\u6216\u9009\u9879\u540D\u79F0" : "\u8BF7\u7528\u6587\u5B57\u56DE\u7B54\u4E0A\u9762\u7684\u95EE\u9898"
       }, this.config.cardTaskIdPrefix);
       pending.taskId = card.task_id;
       if (buttons) {
         pending.byKey = new Map(card.button_list?.map((button) => [button.key, button.text]));
+      } else if (vote) {
+        pending.byId = new Map(options.map((option, index) => [`q-opt-${index + 1}`, option.label]));
+        pending.submitKey = VOTE_SUBMIT_KEY;
       }
       this.sendCard(target, card).then(() => void 0, (error) => {
         if (this.pending.get(target) !== pending) return;
@@ -841,7 +885,7 @@ function parseQuestionReply(question, text) {
   }
   return { id, selected: [], custom: normalized };
 }
-function questionMarkdown(question, buttons) {
+function questionMarkdown(question, buttons, vote) {
   const lines = [
     question.header === void 0 ? null : `### ${question.header}`,
     question.question,
@@ -852,7 +896,7 @@ ${question.detail}`
   if (options.length > 0) {
     lines.push("", "**\u9009\u9879**", options.map((option, index) => option.description === void 0 || option.description.trim().length === 0 ? `${index + 1}. ${option.label}` : `${index + 1}. ${option.label} \u2014 ${option.description}`).join("\n"));
   }
-  lines.push("", buttons ? "\u70B9\u51FB\u5361\u7247\u6309\u94AE\uFF0C\u6216\u76F4\u63A5\u56DE\u590D\u6570\u5B57\u4F5C\u7B54\u3002" : question.multiSelect === true ? "\u76F4\u63A5\u56DE\u590D\u6570\u5B57\u591A\u9009\uFF08\u5982 1,3\uFF09\u6216\u9009\u9879\u540D\u79F0\u3002" : "\u76F4\u63A5\u56DE\u590D\u6570\u5B57\u6216\u9009\u9879\u540D\u79F0\u3002");
+  lines.push("", buttons ? "\u70B9\u51FB\u5361\u7247\u6309\u94AE\uFF0C\u6216\u76F4\u63A5\u56DE\u590D\u6570\u5B57\u4F5C\u7B54\u3002" : vote ? "\u5728\u5361\u7247\u91CC\u52FE\u9009\u540E\u70B9\u300C\u63D0\u4EA4\u300D\uFF0C\u6216\u76F4\u63A5\u56DE\u590D\u6570\u5B57\uFF08\u591A\u9009\u7528\u9017\u53F7\u5206\u9694\uFF0C\u5982 1,3\uFF09\u3002" : question.multiSelect === true ? "\u76F4\u63A5\u56DE\u590D\u6570\u5B57\u591A\u9009\uFF08\u5982 1,3\uFF09\u6216\u9009\u9879\u540D\u79F0\u3002" : "\u76F4\u63A5\u56DE\u590D\u6570\u5B57\u6216\u9009\u9879\u540D\u79F0\u3002");
   return lines.join("\n");
 }
 
@@ -1023,9 +1067,15 @@ var ConversationManager = class {
   enqueue(baseId, operation) {
     const previous = this.queues.get(baseId) ?? Promise.resolve();
     const current = previous.catch(() => void 0).then(operation);
-    const tracked = current.finally(() => {
-      if (this.queues.get(baseId) === tracked) this.queues.delete(baseId);
-    });
+    let tracked;
+    tracked = current.then(
+      () => {
+        if (this.queues.get(baseId) === tracked) this.queues.delete(baseId);
+      },
+      () => {
+        if (this.queues.get(baseId) === tracked) this.queues.delete(baseId);
+      }
+    );
     this.queues.set(baseId, tracked);
     return current;
   }
@@ -1751,7 +1801,7 @@ var WeComHarnessBridge = class {
       maxReconnectAttempts: this.config.maxReconnectAttempts,
       maxAuthFailureAttempts: this.config.maxAuthFailureAttempts,
       requestTimeout: this.config.sendTimeoutMs,
-      plug_version: "deepseek-harness-wecom-plus/0.5.6"
+      plug_version: "deepseek-harness-wecom-plus/0.5.7"
     });
   }
   async handleWelcome(frame) {
@@ -1777,28 +1827,19 @@ var WeComHarnessBridge = class {
   async handleCardEvent(frame) {
     const body = frame.body;
     if (body === void 0 || this.seen.hasOrAdd(body.msgid) || !this.allowedEvent(body)) return;
+    try {
+      await this.handleCardEventInner(frame, body);
+    } catch (error) {
+      this.log.error("WeCom card event %s crashed: %s", body.msgid, String(error));
+    }
+  }
+  async handleCardEventInner(frame, body) {
     const facts = cardEventFacts(body.event);
     const taskId = facts.taskId?.trim();
     const eventKey = facts.eventKey?.trim();
     const questionLabel = this.conversations.pendingQuestionLabel(body);
     const answered = this.conversations.tryAnswerFromClick(body);
-    console.error(
-      "[wecom-plus] card click msgid=%s task=%s key=%s questionLabel=%s answered=%s raw=%s",
-      body.msgid,
-      taskId ?? "",
-      eventKey ?? "",
-      questionLabel ?? "",
-      String(answered),
-      JSON.stringify(body.event)
-    );
-    this.log.info(
-      "WeCom card click msgid=%s task=%s key=%s questionLabel=%s answered=%s",
-      body.msgid,
-      taskId ?? "",
-      eventKey ?? "",
-      questionLabel ?? "",
-      String(answered)
-    );
+    let acked = false;
     if (taskId !== void 0 && taskId.length > 0) {
       try {
         await withTimeout(this.requireClient().updateTemplateCard(frame, {
@@ -1809,10 +1850,21 @@ var WeComHarnessBridge = class {
           },
           task_id: taskId
         }, [body.from.userid]), 4500, "WeCom card click acknowledgement");
+        acked = true;
       } catch (error) {
         this.log.warn("WeCom card click acknowledgement failed: %s", String(error));
       }
     }
+    console.error(
+      "[wecom-plus] card click msgid=%s task=%s key=%s questionLabel=%s answered=%s acked=%s raw=%s",
+      body.msgid,
+      taskId ?? "",
+      eventKey ?? "",
+      questionLabel ?? "",
+      String(answered),
+      String(acked),
+      JSON.stringify(body.event)
+    );
     if (answered) {
       return;
     }
@@ -2344,7 +2396,7 @@ import {
 } from "@deepseek-ai/dsh-settings";
 
 // src/version.ts
-var PLUGIN_VERSION = "0.5.6";
+var PLUGIN_VERSION = "0.5.7";
 
 // src/settings-web.ts
 var SETTINGS_ROUTE = "/_dsh/deepseek-harness-wecom-plus/settings";

@@ -55,6 +55,12 @@ export interface TurnTransport {
   pushText(delta: string): void
   /** Show a transient activity line (e.g. the tool being executed). */
   setActivity(line: string): void
+  /**
+   * Deliver an ask_user_question card. Message-initiated turns attach it to
+   * the stream response (so it renders before the final answer, not after);
+   * proactive turns send it as a standalone message.
+   */
+  sendQuestionCard(card: TemplateCard): Promise<void>
   /** Deliver the complete reply (final stream frame / Markdown + media + cards). */
   finish(reply: ConversationReply): Promise<void>
   /** Deliver an error reply and stop the stream. */
@@ -636,7 +642,14 @@ export class ConversationManager {
             ...request,
             ...(exec.agent === undefined ? {} : { agent: exec.agent }),
           })
-          : await this.questions.present(request, this.activeTurns.get(id) as string)
+          : await this.questions.present(
+            request,
+            this.activeTurns.get(id) as string,
+            // Route the question card through the turn's transport so it is
+            // attached to the stream response and ordered before the answer.
+            (_target, card) => this.activeStreams.get(id)?.transport.sendQuestionCard(card)
+              ?? Promise.resolve(),
+          )
         return {
           answers: result.answers.map(answer => ({
             id: answer.id,

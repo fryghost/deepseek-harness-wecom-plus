@@ -706,10 +706,11 @@ var WeComQuestionBridge = class {
   sendText;
   pending = /* @__PURE__ */ new Map();
   /** Present the questions to one conversation and wait for the human answers. */
-  async present(request, target) {
+  async present(request, target, cardSender) {
     const answers = [];
+    const sendCard = cardSender ?? this.sendCard;
     for (const question of request.questions) {
-      answers.push(await this.askOne(target, question, request.signal));
+      answers.push(await this.askOne(target, question, request.signal, sendCard));
     }
     return { answers };
   }
@@ -776,7 +777,7 @@ var WeComQuestionBridge = class {
     this.pending.clear();
   }
   /** Ask one question: the card carries the question, the Markdown only carries what does not fit. */
-  askOne(target, question, signal) {
+  askOne(target, question, signal, sendCard) {
     const options = question.options ?? [];
     const buttons = options.length >= 2 && options.length <= 6 && question.multiSelect !== true && options.every((option) => option.label.length <= BUTTON_LABEL_MAX_CHARS);
     const vote = options.length >= 2 && options.length <= 20 && !buttons;
@@ -842,7 +843,7 @@ var WeComQuestionBridge = class {
         pending.byId = new Map(options.map((option, index) => [`q-opt-${index + 1}`, option.label]));
         pending.submitKey = VOTE_SUBMIT_KEY;
       }
-      this.sendCard(target, card).then(() => void 0, (error) => {
+      sendCard(target, card).then(() => void 0, (error) => {
         if (this.pending.get(target) !== pending) return;
         this.pending.delete(target);
         clearTimer();
@@ -1402,7 +1403,13 @@ var ConversationManager = class {
         const result = this.activeTurns.get(id) === void 0 ? await requireUserQuestions(userQuestions).ask({
           ...request,
           ...exec.agent === void 0 ? {} : { agent: exec.agent }
-        }) : await this.questions.present(request, this.activeTurns.get(id));
+        }) : await this.questions.present(
+          request,
+          this.activeTurns.get(id),
+          // Route the question card through the turn's transport so it is
+          // attached to the stream response and ordered before the answer.
+          (_target, card) => this.activeStreams.get(id)?.transport.sendQuestionCard(card) ?? Promise.resolve()
+        );
         return {
           answers: result.answers.map((answer) => ({
             id: answer.id,
@@ -1801,7 +1808,7 @@ var WeComHarnessBridge = class {
       maxReconnectAttempts: this.config.maxReconnectAttempts,
       maxAuthFailureAttempts: this.config.maxAuthFailureAttempts,
       requestTimeout: this.config.sendTimeoutMs,
-      plug_version: "deepseek-harness-wecom-plus/0.5.9"
+      plug_version: "deepseek-harness-wecom-plus/0.5.10"
     });
   }
   async handleWelcome(frame) {
@@ -2114,6 +2121,23 @@ ${outcome.response.text}` : direct;
         activity = line;
         schedule();
       },
+      sendQuestionCard: async (card) => {
+        if (settled) return;
+        try {
+          await this.retry(async () => withTimeout(
+            this.requireClient().replyStreamWithCard(frame, streamId, content(), false, { templateCard: card }),
+            this.config.sendTimeoutMs,
+            "WeCom question card send"
+          ));
+        } catch (error) {
+          this.log.warn("WeCom question card stream attach failed, falling back to proactive send: %s", String(error));
+          await this.retry(async () => withTimeout(
+            this.requireClient().sendMessage(chatTargetOf(frame), { msgtype: "template_card", template_card: card }),
+            this.config.sendTimeoutMs,
+            "WeCom question card proactive fallback"
+          ));
+        }
+      },
       finish: async (reply) => {
         settled = true;
         if (timer !== void 0) clearTimeout(timer);
@@ -2199,6 +2223,9 @@ ${outcome.response.text}` : direct;
       pushText: () => {
       },
       setActivity: () => {
+      },
+      sendQuestionCard: async (card) => {
+        await this.sendCards(target, [card]);
       },
       finish: async (reply) => {
         if (settled) return;
@@ -2401,7 +2428,7 @@ import {
 } from "@deepseek-ai/dsh-settings";
 
 // src/version.ts
-var PLUGIN_VERSION = "0.5.9";
+var PLUGIN_VERSION = "0.5.10";
 
 // src/settings-web.ts
 var SETTINGS_ROUTE = "/_dsh/deepseek-harness-wecom-plus/settings";

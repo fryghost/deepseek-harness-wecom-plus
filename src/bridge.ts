@@ -70,6 +70,13 @@ interface WeComClientPort extends WeComDownloadPort {
     frame: WsFrameHeaders,
     body: { msgtype: 'text'; text: { content: string } },
   ): Promise<unknown>
+  replyStreamWithCard(
+    frame: WsFrameHeaders,
+    streamId: string,
+    content: string,
+    finish: boolean,
+    options: { templateCard: TemplateCard },
+  ): Promise<unknown>
   updateTemplateCard(frame: WsFrameHeaders, templateCard: TemplateCard, userids?: string[]): Promise<unknown>
   sendMessage(
     chatid: string,
@@ -224,7 +231,7 @@ export class WeComHarnessBridge {
       maxReconnectAttempts: this.config.maxReconnectAttempts,
       maxAuthFailureAttempts: this.config.maxAuthFailureAttempts,
       requestTimeout: this.config.sendTimeoutMs,
-      plug_version: 'deepseek-harness-wecom-plus/0.5.9',
+      plug_version: 'deepseek-harness-wecom-plus/0.5.10',
     })
   }
 
@@ -567,6 +574,23 @@ export class WeComHarnessBridge {
         activity = line
         schedule()
       },
+      sendQuestionCard: async (card) => {
+        if (settled) return
+        try {
+          await this.retry(async () => withTimeout(
+            this.requireClient().replyStreamWithCard(frame, streamId, content(), false, { templateCard: card }),
+            this.config.sendTimeoutMs,
+            'WeCom question card send',
+          ))
+        } catch (error) {
+          this.log.warn('WeCom question card stream attach failed, falling back to proactive send: %s', String(error))
+          await this.retry(async () => withTimeout(
+            this.requireClient().sendMessage(chatTargetOf(frame), { msgtype: 'template_card', template_card: card }),
+            this.config.sendTimeoutMs,
+            'WeCom question card proactive fallback',
+          ))
+        }
+      },
       finish: async (reply) => {
         settled = true
         if (timer !== undefined) clearTimeout(timer)
@@ -655,6 +679,9 @@ export class WeComHarnessBridge {
     return {
       pushText: () => {},
       setActivity: () => {},
+      sendQuestionCard: async (card) => {
+        await this.sendCards(target, [card])
+      },
       finish: async (reply) => {
         if (settled) return
         settled = true

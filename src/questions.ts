@@ -122,10 +122,15 @@ export class WeComQuestionBridge {
   ) {}
 
   /** Present the questions to one conversation and wait for the human answers. */
-  async present(request: AskUserQuestionRequest, target: string): Promise<AskUserQuestionAnswer> {
+  async present(
+    request: AskUserQuestionRequest,
+    target: string,
+    cardSender?: QuestionCardSender,
+  ): Promise<AskUserQuestionAnswer> {
     const answers: AskUserQuestionAnswerItem[] = []
+    const sendCard = cardSender ?? this.sendCard
     for (const question of request.questions) {
-      answers.push(await this.askOne(target, question, request.signal))
+      answers.push(await this.askOne(target, question, request.signal, sendCard))
     }
     return { answers }
   }
@@ -201,6 +206,7 @@ export class WeComQuestionBridge {
     target: string,
     question: AskUserQuestionItem,
     signal: AbortSignal | undefined,
+    sendCard: QuestionCardSender,
   ): Promise<AskUserQuestionAnswerItem> {
     const options = question.options ?? []
     // Card selection strategy, by label fit and option count:
@@ -284,7 +290,7 @@ export class WeComQuestionBridge {
         pending.byId = new Map(options.map((option, index) => [`q-opt-${index + 1}`, option.label] as const))
         pending.submitKey = VOTE_SUBMIT_KEY
       }
-      this.sendCard(target, card).then(() => undefined, error => {
+      sendCard(target, card).then(() => undefined, error => {
         if (this.pending.get(target) !== pending) return
         this.pending.delete(target)
         clearTimer()

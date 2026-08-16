@@ -72,6 +72,16 @@ class FakeClient {
     this.cardUpdates.push({ templateCard, ...(userids === undefined ? {} : { userids }) })
   }
 
+  async replyStreamWithCard(
+    _frame: WsFrameHeaders,
+    _streamId: string,
+    _content: string,
+    _finish: boolean,
+    options: { templateCard: TemplateCard },
+  ): Promise<void> {
+    this.sent.push({ chatid: '', msgtype: 'template_card', template_card: options.templateCard })
+  }
+
   async sendMessage(
     chatid: string,
     body: { msgtype: 'markdown'; markdown: { content: string } } | { msgtype: 'template_card'; template_card: TemplateCard },

@@ -13,6 +13,7 @@ function noopTransport(): import('../src/conversations.js').TurnTransport {
   return {
     pushText: vi.fn(),
     setActivity: vi.fn(),
+    sendQuestionCard: vi.fn(async () => undefined),
     finish: vi.fn(async () => undefined),
     fail: vi.fn(async () => undefined),
   }
@@ -634,6 +635,7 @@ describe('ConversationManager', () => {
     const transport = {
       pushText: vi.fn(),
       setActivity: vi.fn(),
+      sendQuestionCard: vi.fn(async () => undefined),
       finish: vi.fn(async () => undefined),
       fail: vi.fn(async () => undefined),
     }
@@ -750,12 +752,20 @@ describe('ConversationManager', () => {
       ctx,
       config,
       vi.fn(async () => undefined),
-      vi.fn(async (_target: string, card: TemplateCard) => { sentCards.push(card) }),
+      vi.fn(async () => undefined),
       vi.fn(async () => undefined),
     )
     await manager.initialize()
 
-    const processing = manager.process(textMessage('u-ask', 'm-ask', '问我一个问题'), downloadPort, noopTransport())
+    // The question card now routes through the active turn's transport.
+    const transport = {
+      pushText: vi.fn(),
+      setActivity: vi.fn(),
+      sendQuestionCard: vi.fn(async (_card: TemplateCard) => { sentCards.push(_card) }),
+      finish: vi.fn(async () => undefined),
+      fail: vi.fn(async () => undefined),
+    }
+    const processing = manager.process(textMessage('u-ask', 'm-ask', '问我一个问题'), downloadPort, transport)
     await vi.waitFor(() => { expect(sentCards).toHaveLength(1) })
     const settled = manager.tryAnswerFromClick({
       msgid: 'ev-ask',

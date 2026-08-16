@@ -93,6 +93,9 @@ interface WeComClientPort extends WeComDownloadPort {
             content: string;
         };
     }): Promise<unknown>;
+    replyStreamWithCard(frame: WsFrameHeaders, streamId: string, content: string, finish: boolean, options: {
+        templateCard: TemplateCard;
+    }): Promise<unknown>;
     updateTemplateCard(frame: WsFrameHeaders, templateCard: TemplateCard, userids?: string[]): Promise<unknown>;
     sendMessage(chatid: string, body: {
         msgtype: 'markdown';

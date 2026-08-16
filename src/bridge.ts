@@ -224,7 +224,7 @@ export class WeComHarnessBridge {
       maxReconnectAttempts: this.config.maxReconnectAttempts,
       maxAuthFailureAttempts: this.config.maxAuthFailureAttempts,
       requestTimeout: this.config.sendTimeoutMs,
-      plug_version: 'deepseek-harness-wecom-plus/0.5.8',
+      plug_version: 'deepseek-harness-wecom-plus/0.5.9',
     })
   }
 
@@ -285,6 +285,9 @@ export class WeComHarnessBridge {
               : truncateChars(`已选择「${questionLabel}」`, CARD_LIMITS.title),
             desc: truncateChars(this.config.cardClickAckSubtitle, CARD_LIMITS.titleDesc),
           },
+          // The update API requires a valid card_action on text_notice cards
+          // (errcode 42045 otherwise); a neutral same-site URL satisfies it.
+          card_action: { type: 1, url: 'https://open.work.weixin.qq.com/' },
           task_id: taskId,
         }, [body.from.userid]), 4_500, 'WeCom card click acknowledgement')
         acked = true

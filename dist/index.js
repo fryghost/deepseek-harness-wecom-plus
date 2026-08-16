@@ -1801,7 +1801,7 @@ var WeComHarnessBridge = class {
       maxReconnectAttempts: this.config.maxReconnectAttempts,
       maxAuthFailureAttempts: this.config.maxAuthFailureAttempts,
       requestTimeout: this.config.sendTimeoutMs,
-      plug_version: "deepseek-harness-wecom-plus/0.5.8"
+      plug_version: "deepseek-harness-wecom-plus/0.5.9"
     });
   }
   async handleWelcome(frame) {
@@ -1848,6 +1848,9 @@ var WeComHarnessBridge = class {
             title: questionLabel === void 0 ? truncateChars(this.config.cardClickAckTitle, CARD_LIMITS.title) : truncateChars(`\u5DF2\u9009\u62E9\u300C${questionLabel}\u300D`, CARD_LIMITS.title),
             desc: truncateChars(this.config.cardClickAckSubtitle, CARD_LIMITS.titleDesc)
           },
+          // The update API requires a valid card_action on text_notice cards
+          // (errcode 42045 otherwise); a neutral same-site URL satisfies it.
+          card_action: { type: 1, url: "https://open.work.weixin.qq.com/" },
           task_id: taskId
         }, [body.from.userid]), 4500, "WeCom card click acknowledgement");
         acked = true;
@@ -2398,7 +2401,7 @@ import {
 } from "@deepseek-ai/dsh-settings";
 
 // src/version.ts
-var PLUGIN_VERSION = "0.5.8";
+var PLUGIN_VERSION = "0.5.9";
 
 // src/settings-web.ts
 var SETTINGS_ROUTE = "/_dsh/deepseek-harness-wecom-plus/settings";

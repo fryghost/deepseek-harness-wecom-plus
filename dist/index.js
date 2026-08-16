@@ -1801,7 +1801,7 @@ var WeComHarnessBridge = class {
       maxReconnectAttempts: this.config.maxReconnectAttempts,
       maxAuthFailureAttempts: this.config.maxAuthFailureAttempts,
       requestTimeout: this.config.sendTimeoutMs,
-      plug_version: "deepseek-harness-wecom-plus/0.5.7"
+      plug_version: "deepseek-harness-wecom-plus/0.5.8"
     });
   }
   async handleWelcome(frame) {
@@ -1853,6 +1853,8 @@ var WeComHarnessBridge = class {
         acked = true;
       } catch (error) {
         this.log.warn("WeCom card click acknowledgement failed: %s", String(error));
+        console.error("[wecom-plus] card ack failed: %s", String(error));
+        console.error("[wecom-plus] card ack error detail: %s", JSON.stringify(error));
       }
     }
     console.error(
@@ -2396,7 +2398,7 @@ import {
 } from "@deepseek-ai/dsh-settings";
 
 // src/version.ts
-var PLUGIN_VERSION = "0.5.7";
+var PLUGIN_VERSION = "0.5.8";
 
 // src/settings-web.ts
 var SETTINGS_ROUTE = "/_dsh/deepseek-harness-wecom-plus/settings";

@@ -224,7 +224,7 @@ export class WeComHarnessBridge {
       maxReconnectAttempts: this.config.maxReconnectAttempts,
       maxAuthFailureAttempts: this.config.maxAuthFailureAttempts,
       requestTimeout: this.config.sendTimeoutMs,
-      plug_version: 'deepseek-harness-wecom-plus/0.5.7',
+      plug_version: 'deepseek-harness-wecom-plus/0.5.8',
     })
   }
 
@@ -290,6 +290,8 @@ export class WeComHarnessBridge {
         acked = true
       } catch (error) {
         this.log.warn('WeCom card click acknowledgement failed: %s', String(error))
+        console.error('[wecom-plus] card ack failed: %s', String(error))
+        console.error('[wecom-plus] card ack error detail: %s', JSON.stringify(error))
       }
     }
     console.error(

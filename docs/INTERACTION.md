@@ -1,4 +1,4 @@
-# WeCom 插件交互逻辑（v0.6.1）
+# WeCom 插件交互逻辑（v0.6.2）
 
 > 本文档描述 `deepseek-harness-wecom-plus` 在运行时的完整交互行为，与代码同步维护。
 

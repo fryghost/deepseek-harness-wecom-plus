@@ -240,10 +240,29 @@ export class WeComQuestionBridge {
       || (question.detail?.trim().length ?? 0) > 0
       || options.some(option => (option.description?.trim().length ?? 0) > 0)
       || question.question.length > CARD_LIMITS.title
-    if (needsExplanation) {
-      void this.sendText(target, questionMarkdown(question, buttons, vote)).then(undefined, () => undefined)
-    }
     const mode: PendingQuestion['mode'] = buttons ? 'buttons' : vote ? 'vote' : 'text'
+    const card = buttons
+      ? buildTemplateCard({
+        cardType: 'button_interaction',
+        title: question.question,
+        ...(question.header === undefined ? {} : { desc: question.header }),
+        buttons: options.map((option, index) => ({ text: option.label, key: `q-opt-${index + 1}` })),
+      }, this.config.cardTaskIdPrefix)
+      : vote
+        ? buildTemplateCard({
+          cardType: 'vote_interaction',
+          title: question.question,
+          ...(question.header === undefined ? {} : { desc: question.header }),
+          options: options.map((option, index) => ({ id: `q-opt-${index + 1}`, text: option.label })),
+          voteMode: question.multiSelect === true ? 1 : 0,
+          submitText: '提交',
+          submitKey: VOTE_SUBMIT_KEY,
+        }, this.config.cardTaskIdPrefix)
+        : buildTemplateCard({
+          cardType: 'text_notice',
+          title: '请直接回复',
+          desc: options.length > 0 ? '回复数字或选项名称' : '请用文字回答上面的问题',
+        }, this.config.cardTaskIdPrefix)
     return new Promise<AskUserQuestionAnswerItem>((resolve, reject) => {
       const timer = setTimeout(() => {
         const pending = this.pending.get(target)
@@ -260,7 +279,8 @@ export class WeComQuestionBridge {
         questionId: question.id,
         question,
         mode,
-        taskId: undefined,
+        taskId: card.task_id,
+        card,
         resolve,
         reject,
         clearTimer,
@@ -276,38 +296,22 @@ export class WeComQuestionBridge {
         signal.addEventListener('abort', handler, { once: true })
       }
       this.pending.set(target, pending)
-
-      const card = buttons
-        ? buildTemplateCard({
-          cardType: 'button_interaction',
-          title: question.question,
-          ...(question.header === undefined ? {} : { desc: question.header }),
-          buttons: options.map((option, index) => ({ text: option.label, key: `q-opt-${index + 1}` })),
-        }, this.config.cardTaskIdPrefix)
-        : vote
-          ? buildTemplateCard({
-            cardType: 'vote_interaction',
-            title: question.question,
-            ...(question.header === undefined ? {} : { desc: question.header }),
-            options: options.map((option, index) => ({ id: `q-opt-${index + 1}`, text: option.label })),
-            voteMode: question.multiSelect === true ? 1 : 0,
-            submitText: '提交',
-            submitKey: VOTE_SUBMIT_KEY,
-          }, this.config.cardTaskIdPrefix)
-          : buildTemplateCard({
-            cardType: 'text_notice',
-            title: '请直接回复',
-            desc: options.length > 0 ? '回复数字或选项名称' : '请用文字回答上面的问题',
-          }, this.config.cardTaskIdPrefix)
-      pending.taskId = card.task_id
-      pending.card = card
       if (buttons) {
         pending.byKey = new Map(card.button_list?.map(button => [button.key, button.text] as const))
       } else if (vote) {
         pending.byId = new Map(options.map((option, index) => [`q-opt-${index + 1}`, option.label] as const))
         pending.submitKey = VOTE_SUBMIT_KEY
       }
-      sendCard(target, card).then(() => undefined, error => {
+      // Deliver as standalone messages, Markdown explanation first, then the
+      // card. Stream attachment is unusable here: the platform renders a card
+      // only on the stream's FIRST frame, and questions arrive mid-stream.
+      const deliver = async (): Promise<void> => {
+        if (needsExplanation) {
+          await this.sendText(target, questionMarkdown(question, buttons, vote)).then(undefined, () => undefined)
+        }
+        await sendCard(target, card)
+      }
+      void deliver().then(() => undefined, error => {
         if (this.pending.get(target) !== pending) return
         this.pending.delete(target)
         clearTimer()

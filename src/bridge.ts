@@ -233,7 +233,7 @@ export class WeComHarnessBridge {
       maxReconnectAttempts: this.config.maxReconnectAttempts,
       maxAuthFailureAttempts: this.config.maxAuthFailureAttempts,
       requestTimeout: this.config.sendTimeoutMs,
-      plug_version: 'deepseek-harness-wecom-plus/0.6.1',
+      plug_version: 'deepseek-harness-wecom-plus/0.6.2',
     })
   }
 
@@ -636,20 +636,11 @@ export class WeComHarnessBridge {
       },
       sendQuestionCard: async (card) => {
         if (settled) return
-        try {
-          await this.retry(async () => withTimeout(
-            this.requireClient().replyStreamWithCard(frame, streamId, content(), false, { templateCard: card }),
-            this.config.sendTimeoutMs,
-            'WeCom question card send',
-          ))
-        } catch (error) {
-          this.log.warn('WeCom question card stream attach failed, falling back to proactive send: %s', String(error))
-          await this.retry(async () => withTimeout(
-            this.requireClient().sendMessage(chatTargetOf(frame), { msgtype: 'template_card', template_card: card }),
-            this.config.sendTimeoutMs,
-            'WeCom question card proactive fallback',
-          ))
-        }
+        // A standalone card message, never a stream attachment: the platform
+        // requires the card on the stream's FIRST frame, and question cards
+        // arrive mid-stream where an attachment silently fails to render.
+        // A standalone card also stays updatable through the 5-second window.
+        await this.sendCards(chatTargetOf(frame), [card])
       },
       finish: async (reply) => {
         settled = true

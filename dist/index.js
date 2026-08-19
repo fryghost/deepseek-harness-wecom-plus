@@ -794,10 +794,25 @@ var WeComQuestionBridge = class {
     const buttons = options.length >= 2 && options.length <= 6 && question.multiSelect !== true && options.every((option) => option.label.length <= BUTTON_LABEL_MAX_CHARS);
     const vote = options.length >= 2 && options.length <= 20 && !buttons;
     const needsExplanation = !buttons || (question.detail?.trim().length ?? 0) > 0 || options.some((option) => (option.description?.trim().length ?? 0) > 0) || question.question.length > CARD_LIMITS.title;
-    if (needsExplanation) {
-      void this.sendText(target, questionMarkdown(question, buttons, vote)).then(void 0, () => void 0);
-    }
     const mode = buttons ? "buttons" : vote ? "vote" : "text";
+    const card = buttons ? buildTemplateCard({
+      cardType: "button_interaction",
+      title: question.question,
+      ...question.header === void 0 ? {} : { desc: question.header },
+      buttons: options.map((option, index) => ({ text: option.label, key: `q-opt-${index + 1}` }))
+    }, this.config.cardTaskIdPrefix) : vote ? buildTemplateCard({
+      cardType: "vote_interaction",
+      title: question.question,
+      ...question.header === void 0 ? {} : { desc: question.header },
+      options: options.map((option, index) => ({ id: `q-opt-${index + 1}`, text: option.label })),
+      voteMode: question.multiSelect === true ? 1 : 0,
+      submitText: "\u63D0\u4EA4",
+      submitKey: VOTE_SUBMIT_KEY
+    }, this.config.cardTaskIdPrefix) : buildTemplateCard({
+      cardType: "text_notice",
+      title: "\u8BF7\u76F4\u63A5\u56DE\u590D",
+      desc: options.length > 0 ? "\u56DE\u590D\u6570\u5B57\u6216\u9009\u9879\u540D\u79F0" : "\u8BF7\u7528\u6587\u5B57\u56DE\u7B54\u4E0A\u9762\u7684\u95EE\u9898"
+    }, this.config.cardTaskIdPrefix);
     return new Promise((resolve2, reject) => {
       const timer = setTimeout(() => {
         const pending2 = this.pending.get(target);
@@ -814,7 +829,8 @@ var WeComQuestionBridge = class {
         questionId: question.id,
         question,
         mode,
-        taskId: void 0,
+        taskId: card.task_id,
+        card,
         resolve: resolve2,
         reject,
         clearTimer
@@ -830,33 +846,19 @@ var WeComQuestionBridge = class {
         signal.addEventListener("abort", handler, { once: true });
       }
       this.pending.set(target, pending);
-      const card = buttons ? buildTemplateCard({
-        cardType: "button_interaction",
-        title: question.question,
-        ...question.header === void 0 ? {} : { desc: question.header },
-        buttons: options.map((option, index) => ({ text: option.label, key: `q-opt-${index + 1}` }))
-      }, this.config.cardTaskIdPrefix) : vote ? buildTemplateCard({
-        cardType: "vote_interaction",
-        title: question.question,
-        ...question.header === void 0 ? {} : { desc: question.header },
-        options: options.map((option, index) => ({ id: `q-opt-${index + 1}`, text: option.label })),
-        voteMode: question.multiSelect === true ? 1 : 0,
-        submitText: "\u63D0\u4EA4",
-        submitKey: VOTE_SUBMIT_KEY
-      }, this.config.cardTaskIdPrefix) : buildTemplateCard({
-        cardType: "text_notice",
-        title: "\u8BF7\u76F4\u63A5\u56DE\u590D",
-        desc: options.length > 0 ? "\u56DE\u590D\u6570\u5B57\u6216\u9009\u9879\u540D\u79F0" : "\u8BF7\u7528\u6587\u5B57\u56DE\u7B54\u4E0A\u9762\u7684\u95EE\u9898"
-      }, this.config.cardTaskIdPrefix);
-      pending.taskId = card.task_id;
-      pending.card = card;
       if (buttons) {
         pending.byKey = new Map(card.button_list?.map((button) => [button.key, button.text]));
       } else if (vote) {
         pending.byId = new Map(options.map((option, index) => [`q-opt-${index + 1}`, option.label]));
         pending.submitKey = VOTE_SUBMIT_KEY;
       }
-      sendCard(target, card).then(() => void 0, (error) => {
+      const deliver = async () => {
+        if (needsExplanation) {
+          await this.sendText(target, questionMarkdown(question, buttons, vote)).then(void 0, () => void 0);
+        }
+        await sendCard(target, card);
+      };
+      void deliver().then(() => void 0, (error) => {
         if (this.pending.get(target) !== pending) return;
         this.pending.delete(target);
         clearTimer();
@@ -1435,7 +1437,7 @@ var ConversationManager = class {
           request,
           this.activeTurns.get(id),
           // Route the question card through the turn's transport so it is
-          // attached to the stream response and ordered before the answer.
+          // delivered as a standalone message ordered after the explanation.
           (_target, card) => this.activeStreams.get(id)?.transport.sendQuestionCard(card) ?? Promise.resolve()
         );
         return {
@@ -1838,7 +1840,7 @@ var WeComHarnessBridge = class {
       maxReconnectAttempts: this.config.maxReconnectAttempts,
       maxAuthFailureAttempts: this.config.maxAuthFailureAttempts,
       requestTimeout: this.config.sendTimeoutMs,
-      plug_version: "deepseek-harness-wecom-plus/0.6.1"
+      plug_version: "deepseek-harness-wecom-plus/0.6.2"
     });
   }
   async handleWelcome(frame) {
@@ -2198,20 +2200,7 @@ ${outcome.response.text}` : direct;
       },
       sendQuestionCard: async (card) => {
         if (settled) return;
-        try {
-          await this.retry(async () => withTimeout(
-            this.requireClient().replyStreamWithCard(frame, streamId, content(), false, { templateCard: card }),
-            this.config.sendTimeoutMs,
-            "WeCom question card send"
-          ));
-        } catch (error) {
-          this.log.warn("WeCom question card stream attach failed, falling back to proactive send: %s", String(error));
-          await this.retry(async () => withTimeout(
-            this.requireClient().sendMessage(chatTargetOf(frame), { msgtype: "template_card", template_card: card }),
-            this.config.sendTimeoutMs,
-            "WeCom question card proactive fallback"
-          ));
-        }
+        await this.sendCards(chatTargetOf(frame), [card]);
       },
       finish: async (reply) => {
         settled = true;
@@ -2512,7 +2501,7 @@ import {
 } from "@deepseek-ai/dsh-settings";
 
 // src/version.ts
-var PLUGIN_VERSION = "0.6.1";
+var PLUGIN_VERSION = "0.6.2";
 
 // src/settings-web.ts
 var SETTINGS_ROUTE = "/_dsh/deepseek-harness-wecom-plus/settings";

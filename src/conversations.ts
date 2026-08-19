@@ -56,9 +56,10 @@ export interface TurnTransport {
   /** Show a transient activity line (e.g. the tool being executed). */
   setActivity(line: string): void
   /**
-   * Deliver an ask_user_question card. Message-initiated turns attach it to
-   * the stream response (so it renders before the final answer, not after);
-   * proactive turns send it as a standalone message.
+   * Deliver an ask_user_question card. Both transports send it as a
+   * standalone card message right after the question's Markdown explanation:
+   * the platform renders a card only on a stream's FIRST frame, so a
+   * mid-stream attachment would silently fail to appear.
    */
   sendQuestionCard(card: TemplateCard): Promise<void>
   /** Deliver the complete reply (final stream frame / Markdown + media + cards). */
@@ -669,7 +670,7 @@ export class ConversationManager {
             request,
             this.activeTurns.get(id) as string,
             // Route the question card through the turn's transport so it is
-            // attached to the stream response and ordered before the answer.
+            // delivered as a standalone message ordered after the explanation.
             (_target, card) => this.activeStreams.get(id)?.transport.sendQuestionCard(card)
               ?? Promise.resolve(),
           )

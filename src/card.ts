@@ -362,13 +362,20 @@ export interface ClickAckInput {
   ackSubtitle: string
 }
 
+/** Smart-bot button cards have no disabled state (the app-message channel's
+ * replace_text is unavailable here), so the acknowledged card approximates
+ * "processed" visually: every button turns grey (style 2) and the clicked
+ * one carries the ✓ prefix. */
+const ACK_BUTTON_STYLE = 2
+
 /**
  * Build the in-place update card for one click inside the protocol's 5-second
  * window. Interaction cards are updated AS THE SAME CARD TYPE so the option
- * surface stays visible: buttons remain (the clicked one marked with ✓), vote
- * checkboxes become disabled with the chosen options checked, and the title's
- * desc reports the selection. Only cards without an interaction surface fall
- * back to a plain text_notice confirmation.
+ * surface stays visible: buttons remain (all greyed out, the clicked one
+ * marked with ✓), vote checkboxes become disabled with the chosen options
+ * checked, dropdowns lock on the chosen values, and the title's desc reports
+ * the selection. Only cards without an interaction surface fall back to a
+ * plain text_notice confirmation.
  */
 export function buildClickAckCard(input: ClickAckInput): TemplateCard {
   const original = input.original
@@ -386,8 +393,8 @@ export function buildClickAckCard(input: ClickAckInput): TemplateCard {
       main_title: { title: original.main_title?.title ?? input.ackTitle, desc },
       ...(original.sub_title_text === undefined ? {} : { sub_title_text: original.sub_title_text }),
       button_list: (original.button_list ?? []).map(button => button.key === input.eventKey
-        ? { ...button, text: markSelectedLabel(button.text) }
-        : button),
+        ? { ...button, text: markSelectedLabel(button.text), style: ACK_BUTTON_STYLE }
+        : { ...button, style: ACK_BUTTON_STYLE }),
       ...id,
     }
   }
@@ -429,7 +436,20 @@ export function buildClickAckCard(input: ClickAckInput): TemplateCard {
     return {
       card_type: 'multiple_interaction',
       main_title: { title: original.main_title?.title ?? input.ackTitle, desc },
-      ...(original.select_list === undefined ? {} : { select_list: original.select_list }),
+      // disable is honored only on updates: lock every dropdown on the chosen
+      // value so the submission reads as settled.
+      ...(original.select_list === undefined
+        ? {}
+        : {
+            select_list: original.select_list.map(select => {
+              const chosen = select.option_list.find(option => selected.has(option.id))
+              return {
+                ...select,
+                disable: true,
+                ...(chosen === undefined ? {} : { selected_id: chosen.id }),
+              }
+            }),
+          }),
       ...(original.submit_button === undefined ? {} : { submit_button: original.submit_button }),
       ...id,
     }

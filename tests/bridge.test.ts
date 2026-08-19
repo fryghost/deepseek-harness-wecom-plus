@@ -359,8 +359,8 @@ describe('WeComHarnessBridge', () => {
       main_title: { title: '模板卡片测试', desc: '已选择「确认收到」，正在处理…' },
       sub_title_text: '点击下方按钮验证卡片交互链路。',
       button_list: [
-        expect.objectContaining({ text: '✓ 确认收到', key: 'bot-card-test-ok' }),
-        expect.objectContaining({ text: '再想想', key: 'bot-card-test-retry' }),
+        expect.objectContaining({ text: '✓ 确认收到', key: 'bot-card-test-ok', style: 2 }),
+        expect.objectContaining({ text: '再想想', key: 'bot-card-test-retry', style: 2 }),
       ],
       task_id: taskId,
     })

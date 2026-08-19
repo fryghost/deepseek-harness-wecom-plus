@@ -132,9 +132,11 @@ describe('template card construction', () => {
       main_title: { title: '选择发布方式', desc: '已选择「灰度」，正在处理…' },
       sub_title_text: '完整说明见上一条消息。',
       button_list: [
-        expect.objectContaining({ text: '发布', key: 'opt-1' }),
-        expect.objectContaining({ text: '✓ 灰度', key: 'opt-2' }),
-        expect.objectContaining({ text: '暂不发布', key: 'opt-3' }),
+        // Every button turns grey (style 2): smart-bot cards have no disabled
+        // state, so the whole row reads as settled, ✓ marking the selection.
+        expect.objectContaining({ text: '发布', key: 'opt-1', style: 2 }),
+        expect.objectContaining({ text: '✓ 灰度', key: 'opt-2', style: 2 }),
+        expect.objectContaining({ text: '暂不发布', key: 'opt-3', style: 2 }),
       ],
       task_id: 'release-1',
     })
@@ -187,6 +189,34 @@ describe('template card construction', () => {
       ],
     }))
     expect(ack.submit_button).toEqual({ text: '提交', key: 'vote-submit' })
+  })
+
+  it('acknowledges a multiple-choice submission by locking the dropdowns on the chosen values', () => {
+    const original = buildTemplateCard({
+      cardType: 'multiple_interaction',
+      title: '发布设置',
+      selects: [{
+        questionKey: 'region',
+        title: '目标区域',
+        options: [{ id: 'cn', text: '华南' }, { id: 'eu', text: '欧洲' }],
+      }],
+      submitText: '开始发布',
+      submitKey: 'multi-submit',
+    }, 'dshp')
+    const ack = buildClickAckCard({
+      original,
+      eventKey: 'multi-submit',
+      selectedOptionIds: ['eu'],
+      ackTitle: '正在处理…',
+      ackSubtitle: '请稍候。',
+    })
+    expect(ack.card_type).toBe('multiple_interaction')
+    expect(ack.main_title?.desc).toBe('已选择「欧洲」，正在处理…')
+    expect(ack.select_list).toEqual([expect.objectContaining({
+      question_key: 'region',
+      disable: true,
+      selected_id: 'eu',
+    })])
   })
 
   it('falls back to a text_notice confirmation for unknown tasks and non-interactive cards', () => {

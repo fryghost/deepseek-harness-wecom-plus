@@ -268,6 +268,7 @@ function buildTemplateCard(input, taskIdPrefix) {
     }
   }
 }
+var ACK_BUTTON_STYLE = 2;
 function buildClickAckCard(input) {
   const original = input.original;
   const taskId = input.taskId ?? original?.task_id;
@@ -282,7 +283,7 @@ function buildClickAckCard(input) {
       card_type: "button_interaction",
       main_title: { title: original.main_title?.title ?? input.ackTitle, desc },
       ...original.sub_title_text === void 0 ? {} : { sub_title_text: original.sub_title_text },
-      button_list: (original.button_list ?? []).map((button) => button.key === input.eventKey ? { ...button, text: markSelectedLabel(button.text) } : button),
+      button_list: (original.button_list ?? []).map((button) => button.key === input.eventKey ? { ...button, text: markSelectedLabel(button.text), style: ACK_BUTTON_STYLE } : { ...button, style: ACK_BUTTON_STYLE }),
       ...id
     };
   }
@@ -320,7 +321,18 @@ function buildClickAckCard(input) {
     return {
       card_type: "multiple_interaction",
       main_title: { title: original.main_title?.title ?? input.ackTitle, desc },
-      ...original.select_list === void 0 ? {} : { select_list: original.select_list },
+      // disable is honored only on updates: lock every dropdown on the chosen
+      // value so the submission reads as settled.
+      ...original.select_list === void 0 ? {} : {
+        select_list: original.select_list.map((select) => {
+          const chosen = select.option_list.find((option) => selected.has(option.id));
+          return {
+            ...select,
+            disable: true,
+            ...chosen === void 0 ? {} : { selected_id: chosen.id }
+          };
+        })
+      },
       ...original.submit_button === void 0 ? {} : { submit_button: original.submit_button },
       ...id
     };
@@ -1826,7 +1838,7 @@ var WeComHarnessBridge = class {
       maxReconnectAttempts: this.config.maxReconnectAttempts,
       maxAuthFailureAttempts: this.config.maxAuthFailureAttempts,
       requestTimeout: this.config.sendTimeoutMs,
-      plug_version: "deepseek-harness-wecom-plus/0.6.0"
+      plug_version: "deepseek-harness-wecom-plus/0.6.1"
     });
   }
   async handleWelcome(frame) {
@@ -2500,7 +2512,7 @@ import {
 } from "@deepseek-ai/dsh-settings";
 
 // src/version.ts
-var PLUGIN_VERSION = "0.6.0";
+var PLUGIN_VERSION = "0.6.1";
 
 // src/settings-web.ts
 var SETTINGS_ROUTE = "/_dsh/deepseek-harness-wecom-plus/settings";

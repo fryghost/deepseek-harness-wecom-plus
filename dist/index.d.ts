@@ -13,14 +13,13 @@ type AccessMode = 'open' | 'allowlist' | 'disabled';
 type ImageInputMode = 'auto' | 'always' | 'never';
 /**
  * How template cards accompany model replies.
- * - "auto" (default): adaptive interaction cards. Explicit `wecom_send_card`
- *   calls always win; otherwise the bridge inspects the reply and adds a
- *   button card automatically when the reply asks the user to choose among
- *   options or confirm/cancel — the Markdown message keeps the full details,
- *   the card carries the short option buttons. Informational replies get no
- *   card, so ordinary chat stays clean.
- * - "tool": cards are sent only when the model calls `wecom_send_card`.
+ * - "tool" (default): cards are sent only when the model calls
+ *   `wecom_send_card`. The Markdown message keeps the full content, the card
+ *   carries only the short-label interaction surface — deriving cards from
+ *   reply text was removed because protocol caps force truncated labels.
  * - "off": no cards; `wecom_send_card` fails with a teaching error.
+ * - "auto": deprecated alias of "tool"; accepted so existing configurations
+ *   keep loading, but no adaptive derivation happens anymore.
  */
 type CardMode = 'auto' | 'tool' | 'off';
 /** WeCom AI Bot channel configuration. */
@@ -124,6 +123,8 @@ declare class WeComHarnessBridge {
     private client;
     private stopping;
     private lastError;
+    /** Task ids whose click was already processed; re-clicks are dropped. */
+    private readonly consumedCardTasks;
     constructor(ctx: Context, config: Config, clientFactory?: WeComClientFactory);
     /** Latest channel fact for configuration surfaces. */
     status(): {
@@ -143,6 +144,17 @@ declare class WeComHarnessBridge {
      */
     private handleCardEvent;
     private handleCardEventInner;
+    /**
+     * Update the clicked card in place within the protocol's 5-second window,
+     * trying the best shape first: same-type (options preserved) → text_notice
+     * without a jump → the known-good text_notice with a neutral link. Every
+     * platform rejection is logged with its errcode so constraints are visible.
+     * userids is deliberately omitted so the replacement reaches every view of
+     * the card, not only the clicker's.
+     */
+    private acknowledgeCardClick;
+    /** Bound the consumed-task memory; oldest entries are evicted first. */
+    private rememberConsumedTask;
     private handleMessage;
     private helpText;
     private commandReply;

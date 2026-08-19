@@ -458,7 +458,7 @@ describe('ConversationManager', () => {
     await manager.dispose()
   })
 
-  it('derives an adaptive choice card when cardMode is auto and no explicit card was sent', async () => {
+  it('derives no card from reply text: auto is a deprecated alias of tool', async () => {
     const config = testConfig({ cardMode: 'auto' })
     const events: unknown[] = []
     const agent = {
@@ -503,64 +503,9 @@ describe('ConversationManager', () => {
 
     const reply = await manager.process(textMessage('u-auto', 'm-auto', '我该选哪个方案？'), downloadPort, noopTransport())
 
-    expect(reply.cards).toHaveLength(1)
-    expect(reply.cards[0]).toEqual(expect.objectContaining({
-      card_type: 'button_interaction',
-      main_title: expect.objectContaining({ title: '请选择下一步' }),
-      button_list: [
-        expect.objectContaining({ text: '发布到生产', key: 'opt-1' }),
-        expect.objectContaining({ text: '灰度发布', key: 'opt-2' }),
-        expect.objectContaining({ text: '暂不发布', key: 'opt-3' }),
-      ],
-    }))
-    const taskId = reply.cards[0]?.task_id
-    expect(taskId).toBeDefined()
-    expect(manager.cardLabel(taskId, 'opt-2')).toBe('灰度发布')
-    expect(manager.cardLabel(taskId, 'opt-9')).toBeUndefined()
-    await manager.dispose()
-  })
-
-  it('adds no card in auto mode for informational replies', async () => {
-    const config = testConfig({ cardMode: 'auto' })
-    const events: unknown[] = []
-    const agent = {
-      status: 'idle',
-      options: { provider: 'deepseek', model: 'deepseek-chat' },
-      session: { events },
-      followup: vi.fn(() => {
-        events.push({
-          type: 'assistant/message',
-          data: { message: { content: [{ type: 'text', text: '# 部署完成\n\n应用已上线，运行正常。' }] } },
-        })
-        events.push({ type: 'turn/end', data: { reason: { kind: 'stop' } } })
-      }),
-      whenIdle: vi.fn(async () => undefined),
-    }
-    const ctx = {
-      on: vi.fn(() => vi.fn()),
-      sessionPersistence: { list: vi.fn(async () => []) },
-      agentDefaultModel: { currentSelection: vi.fn(() => ({ provider: 'deepseek', model: 'deepseek-chat' })) },
-      agentPresets: { defaultId: 'standard', mount: vi.fn(async () => ({ id: 'standard' })) },
-      llm: { resolveModelInfo: vi.fn(async () => ({ inputModalities: ['text'] })) },
-      agents: {
-        create: vi.fn(async (options: { setup?: (ctx: never) => Promise<void> }) => {
-          await options.setup?.({
-            systemPrompt: { section: vi.fn(() => vi.fn()) },
-            tools: { register: vi.fn(() => vi.fn()) }, get: vi.fn(() => undefined), reflect: { provide: vi.fn(() => vi.fn()) }, effect: vi.fn((callback: unknown) => { if (typeof callback !== "function") return () => {}; const generator = (callback as () => Generator)(); const first = generator.next(); return typeof first.value === "function" ? first.value as () => void : () => {} }),
-          } as never)
-          return { agent, dispose: vi.fn(async () => undefined) }
-        }),
-        get: vi.fn(),
-      },
-      attachments: {
-        imageLimits: { maxImagesPerMessage: 4, maxMessageImageBytes: 10_000, maxImageBytes: 10_000 },
-      },
-    } as never
-    const manager = new ConversationManager(ctx, config, vi.fn(async () => undefined), vi.fn(async () => undefined), vi.fn(async () => undefined))
-    await manager.initialize()
-
-    const reply = await manager.process(textMessage('u-info', 'm-info', '部署好了吗'), downloadPort, noopTransport())
-
+    // Adaptive derivation was removed: option lists in the Markdown reply no
+    // longer produce a truncated-label button card; cards only come from an
+    // explicit wecom_send_card call or the question bridge.
     expect(reply.cards).toEqual([])
     await manager.dispose()
   })

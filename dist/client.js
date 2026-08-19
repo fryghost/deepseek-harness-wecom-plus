@@ -148,8 +148,7 @@ var POLICY_OPTIONS = [
   { value: "disabled", label: "\u7981\u7528\uFF08disabled\uFF09" }
 ];
 var CARD_MODE_OPTIONS = [
-  { value: "auto", label: "auto\uFF08\u81EA\u9002\u5E94\uFF1A\u9009\u9879/\u786E\u8BA4\u81EA\u52A8\u914D\u5361\uFF09" },
-  { value: "tool", label: "tool\uFF08\u4EC5\u6A21\u578B\u663E\u5F0F\u53D1\u5361\uFF09" },
+  { value: "tool", label: "tool\uFF08\u4EC5\u6A21\u578B\u663E\u5F0F\u53D1\u5361\uFF0C\u9ED8\u8BA4\uFF09" },
   { value: "off", label: "off\uFF08\u5173\u95ED\u5361\u7247\uFF09" }
 ];
 function SettingsSection(props) {
@@ -263,7 +262,7 @@ function LoadedSettings({ controller }) {
     /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("section", { className: "wc-panel", children: [
       /* @__PURE__ */ (0, import_jsx_runtime.jsx)("div", { className: "wc-panel-title", children: /* @__PURE__ */ (0, import_jsx_runtime.jsx)("h3", { children: "\u4EA4\u4E92" }) }),
       /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", { className: "wc-form-grid", children: [
-        /* @__PURE__ */ (0, import_jsx_runtime.jsx)(Field, { label: "\u5361\u7247\u6A21\u5F0F\uFF08cardMode\uFF09", hint: "auto\uFF1A\u56DE\u590D\u5E26\u9009\u9879/\u786E\u8BA4\u65F6\u81EA\u52A8\u751F\u6210\u6309\u94AE\u5361\u7247\uFF1Btool\uFF1A\u4EC5\u6A21\u578B\u8C03\u7528 wecom_send_card \u65F6\u53D1\u5361\uFF1Boff\uFF1A\u5173\u95ED\u5361\u7247\u3002", children: /* @__PURE__ */ (0, import_jsx_runtime.jsx)("select", { className: "wc-input", value: draft.cardMode, onChange: (event) => {
+        /* @__PURE__ */ (0, import_jsx_runtime.jsx)(Field, { label: "\u5361\u7247\u6A21\u5F0F\uFF08cardMode\uFF09", hint: "tool\uFF1A\u4EC5\u6A21\u578B\u8C03\u7528 wecom_send_card \u65F6\u53D1\u5361\uFF08Markdown \u627F\u8F7D\u5168\u6587\u3001\u5361\u7247\u627F\u8F7D\u77ED\u6807\u7B7E\u4EA4\u4E92\uFF09\uFF1Boff\uFF1A\u5173\u95ED\u5361\u7247\u3002", children: /* @__PURE__ */ (0, import_jsx_runtime.jsx)("select", { className: "wc-input", value: draft.cardMode, onChange: (event) => {
           update("cardMode", event.target.value);
         }, children: CARD_MODE_OPTIONS.map((option) => /* @__PURE__ */ (0, import_jsx_runtime.jsx)("option", { value: option.value, children: option.label }, option.value)) }) }),
         /* @__PURE__ */ (0, import_jsx_runtime.jsx)(Field, { label: "\u5355\u804A\u7B56\u7565\uFF08singlePolicy\uFF09", children: /* @__PURE__ */ (0, import_jsx_runtime.jsx)("select", { className: "wc-input", value: draft.singlePolicy, onChange: (event) => {

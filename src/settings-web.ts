@@ -115,7 +115,9 @@ function userSettingsOf(config: unknown): WeComUserSettings {
   const record = isRecord(config) ? config : {}
   return {
     botId: typeof record.botId === 'string' ? record.botId : '',
-    cardMode: record.cardMode === 'tool' || record.cardMode === 'off' ? record.cardMode : 'auto',
+    // Legacy "auto" settings normalize to "tool": adaptive derivation was
+    // removed, and the UI no longer offers "auto".
+    cardMode: record.cardMode === 'off' ? 'off' : 'tool',
     singlePolicy: record.singlePolicy === 'allowlist' || record.singlePolicy === 'disabled' ? record.singlePolicy : 'open',
     groupPolicy: record.groupPolicy === 'allowlist' || record.groupPolicy === 'disabled' ? record.groupPolicy : 'open',
     welcomeText: typeof record.welcomeText === 'string' ? record.welcomeText : '',

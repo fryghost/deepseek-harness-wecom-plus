@@ -39,7 +39,7 @@ export const BUTTON_LABEL_MAX_CHARS = 6
 const VOTE_SUBMIT_KEY = 'q-submit'
 
 /** Flatten the selected option ids from a vote/multiple submit event. */
-function selectedOptionIds(event: unknown): string[] {
+export function selectedOptionIds(event: unknown): string[] {
   if (typeof event !== 'object' || event === null) return []
   const record = event as Record<string, unknown>
   const nested = record.template_card_event
@@ -102,6 +102,8 @@ interface PendingQuestion {
   question: AskUserQuestionItem
   mode: 'buttons' | 'vote' | 'text'
   taskId: string | undefined
+  /** The presented card, kept so a click can update it in place same-type. */
+  card?: TemplateCard
   byKey?: Map<string, string>
   byId?: Map<string, string>
   submitKey?: string
@@ -147,6 +149,20 @@ export class WeComQuestionBridge {
     const { taskId, eventKey } = cardEventFacts(message.event)
     if (eventKey === undefined || taskId !== pending.taskId) return undefined
     return pending.byKey?.get(eventKey)
+  }
+
+  /**
+   * Peek at one click without settling: when it targets a pending question,
+   * return the presented card so the bridge can acknowledge the click with a
+   * same-type in-place update that keeps the options visible.
+   */
+  questionCard(message: EventMessageWith<TemplateCardEventData>): TemplateCard | undefined {
+    const target = chatTarget(message)
+    const pending = this.pending.get(target)
+    if (pending === undefined) return undefined
+    const { taskId } = cardEventFacts(message.event)
+    if (taskId !== pending.taskId) return undefined
+    return pending.card
   }
 
   /**
@@ -284,6 +300,7 @@ export class WeComQuestionBridge {
             desc: options.length > 0 ? '回复数字或选项名称' : '请用文字回答上面的问题',
           }, this.config.cardTaskIdPrefix)
       pending.taskId = card.task_id
+      pending.card = card
       if (buttons) {
         pending.byKey = new Map(card.button_list?.map(button => [button.key, button.text] as const))
       } else if (vote) {

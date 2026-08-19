@@ -268,92 +268,79 @@ function buildTemplateCard(input, taskIdPrefix) {
     }
   }
 }
-function deriveAdaptiveCard(text, taskIdPrefix) {
-  const choice = deriveChoiceCard(text, taskIdPrefix);
-  if (choice !== void 0) return choice;
-  return deriveConfirmCard(text, taskIdPrefix);
-}
-var LIST_ITEM_PATTERN = /^\s*(?:\d+[.、)）]\s*|[-*•·]\s+)(.+)$/u;
-var CHOICE_CUE_PATTERN = /选择|选项|choose|select|pick|哪一个|哪个|which|回复数字|确认|是否|投票/iu;
-function deriveChoiceCard(text, taskIdPrefix) {
-  const lines = text.split("\n");
-  while (lines.length > 0 && lines[lines.length - 1]?.trim() === "") lines.pop();
-  const items = [];
-  let cueLine = "";
-  for (let index = lines.length - 1; index >= 0; index -= 1) {
-    const match = LIST_ITEM_PATTERN.exec(lines[index] ?? "");
-    if (match === null) {
-      cueLine = lines[index] ?? "";
-      break;
+function buildClickAckCard(input) {
+  const original = input.original;
+  const taskId = input.taskId ?? original?.task_id;
+  const id = taskId === void 0 ? {} : { task_id: taskId };
+  if (original?.card_type === "button_interaction") {
+    const label = input.selectedLabel ?? original.button_list?.find((button) => button.key === input.eventKey)?.text;
+    const desc = truncateChars(
+      label === void 0 ? input.ackSubtitle : `\u5DF2\u9009\u62E9\u300C${label}\u300D\uFF0C\u6B63\u5728\u5904\u7406\u2026`,
+      CARD_LIMITS.titleDesc
+    );
+    return {
+      card_type: "button_interaction",
+      main_title: { title: original.main_title?.title ?? input.ackTitle, desc },
+      ...original.sub_title_text === void 0 ? {} : { sub_title_text: original.sub_title_text },
+      button_list: (original.button_list ?? []).map((button) => button.key === input.eventKey ? { ...button, text: markSelectedLabel(button.text) } : button),
+      ...id
+    };
+  }
+  if (original?.card_type === "vote_interaction" && original.checkbox !== void 0) {
+    const selected = new Set(input.selectedOptionIds ?? []);
+    const labels = original.checkbox.option_list.filter((option) => selected.has(option.id)).map((option) => option.text);
+    const desc = truncateChars(
+      labels.length > 0 ? `\u5DF2\u9009\u62E9\u300C${labels.join("\u3001")}\u300D\uFF0C\u6B63\u5728\u5904\u7406\u2026` : input.ackSubtitle,
+      CARD_LIMITS.titleDesc
+    );
+    return {
+      card_type: "vote_interaction",
+      main_title: { title: original.main_title?.title ?? input.ackTitle, desc },
+      checkbox: {
+        ...original.checkbox,
+        disable: true,
+        option_list: original.checkbox.option_list.map((option) => selected.size > 0 ? { ...option, is_checked: selected.has(option.id) } : option)
+      },
+      ...original.submit_button === void 0 ? {} : { submit_button: original.submit_button },
+      ...id
+    };
+  }
+  if (original?.card_type === "multiple_interaction") {
+    const selected = new Set(input.selectedOptionIds ?? []);
+    const labels = [];
+    for (const select of original.select_list ?? []) {
+      for (const option of select.option_list ?? []) {
+        if (selected.has(option.id)) labels.push(option.text);
+      }
     }
-    items.unshift(match[1] ?? "");
+    const desc = truncateChars(
+      labels.length > 0 ? `\u5DF2\u9009\u62E9\u300C${labels.join("\u3001")}\u300D\uFF0C\u6B63\u5728\u5904\u7406\u2026` : input.ackSubtitle,
+      CARD_LIMITS.titleDesc
+    );
+    return {
+      card_type: "multiple_interaction",
+      main_title: { title: original.main_title?.title ?? input.ackTitle, desc },
+      ...original.select_list === void 0 ? {} : { select_list: original.select_list },
+      ...original.submit_button === void 0 ? {} : { submit_button: original.submit_button },
+      ...id
+    };
   }
-  if (items.length < 2 || items.length > CARD_LIMITS.maxButtons) return void 0;
-  if (cueLine === "") return void 0;
-  const labels = [];
-  let allShort = true;
-  for (const item of items) {
-    const label = optionLabel(item);
-    if (label === void 0) return void 0;
-    if (label.length > CARD_LIMITS.buttonText) allShort = false;
-    labels.push(label);
-  }
-  const cue = CHOICE_CUE_PATTERN.test(cueLine);
-  if (!cue && !(allShort && cueLine.trim().endsWith("\uFF1F"))) return void 0;
-  const buttons = labels.map((label, index) => ({
-    text: label,
-    key: `opt-${index + 1}`
-  }));
-  const title = truncateChars(stripMarkdownPrefix(cueLine).replace(/[：:？?。.!！]+$/u, ""), CARD_LIMITS.title) || "\u8BF7\u9009\u62E9";
-  const card = buildTemplateCard({
-    cardType: "button_interaction",
-    title,
-    buttons
-  }, taskIdPrefix);
-  const keyLabels = /* @__PURE__ */ new Map();
-  for (let index = 0; index < buttons.length; index += 1) {
-    const button = buttons[index];
-    if (button !== void 0) keyLabels.set(button.key, labels[index] ?? button.text);
-  }
-  return { card, labels: keyLabels };
+  return buildTextNoticeAckCard(taskId, input.ackTitle, input.ackSubtitle);
 }
-var CONFIRM_QUESTION_PATTERN = /是否|要不要|需不需要|确认|继续|取消/u;
-function deriveConfirmCard(text, taskIdPrefix) {
-  const lines = text.trim().split("\n");
-  const last = lines[lines.length - 1]?.trim() ?? "";
-  if (!last.endsWith("\uFF1F") && !last.endsWith("?")) return void 0;
-  if (!CONFIRM_QUESTION_PATTERN.test(last)) return void 0;
-  const verb = /继续/u.test(last) ? "\u7EE7\u7EED" : "\u786E\u8BA4";
-  const buttons = [
-    { text: verb, key: "confirm", style: 1 },
-    { text: "\u53D6\u6D88", key: "cancel", style: 2 }
-  ];
-  const title = truncateChars(stripMarkdownPrefix(last).replace(/[：:？?。.!！]+$/u, ""), CARD_LIMITS.title) || verb;
-  const card = buildTemplateCard({
-    cardType: "button_interaction",
-    title,
-    buttons
-  }, taskIdPrefix);
+function buildTextNoticeAckCard(taskId, ackTitle, ackSubtitle, jump = true) {
   return {
-    card,
-    labels: /* @__PURE__ */ new Map([
-      ["confirm", verb],
-      ["cancel", "\u53D6\u6D88"]
-    ])
+    card_type: "text_notice",
+    main_title: {
+      title: truncateChars(ackTitle, CARD_LIMITS.title),
+      desc: truncateChars(ackSubtitle, CARD_LIMITS.titleDesc)
+    },
+    card_action: jump ? { type: 1, url: "https://open.work.weixin.qq.com/" } : { type: 0 },
+    ...taskId === void 0 ? {} : { task_id: taskId }
   };
 }
-function optionLabel(item) {
-  const content = item.trim();
-  if (content.length === 0) return void 0;
-  const separator = content.search(/[：:｜|—–-]/u);
-  if (separator > 0) {
-    const head = content.slice(0, separator).trim();
-    return head.length === 0 ? void 0 : stripMarkdownPrefix(head);
-  }
-  return content.length <= CARD_LIMITS.buttonText ? content : void 0;
-}
-function stripMarkdownPrefix(value) {
-  return value.replace(/^[#>+\-*]\s*/u, "").replace(/[*_`~]/gu, "").trim();
+function markSelectedLabel(text) {
+  const marked = `\u2713 ${text}`;
+  return marked.length <= CARD_LIMITS.buttonText ? marked : truncateChars(marked, CARD_LIMITS.buttonText);
 }
 
 // src/conversations.ts
@@ -728,6 +715,19 @@ var WeComQuestionBridge = class {
     return pending.byKey?.get(eventKey);
   }
   /**
+   * Peek at one click without settling: when it targets a pending question,
+   * return the presented card so the bridge can acknowledge the click with a
+   * same-type in-place update that keeps the options visible.
+   */
+  questionCard(message) {
+    const target = chatTarget(message);
+    const pending = this.pending.get(target);
+    if (pending === void 0) return void 0;
+    const { taskId } = cardEventFacts(message.event);
+    if (taskId !== pending.taskId) return void 0;
+    return pending.card;
+  }
+  /**
    * Settle a pending question with a card button click. Returns true when the
    * click belonged to a pending question (the bridge must not start a model
    * turn for it), false otherwise.
@@ -837,6 +837,7 @@ var WeComQuestionBridge = class {
         desc: options.length > 0 ? "\u56DE\u590D\u6570\u5B57\u6216\u9009\u9879\u540D\u79F0" : "\u8BF7\u7528\u6587\u5B57\u56DE\u7B54\u4E0A\u9762\u7684\u95EE\u9898"
       }, this.config.cardTaskIdPrefix);
       pending.taskId = card.task_id;
+      pending.card = card;
       if (buttons) {
         pending.byKey = new Map(card.button_list?.map((button) => [button.key, button.text]));
       } else if (vote) {
@@ -937,7 +938,7 @@ var ConversationManager = class {
   activeTurns = /* @__PURE__ */ new Map();
   activeStreams = /* @__PURE__ */ new Map();
   pendingCards = /* @__PURE__ */ new Map();
-  cardLabels = /* @__PURE__ */ new Map();
+  cardRegistry = /* @__PURE__ */ new Map();
   questions;
   generations = /* @__PURE__ */ new Map();
   persistedIds = /* @__PURE__ */ new Set();
@@ -966,7 +967,41 @@ var ConversationManager = class {
     if (taskId === void 0 || taskId.length === 0 || eventKey === void 0 || eventKey.length === 0) {
       return void 0;
     }
-    return this.cardLabels.get(taskId)?.get(eventKey);
+    return this.cardRegistry.get(taskId)?.labels.get(eventKey);
+  }
+  /**
+   * The sent card registered under one task id, kept so a later click can be
+   * acknowledged with a same-type in-place update that preserves the option
+   * surface instead of replacing the card with a plain notification.
+   */
+  cardSnapshot(taskId) {
+    if (taskId === void 0 || taskId.length === 0) return void 0;
+    return this.cardRegistry.get(taskId)?.card;
+  }
+  /**
+   * Remember sent cards and their button key → visible label pairs so a
+   * later click (which only echoes event_key) can be resolved to the chosen
+   * option and acknowledged in place.
+   */
+  registerCards(cards) {
+    for (const card of cards) {
+      const taskId = card.task_id;
+      if (taskId === void 0) continue;
+      let entry = this.cardRegistry.get(taskId);
+      if (entry === void 0) {
+        entry = { card, labels: /* @__PURE__ */ new Map() };
+        this.cardRegistry.set(taskId, entry);
+        while (this.cardRegistry.size > MAX_CARD_LABEL_TASKS) {
+          const oldest = this.cardRegistry.keys().next().value;
+          if (oldest === void 0) break;
+          this.cardRegistry.delete(oldest);
+        }
+      }
+      for (const button of card.button_list ?? []) entry.labels.set(button.key, button.text);
+      if (card.submit_button !== void 0) {
+        entry.labels.set(card.submit_button.key, `\u63D0\u4EA4\uFF1A${card.submit_button.text}`);
+      }
+    }
   }
   /**
    * Peek at one click without settling: when it targets a pending button
@@ -974,6 +1009,15 @@ var ConversationManager = class {
    */
   pendingQuestionLabel(message) {
     return this.questions.questionLabel(message);
+  }
+  /**
+   * Peek at one click without settling: when it targets a pending question,
+   * return the question card itself so the click can be acknowledged with a
+   * same-type in-place update. Must be read BEFORE settling, which removes
+   * the pending entry.
+   */
+  pendingQuestionCard(message) {
+    return this.questions.questionCard(message);
   }
   /**
    * Settle a pending ask_user_question with a card button click. Returns true
@@ -1063,7 +1107,7 @@ var ConversationManager = class {
     this.activeTurns.clear();
     this.activeStreams.clear();
     this.pendingCards.clear();
-    this.cardLabels.clear();
+    this.cardRegistry.clear();
   }
   enqueue(baseId, operation) {
     const previous = this.queues.get(baseId) ?? Promise.resolve();
@@ -1176,18 +1220,14 @@ var ConversationManager = class {
     }
   }
   /**
-   * Attach the turn's queued cards to a collected reply. In "auto" mode an
-   * adaptive interaction card accompanies the Markdown reply whenever the
-   * reply asks the user to choose or confirm and the model did not send an
-   * explicit card first.
+   * Attach the turn's queued cards to a collected reply. Cards are only ever
+   * produced by explicit `wecom_send_card` calls (or the question bridge):
+   * the Markdown message carries the full content, the card carries only the
+   * interaction surface.
    */
   finalizeReply(id, collected) {
     const cards = this.takeCards(id);
-    if (this.config.cardMode === "auto" && cards.length === 0 && collected.text.trim().length > 0) {
-      const derived = deriveAdaptiveCard(collected.text, this.config.cardTaskIdPrefix);
-      if (derived !== void 0) cards.push(derived.card);
-    }
-    this.registerCardLabels(cards);
+    this.registerCards(cards);
     return { ...collected, cards };
   }
   /** Drain and clear the template cards queued by one active turn's tools. */
@@ -1195,30 +1235,6 @@ var ConversationManager = class {
     const cards = this.pendingCards.get(id) ?? [];
     this.pendingCards.delete(id);
     return cards;
-  }
-  /**
-   * Remember every sent card's button key → visible label pairs so a later
-   * click (which only echoes event_key) can be resolved to the chosen option.
-   */
-  registerCardLabels(cards) {
-    for (const card of cards) {
-      const taskId = card.task_id;
-      if (taskId === void 0) continue;
-      let labels = this.cardLabels.get(taskId);
-      if (labels === void 0) {
-        labels = /* @__PURE__ */ new Map();
-        this.cardLabels.set(taskId, labels);
-        while (this.cardLabels.size > MAX_CARD_LABEL_TASKS) {
-          const oldest = this.cardLabels.keys().next().value;
-          if (oldest === void 0) break;
-          this.cardLabels.delete(oldest);
-        }
-      }
-      for (const button of card.button_list ?? []) labels.set(button.key, button.text);
-      if (card.submit_button !== void 0) {
-        labels.set(card.submit_button.key, `\u63D0\u4EA4\uFF1A${card.submit_button.text}`);
-      }
-    }
   }
   async includeImages(agent) {
     if (this.config.imageInputMode === "always") return true;
@@ -1713,6 +1729,8 @@ var WeComHarnessBridge = class {
   client;
   stopping = false;
   lastError;
+  /** Task ids whose click was already processed; re-clicks are dropped. */
+  consumedCardTasks = /* @__PURE__ */ new Set();
   /** Latest channel fact for configuration surfaces. */
   status() {
     const client = this.client;
@@ -1808,7 +1826,7 @@ var WeComHarnessBridge = class {
       maxReconnectAttempts: this.config.maxReconnectAttempts,
       maxAuthFailureAttempts: this.config.maxAuthFailureAttempts,
       requestTimeout: this.config.sendTimeoutMs,
-      plug_version: "deepseek-harness-wecom-plus/0.5.10"
+      plug_version: "deepseek-harness-wecom-plus/0.6.0"
     });
   }
   async handleWelcome(frame) {
@@ -1844,29 +1862,28 @@ var WeComHarnessBridge = class {
     const facts = cardEventFacts(body.event);
     const taskId = facts.taskId?.trim();
     const eventKey = facts.eventKey?.trim();
+    if (taskId !== void 0 && taskId.length > 0 && this.consumedCardTasks.has(taskId)) {
+      this.log.info("WeCom card %s re-click on consumed task %s ignored", body.msgid, taskId);
+      return;
+    }
+    const questionCard = this.conversations.pendingQuestionCard(body);
     const questionLabel = this.conversations.pendingQuestionLabel(body);
     const answered = this.conversations.tryAnswerFromClick(body);
+    const original = questionCard ?? this.conversations.cardSnapshot(taskId);
     let acked = false;
     if (taskId !== void 0 && taskId.length > 0) {
-      try {
-        await withTimeout(this.requireClient().updateTemplateCard(frame, {
-          card_type: "text_notice",
-          main_title: {
-            title: questionLabel === void 0 ? truncateChars(this.config.cardClickAckTitle, CARD_LIMITS.title) : truncateChars(`\u5DF2\u9009\u62E9\u300C${questionLabel}\u300D`, CARD_LIMITS.title),
-            desc: truncateChars(this.config.cardClickAckSubtitle, CARD_LIMITS.titleDesc)
-          },
-          // The update API requires a valid card_action on text_notice cards
-          // (errcode 42045 otherwise); a neutral same-site URL satisfies it.
-          card_action: { type: 1, url: "https://open.work.weixin.qq.com/" },
-          task_id: taskId
-        }, [body.from.userid]), 4500, "WeCom card click acknowledgement");
-        acked = true;
-      } catch (error) {
-        this.log.warn("WeCom card click acknowledgement failed: %s", String(error));
-        console.error("[wecom-plus] card ack failed: %s", String(error));
-        console.error("[wecom-plus] card ack error detail: %s", JSON.stringify(error));
-      }
+      const ackCard = buildClickAckCard({
+        original,
+        taskId,
+        eventKey: eventKey ?? "",
+        selectedLabel: questionLabel ?? this.conversations.cardLabel(taskId, eventKey),
+        selectedOptionIds: selectedOptionIds(body.event),
+        ackTitle: this.config.cardClickAckTitle,
+        ackSubtitle: this.config.cardClickAckSubtitle
+      });
+      acked = await this.acknowledgeCardClick(frame, taskId, ackCard, original !== void 0);
     }
+    this.rememberConsumedTask(taskId);
     console.error(
       "[wecom-plus] card click msgid=%s task=%s key=%s questionLabel=%s answered=%s acked=%s raw=%s",
       body.msgid,
@@ -1890,6 +1907,51 @@ var WeComHarnessBridge = class {
     } catch (error) {
       this.log.error("WeCom card click %s failed: %s", body.msgid, String(error));
       await transport.fail("\u5904\u7406\u6309\u94AE\u70B9\u51FB\u65F6\u53D1\u751F\u9519\u8BEF\uFF0C\u8BF7\u7A0D\u540E\u91CD\u8BD5\u3002");
+    }
+  }
+  /**
+   * Update the clicked card in place within the protocol's 5-second window,
+   * trying the best shape first: same-type (options preserved) → text_notice
+   * without a jump → the known-good text_notice with a neutral link. Every
+   * platform rejection is logged with its errcode so constraints are visible.
+   * userids is deliberately omitted so the replacement reaches every view of
+   * the card, not only the clicker's.
+   */
+  async acknowledgeCardClick(frame, taskId, ackCard, sameType) {
+    const noJump = buildTextNoticeAckCard(taskId, this.config.cardClickAckTitle, this.config.cardClickAckSubtitle, false);
+    const withJump = buildTextNoticeAckCard(taskId, this.config.cardClickAckTitle, this.config.cardClickAckSubtitle, true);
+    const attempts = sameType ? [
+      { path: "same-type", card: ackCard },
+      { path: "text-notice-nojump", card: noJump },
+      { path: "text-notice-jump", card: withJump }
+    ] : [
+      { path: "text-notice-nojump", card: noJump },
+      { path: "text-notice-jump", card: withJump }
+    ];
+    for (const attempt of attempts) {
+      try {
+        await withTimeout(
+          this.requireClient().updateTemplateCard(frame, attempt.card),
+          4500,
+          `WeCom card click acknowledgement (${attempt.path})`
+        );
+        console.error("[wecom-plus] card ack applied path=%s card=%s", attempt.path, JSON.stringify(attempt.card));
+        return true;
+      } catch (error) {
+        console.error("[wecom-plus] card ack rejected path=%s err=%s", attempt.path, wireErrorDetail(error));
+        this.log.warn("WeCom card click acknowledgement failed (%s): %s", attempt.path, wireErrorDetail(error));
+      }
+    }
+    return false;
+  }
+  /** Bound the consumed-task memory; oldest entries are evicted first. */
+  rememberConsumedTask(taskId) {
+    if (taskId === void 0 || taskId.length === 0) return;
+    this.consumedCardTasks.add(taskId);
+    while (this.consumedCardTasks.size > 1e3) {
+      const oldest = this.consumedCardTasks.values().next().value;
+      if (oldest === void 0) break;
+      this.consumedCardTasks.delete(oldest);
     }
   }
   async handleMessage(frame) {
@@ -1932,6 +1994,7 @@ var WeComHarnessBridge = class {
             { text: "\u518D\u60F3\u60F3", key: "bot-card-test-retry", style: 2 }
           ]
         }, this.config.cardTaskIdPrefix);
+        this.conversations.registerCards([card]);
         await this.retry(async () => withTimeout(
           this.requireClient().sendMessage(chatTarget(message), { msgtype: "template_card", template_card: card }),
           this.config.sendTimeoutMs,
@@ -2365,6 +2428,15 @@ function imageFilename(mediaType) {
   if (mediaType === "image/webp") return "image.webp";
   return "image.png";
 }
+function wireErrorDetail(error) {
+  if (typeof error === "object" && error !== null) {
+    const record = error;
+    if (record.errcode !== void 0 || record.errmsg !== void 0) {
+      return `errcode=${String(record.errcode ?? "?")} errmsg=${String(record.errmsg ?? "?")}`;
+    }
+  }
+  return String(error);
+}
 function chatTargetOf(frame) {
   const body = frame.body;
   if (body === void 0) throw new Error("WeCom stream frame has no message body");
@@ -2396,7 +2468,7 @@ var Config = z.object({
   groupAllowFrom: z.array(z.string()).default([]),
   allowedHarnessCommands: z.array(z.string().pattern(COMMAND_NAME_PATTERN)).default(["compact", "goal", "plan"]),
   imageInputMode: z.union(["auto", "always", "never"]).default("auto"),
-  cardMode: z.union(["auto", "tool", "off"]).default("auto"),
+  cardMode: z.union(["auto", "tool", "off"]).default("tool"),
   cardTaskIdPrefix: z.string().default("dshp"),
   cardClickAckTitle: z.string().default("\u6B63\u5728\u5904\u7406\u2026"),
   cardClickAckSubtitle: z.string().default("\u5DF2\u6536\u5230\u6309\u94AE\u70B9\u51FB\uFF0C\u6B63\u5728\u5904\u7406\uFF0C\u8BF7\u7A0D\u5019\u3002"),
@@ -2428,7 +2500,7 @@ import {
 } from "@deepseek-ai/dsh-settings";
 
 // src/version.ts
-var PLUGIN_VERSION = "0.5.10";
+var PLUGIN_VERSION = "0.6.0";
 
 // src/settings-web.ts
 var SETTINGS_ROUTE = "/_dsh/deepseek-harness-wecom-plus/settings";
@@ -2453,7 +2525,9 @@ function userSettingsOf(config) {
   const record = isRecord(config) ? config : {};
   return {
     botId: typeof record.botId === "string" ? record.botId : "",
-    cardMode: record.cardMode === "tool" || record.cardMode === "off" ? record.cardMode : "auto",
+    // Legacy "auto" settings normalize to "tool": adaptive derivation was
+    // removed, and the UI no longer offers "auto".
+    cardMode: record.cardMode === "off" ? "off" : "tool",
     singlePolicy: record.singlePolicy === "allowlist" || record.singlePolicy === "disabled" ? record.singlePolicy : "open",
     groupPolicy: record.groupPolicy === "allowlist" || record.groupPolicy === "disabled" ? record.groupPolicy : "open",
     welcomeText: typeof record.welcomeText === "string" ? record.welcomeText : ""

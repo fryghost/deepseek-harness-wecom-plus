@@ -21,7 +21,7 @@ import {
   type WsFrame,
   type WsFrameHeaders,
 } from '@wecom/aibot-node-sdk'
-import { buildTemplateCard, CARD_LIMITS, truncateChars } from './card.js'
+import { buildClickAckCard, buildTemplateCard, buildTextNoticeAckCard } from './card.js'
 import type { Config } from './config.js'
 import {
   ConversationManager,
@@ -31,7 +31,7 @@ import {
 } from './conversations.js'
 import type { WeComDownloadPort } from './inbound.js'
 import type { OutboundFile } from './outbound-file.js'
-import { cardEventFacts } from './questions.js'
+import { cardEventFacts, selectedOptionIds } from './questions.js'
 import { chatTarget, SeenMessageIds, truncateUtf8, withTimeout } from './util.js'
 
 const OUTBOUND_TEST_PNG = Buffer.from(
@@ -107,6 +107,8 @@ export class WeComHarnessBridge {
   private client: WeComClientPort | undefined
   private stopping = false
   private lastError: string | undefined
+  /** Task ids whose click was already processed; re-clicks are dropped. */
+  private readonly consumedCardTasks = new Set<string>()
 
   constructor(
     private readonly ctx: Context,
@@ -231,7 +233,7 @@ export class WeComHarnessBridge {
       maxReconnectAttempts: this.config.maxReconnectAttempts,
       maxAuthFailureAttempts: this.config.maxAuthFailureAttempts,
       requestTimeout: this.config.sendTimeoutMs,
-      plug_version: 'deepseek-harness-wecom-plus/0.5.10',
+      plug_version: 'deepseek-harness-wecom-plus/0.6.0',
     })
   }
 
@@ -275,35 +277,36 @@ export class WeComHarnessBridge {
     const facts = cardEventFacts(body.event)
     const taskId = facts.taskId?.trim()
     const eventKey = facts.eventKey?.trim()
-    // A click on a pending ask_user_question card is the ANSWER: settle the
-    // question FIRST (no await in between, no race window), then acknowledge
-    // the choice on the card, and let the running turn continue.
+    if (taskId !== undefined && taskId.length > 0 && this.consumedCardTasks.has(taskId)) {
+      // The card already shows the acknowledged selection; a re-click must
+      // neither update the card again nor start another model turn.
+      this.log.info('WeCom card %s re-click on consumed task %s ignored', body.msgid, taskId)
+      return
+    }
+    // Read the pending-question facts BEFORE settling: settling removes the
+    // pending entry, and the question card snapshot is needed to acknowledge
+    // the click with a same-type in-place update.
+    const questionCard = this.conversations.pendingQuestionCard(body)
     const questionLabel = this.conversations.pendingQuestionLabel(body)
     const answered = this.conversations.tryAnswerFromClick(body)
+    const original = questionCard ?? this.conversations.cardSnapshot(taskId)
     // The in-place card acknowledgement outcome is part of the diagnostic.
     let acked = false
     if (taskId !== undefined && taskId.length > 0) {
-      try {
-        await withTimeout(this.requireClient().updateTemplateCard(frame, {
-          card_type: 'text_notice',
-          main_title: {
-            title: questionLabel === undefined
-              ? truncateChars(this.config.cardClickAckTitle, CARD_LIMITS.title)
-              : truncateChars(`已选择「${questionLabel}」`, CARD_LIMITS.title),
-            desc: truncateChars(this.config.cardClickAckSubtitle, CARD_LIMITS.titleDesc),
-          },
-          // The update API requires a valid card_action on text_notice cards
-          // (errcode 42045 otherwise); a neutral same-site URL satisfies it.
-          card_action: { type: 1, url: 'https://open.work.weixin.qq.com/' },
-          task_id: taskId,
-        }, [body.from.userid]), 4_500, 'WeCom card click acknowledgement')
-        acked = true
-      } catch (error) {
-        this.log.warn('WeCom card click acknowledgement failed: %s', String(error))
-        console.error('[wecom-plus] card ack failed: %s', String(error))
-        console.error('[wecom-plus] card ack error detail: %s', JSON.stringify(error))
-      }
+      // Same-type update: interaction cards keep their option surface, the
+      // clicked button marked, the title desc reporting the selection.
+      const ackCard = buildClickAckCard({
+        original,
+        taskId,
+        eventKey: eventKey ?? '',
+        selectedLabel: questionLabel ?? this.conversations.cardLabel(taskId, eventKey),
+        selectedOptionIds: selectedOptionIds(body.event),
+        ackTitle: this.config.cardClickAckTitle,
+        ackSubtitle: this.config.cardClickAckSubtitle,
+      })
+      acked = await this.acknowledgeCardClick(frame, taskId, ackCard, original !== undefined)
     }
+    this.rememberConsumedTask(taskId)
     console.error(
       '[wecom-plus] card click msgid=%s task=%s key=%s questionLabel=%s answered=%s acked=%s raw=%s',
       body.msgid,
@@ -331,6 +334,60 @@ export class WeComHarnessBridge {
     } catch (error) {
       this.log.error('WeCom card click %s failed: %s', body.msgid, String(error))
       await transport.fail('处理按钮点击时发生错误，请稍后重试。')
+    }
+  }
+
+  /**
+   * Update the clicked card in place within the protocol's 5-second window,
+   * trying the best shape first: same-type (options preserved) → text_notice
+   * without a jump → the known-good text_notice with a neutral link. Every
+   * platform rejection is logged with its errcode so constraints are visible.
+   * userids is deliberately omitted so the replacement reaches every view of
+   * the card, not only the clicker's.
+   */
+  private async acknowledgeCardClick(
+    frame: WsFrame<EventMessageWith<TemplateCardEventData>>,
+    taskId: string,
+    ackCard: TemplateCard,
+    sameType: boolean,
+  ): Promise<boolean> {
+    const noJump = buildTextNoticeAckCard(taskId, this.config.cardClickAckTitle, this.config.cardClickAckSubtitle, false)
+    const withJump = buildTextNoticeAckCard(taskId, this.config.cardClickAckTitle, this.config.cardClickAckSubtitle, true)
+    const attempts: Array<{ path: string; card: TemplateCard }> = sameType
+      ? [
+          { path: 'same-type', card: ackCard },
+          { path: 'text-notice-nojump', card: noJump },
+          { path: 'text-notice-jump', card: withJump },
+        ]
+      : [
+          { path: 'text-notice-nojump', card: noJump },
+          { path: 'text-notice-jump', card: withJump },
+        ]
+    for (const attempt of attempts) {
+      try {
+        await withTimeout(
+          this.requireClient().updateTemplateCard(frame, attempt.card),
+          4_500,
+          `WeCom card click acknowledgement (${attempt.path})`,
+        )
+        console.error('[wecom-plus] card ack applied path=%s card=%s', attempt.path, JSON.stringify(attempt.card))
+        return true
+      } catch (error) {
+        console.error('[wecom-plus] card ack rejected path=%s err=%s', attempt.path, wireErrorDetail(error))
+        this.log.warn('WeCom card click acknowledgement failed (%s): %s', attempt.path, wireErrorDetail(error))
+      }
+    }
+    return false
+  }
+
+  /** Bound the consumed-task memory; oldest entries are evicted first. */
+  private rememberConsumedTask(taskId: string | undefined): void {
+    if (taskId === undefined || taskId.length === 0) return
+    this.consumedCardTasks.add(taskId)
+    while (this.consumedCardTasks.size > 1_000) {
+      const oldest = this.consumedCardTasks.values().next().value
+      if (oldest === undefined) break
+      this.consumedCardTasks.delete(oldest)
     }
   }
 
@@ -374,6 +431,9 @@ export class WeComHarnessBridge {
             { text: '再想想', key: 'bot-card-test-retry', style: 2 },
           ],
         }, this.config.cardTaskIdPrefix)
+        // Register the snapshot so a click can be acknowledged same-type with
+        // the options preserved, exactly like model-sent cards.
+        this.conversations.registerCards([card])
         await this.retry(async () => withTimeout(
           this.requireClient().sendMessage(chatTarget(message), { msgtype: 'template_card', template_card: card }),
           this.config.sendTimeoutMs,
@@ -841,6 +901,21 @@ function imageFilename(mediaType: string): string {
   if (mediaType === 'image/gif') return 'image.gif'
   if (mediaType === 'image/webp') return 'image.webp'
   return 'image.png'
+}
+
+/**
+ * The SDK rejects reply acks with the raw response FRAME (a plain object with
+ * errcode/errmsg), which String() renders as "[object Object]". Surface the
+ * platform facts instead so rejections are diagnosable from the DSH log.
+ */
+function wireErrorDetail(error: unknown): string {
+  if (typeof error === 'object' && error !== null) {
+    const record = error as { errcode?: unknown; errmsg?: unknown; message?: unknown }
+    if (record.errcode !== undefined || record.errmsg !== undefined) {
+      return `errcode=${String(record.errcode ?? '?')} errmsg=${String(record.errmsg ?? '?')}`
+    }
+  }
+  return String(error)
 }
 
 /** Outbound target of one stream frame's message body. */

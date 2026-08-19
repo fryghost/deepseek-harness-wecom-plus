@@ -321,7 +321,6 @@ describe('WeComHarnessBridge', () => {
           desc: '已收到按钮点击，正在处理，请稍候。',
         }),
       }),
-      userids: ['u1'],
     }])
     const markdown = client.sent.find(entry => entry.msgtype === 'markdown')
     expect(markdown).toEqual({
@@ -330,6 +329,57 @@ describe('WeComHarnessBridge', () => {
       markdown: { content: '# Model reply\n\n- first\n- second' },
     })
     expect(client.replies).toEqual([])
+    await bridge.stop()
+  })
+
+  it('acknowledges a registered card click same-type, keeping the options and marking the selection', async () => {
+    const client = new FakeClient()
+    const bridge = new WeComHarnessBridge(agentContext(), testConfig(), () => client as never)
+    await bridge.start()
+    await client.message(textMessage('/bot-card-test', 'm-card'))
+    const card = client.sent.find(entry => entry.msgtype === 'template_card')
+    const taskId = card?.template_card?.task_id
+    if (taskId === undefined) throw new Error('bot-card-test did not send a template card')
+
+    await client.cardEvent({
+      msgid: 'ev-click',
+      aibotid: 'test-bot',
+      chattype: 'single',
+      from: { userid: 'u1' },
+      msgtype: 'event',
+      create_time: 1,
+      event: { eventtype: EventType.TemplateCardEvent, task_id: taskId, event_key: 'bot-card-test-ok' },
+    })
+
+    // The update keeps the button surface: original title, every option
+    // visible, the clicked one marked; no whole-card jump action.
+    expect(client.cardUpdates).toHaveLength(1)
+    expect(client.cardUpdates[0]?.templateCard).toEqual({
+      card_type: 'button_interaction',
+      main_title: { title: '模板卡片测试', desc: '已选择「确认收到」，正在处理…' },
+      sub_title_text: '点击下方按钮验证卡片交互链路。',
+      button_list: [
+        expect.objectContaining({ text: '✓ 确认收到', key: 'bot-card-test-ok' }),
+        expect.objectContaining({ text: '再想想', key: 'bot-card-test-retry' }),
+      ],
+      task_id: taskId,
+    })
+    expect(client.cardUpdates[0]?.templateCard.card_action).toBeUndefined()
+    // The click still starts a model turn, delivered proactively.
+    expect(client.sent.filter(entry => entry.msgtype === 'markdown')).toHaveLength(1)
+
+    // A re-click on the consumed card neither updates nor starts another turn.
+    await client.cardEvent({
+      msgid: 'ev-click-again',
+      aibotid: 'test-bot',
+      chattype: 'single',
+      from: { userid: 'u1' },
+      msgtype: 'event',
+      create_time: 2,
+      event: { eventtype: EventType.TemplateCardEvent, task_id: taskId, event_key: 'bot-card-test-retry' },
+    })
+    expect(client.cardUpdates).toHaveLength(1)
+    expect(client.sent.filter(entry => entry.msgtype === 'markdown')).toHaveLength(1)
     await bridge.stop()
   })
 

@@ -1,8 +1,9 @@
 import { describe, expect, it } from 'vitest'
 import {
+  buildClickAckCard,
   buildTemplateCard,
+  buildTextNoticeAckCard,
   CARD_LIMITS,
-  deriveAdaptiveCard,
   generateTaskId,
   truncateChars,
 } from '../src/card.js'
@@ -107,56 +108,118 @@ describe('template card construction', () => {
     expect(card.card_action).toEqual({ type: 1, url: 'https://example.com/report' })
   })
 
-  it('derives a button card from a trailing option list with a choice cue', () => {
-    const derived = deriveAdaptiveCard(
-      '# 发布计划\n\n请选择下一步操作：\n1. **发布到生产**：立即上线，影响全部用户\n2. **灰度发布**：先给 10% 用户\n3. **暂不发布**：继续观察监控',
-      'dshp',
-    )
-    expect(derived).toBeDefined()
-    expect(derived?.card).toEqual(expect.objectContaining({
+  it('acknowledges a button card click same-type, keeping every option and marking the selection', () => {
+    const original = buildTemplateCard({
+      cardType: 'button_interaction',
+      title: '选择发布方式',
+      subtitle: '完整说明见上一条消息。',
+      buttons: [
+        { text: '发布', key: 'opt-1' },
+        { text: '灰度', key: 'opt-2' },
+        { text: '暂不发布', key: 'opt-3' },
+      ],
+      taskId: 'release-1',
+    }, 'dshp')
+    const ack = buildClickAckCard({
+      original,
+      eventKey: 'opt-2',
+      selectedLabel: '灰度',
+      ackTitle: '正在处理…',
+      ackSubtitle: '已收到按钮点击，正在处理，请稍候。',
+    })
+    expect(ack).toEqual({
       card_type: 'button_interaction',
-      main_title: expect.objectContaining({ title: '请选择下一步操作' }),
+      main_title: { title: '选择发布方式', desc: '已选择「灰度」，正在处理…' },
+      sub_title_text: '完整说明见上一条消息。',
       button_list: [
-        expect.objectContaining({ text: '发布到生产', key: 'opt-1' }),
-        expect.objectContaining({ text: '灰度发布', key: 'opt-2' }),
+        expect.objectContaining({ text: '发布', key: 'opt-1' }),
+        expect.objectContaining({ text: '✓ 灰度', key: 'opt-2' }),
         expect.objectContaining({ text: '暂不发布', key: 'opt-3' }),
       ],
-    }))
-    expect(derived?.labels.get('opt-1')).toBe('发布到生产')
-    expect(derived?.labels.get('opt-3')).toBe('暂不发布')
+      task_id: 'release-1',
+    })
+    expect(ack.card_action).toBeUndefined()
   })
 
-  it('derives a confirm/cancel card from a yes/no question', () => {
-    const derived = deriveAdaptiveCard('已定位到构建缓存问题。是否立即清理缓存并重新构建？', 'dshp')
-    expect(derived?.card).toEqual(expect.objectContaining({
-      card_type: 'button_interaction',
-      button_list: [
-        expect.objectContaining({ text: '确认', key: 'confirm' }),
-        expect.objectContaining({ text: '取消', key: 'cancel' }),
+  it('keeps the button surface within caps when the clicked label is long', () => {
+    const original = buildTemplateCard({
+      cardType: 'button_interaction',
+      title: '选择',
+      buttons: [{ text: '非常长的标签文案', key: 'k1' }],
+    }, 'dshp')
+    const ack = buildClickAckCard({
+      original,
+      eventKey: 'k1',
+      ackTitle: '正在处理…',
+      ackSubtitle: '请稍候。',
+    })
+    const marked = ack.button_list?.[0]?.text ?? ''
+    expect(marked.length).toBeLessThanOrEqual(CARD_LIMITS.buttonText)
+    expect(marked.startsWith('✓')).toBe(true)
+  })
+
+  it('acknowledges a vote submission by disabling the checkboxes and checking the chosen options', () => {
+    const original = buildTemplateCard({
+      cardType: 'vote_interaction',
+      title: '选出优先级',
+      options: [
+        { id: 'p0', text: '性能优化' },
+        { id: 'p1', text: '文档完善' },
+      ],
+      voteMode: 1,
+      submitText: '提交',
+      submitKey: 'vote-submit',
+    }, 'dshp')
+    const ack = buildClickAckCard({
+      original,
+      eventKey: 'vote-submit',
+      selectedOptionIds: ['p1'],
+      ackTitle: '正在处理…',
+      ackSubtitle: '已收到按钮点击，正在处理，请稍候。',
+    })
+    expect(ack.card_type).toBe('vote_interaction')
+    expect(ack.main_title?.desc).toBe('已选择「文档完善」，正在处理…')
+    expect(ack.checkbox).toEqual(expect.objectContaining({
+      disable: true,
+      option_list: [
+        expect.objectContaining({ id: 'p0', is_checked: false }),
+        expect.objectContaining({ id: 'p1', is_checked: true }),
       ],
     }))
-    expect(derived?.labels.get('confirm')).toBe('确认')
+    expect(ack.submit_button).toEqual({ text: '提交', key: 'vote-submit' })
   })
 
-  it('prefers 继续 over 确认 for continue-style questions', () => {
-    const derived = deriveAdaptiveCard('第一批数据已迁移完成，是否继续迁移第二批？', 'dshp')
-    expect(derived?.card.button_list?.[0]).toEqual(expect.objectContaining({ text: '继续', key: 'confirm' }))
+  it('falls back to a text_notice confirmation for unknown tasks and non-interactive cards', () => {
+    const unknown = buildClickAckCard({
+      eventKey: 'btn-ok',
+      ackTitle: '正在处理…',
+      ackSubtitle: '已收到按钮点击，正在处理，请稍候。',
+    })
+    expect(unknown).toEqual(expect.objectContaining({
+      card_type: 'text_notice',
+      main_title: expect.objectContaining({ title: '正在处理…' }),
+    }))
+    expect(unknown.task_id).toBeUndefined()
+
+    const notice = buildTemplateCard({ cardType: 'text_notice', title: '通知', taskId: 'n-1' }, 'dshp')
+    const noticeAck = buildClickAckCard({
+      original: notice,
+      eventKey: '',
+      ackTitle: '正在处理…',
+      ackSubtitle: '请稍候。',
+    })
+    expect(noticeAck.card_type).toBe('text_notice')
+    expect(noticeAck.task_id).toBe('n-1')
+    // The update API requires a card_action on text_notice (errcode 42045).
+    expect(noticeAck.card_action).toEqual(expect.objectContaining({ type: 1 }))
   })
 
-  it('adds no card for informational replies', () => {
-    expect(deriveAdaptiveCard('# 部署完成\n\n应用已上线，运行正常。', 'dshp')).toBeUndefined()
-    expect(deriveAdaptiveCard('今天天气不错。', 'dshp')).toBeUndefined()
-  })
-
-  it('adds no card for a list without a choice cue', () => {
-    expect(deriveAdaptiveCard('本季度进展：\n1. 完成迁移\n2. 上线灰度\n3. 修复告警', 'dshp')).toBeUndefined()
-  })
-
-  it('treats long list items as content instead of options', () => {
-    expect(deriveAdaptiveCard(
-      '请选择：\n1. 这是一段非常长的选项说明，超出了按钮标签的长度上限\n2. 另一段同样非常长的选项说明内容',
-      'dshp',
-    )).toBeUndefined()
+  it('builds the text-notice acknowledgement with or without the whole-card jump', () => {
+    const withJump = buildTextNoticeAckCard('t-1', '正在处理…', '请稍候。')
+    expect(withJump.card_action).toEqual(expect.objectContaining({ type: 1 }))
+    const noJump = buildTextNoticeAckCard('t-1', '正在处理…', '请稍候。', false)
+    expect(noJump.card_action).toEqual({ type: 0 })
+    expect(noJump.task_id).toBe('t-1')
   })
 
   it('builds vote and multiple interaction cards', () => {

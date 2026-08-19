@@ -207,8 +207,7 @@ const POLICY_OPTIONS = [
 ] as const
 
 const CARD_MODE_OPTIONS = [
-  { value: 'auto', label: 'auto（自适应：选项/确认自动配卡）' },
-  { value: 'tool', label: 'tool（仅模型显式发卡）' },
+  { value: 'tool', label: 'tool（仅模型显式发卡，默认）' },
   { value: 'off', label: 'off（关闭卡片）' },
 ] as const
 
@@ -344,7 +343,7 @@ function LoadedSettings({ controller }: SettingsInjected) {
       <section className="wc-panel">
         <div className="wc-panel-title"><h3>交互</h3></div>
         <div className="wc-form-grid">
-          <Field label="卡片模式（cardMode）" hint="auto：回复带选项/确认时自动生成按钮卡片；tool：仅模型调用 wecom_send_card 时发卡；off：关闭卡片。">
+          <Field label="卡片模式（cardMode）" hint="tool：仅模型调用 wecom_send_card 时发卡（Markdown 承载全文、卡片承载短标签交互）；off：关闭卡片。">
             <select className="wc-input" value={draft.cardMode} onChange={(event) => { update('cardMode', event.target.value as UserSettings['cardMode']) }}>
               {CARD_MODE_OPTIONS.map(option => <option key={option.value} value={option.value}>{option.label}</option>)}
             </select>

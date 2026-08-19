@@ -19,7 +19,7 @@ import type {
   TemplateCard,
   TemplateCardEventData,
 } from '@wecom/aibot-node-sdk'
-import { buildTemplateCard, deriveAdaptiveCard, type CardInput } from './card.js'
+import { buildTemplateCard, type CardInput } from './card.js'
 import type { Config } from './config.js'
 import { inboundContent, type WeComDownloadPort } from './inbound.js'
 import { resolveOutboundFile, type OutboundFile } from './outbound-file.js'
@@ -74,8 +74,14 @@ interface ActiveStream {
   activity: string | undefined
 }
 
-/** Bound on remembered card label registries; oldest tasks are evicted first. */
+/** Bound on remembered card registries; oldest tasks are evicted first. */
 const MAX_CARD_LABEL_TASKS = 500
+
+/** One sent card plus the key → visible-label map used to resolve clicks. */
+interface CardRegistryEntry {
+  card: TemplateCard
+  labels: Map<string, string>
+}
 
 /** One live agent plus only the lifecycle capability this manager owns. */
 interface ConversationAgentBinding {
@@ -91,7 +97,7 @@ export class ConversationManager {
   private readonly activeTurns = new Map<string, string>()
   private readonly activeStreams = new Map<string, ActiveStream>()
   private readonly pendingCards = new Map<string, TemplateCard[]>()
-  private readonly cardLabels = new Map<string, Map<string, string>>()
+  private readonly cardRegistry = new Map<string, CardRegistryEntry>()
   private readonly questions: WeComQuestionBridge
   private readonly generations = new Map<string, number>()
   private persistedIds = new Set<string>()
@@ -158,7 +164,43 @@ export class ConversationManager {
     if (taskId === undefined || taskId.length === 0 || eventKey === undefined || eventKey.length === 0) {
       return undefined
     }
-    return this.cardLabels.get(taskId)?.get(eventKey)
+    return this.cardRegistry.get(taskId)?.labels.get(eventKey)
+  }
+
+  /**
+   * The sent card registered under one task id, kept so a later click can be
+   * acknowledged with a same-type in-place update that preserves the option
+   * surface instead of replacing the card with a plain notification.
+   */
+  cardSnapshot(taskId: string | undefined): TemplateCard | undefined {
+    if (taskId === undefined || taskId.length === 0) return undefined
+    return this.cardRegistry.get(taskId)?.card
+  }
+
+  /**
+   * Remember sent cards and their button key → visible label pairs so a
+   * later click (which only echoes event_key) can be resolved to the chosen
+   * option and acknowledged in place.
+   */
+  registerCards(cards: readonly TemplateCard[]): void {
+    for (const card of cards) {
+      const taskId = card.task_id
+      if (taskId === undefined) continue
+      let entry = this.cardRegistry.get(taskId)
+      if (entry === undefined) {
+        entry = { card, labels: new Map() }
+        this.cardRegistry.set(taskId, entry)
+        while (this.cardRegistry.size > MAX_CARD_LABEL_TASKS) {
+          const oldest = this.cardRegistry.keys().next().value
+          if (oldest === undefined) break
+          this.cardRegistry.delete(oldest)
+        }
+      }
+      for (const button of card.button_list ?? []) entry.labels.set(button.key, button.text)
+      if (card.submit_button !== undefined) {
+        entry.labels.set(card.submit_button.key, `提交：${card.submit_button.text}`)
+      }
+    }
   }
 
   /**
@@ -167,6 +209,16 @@ export class ConversationManager {
    */
   pendingQuestionLabel(message: EventMessageWith<TemplateCardEventData>): string | undefined {
     return this.questions.questionLabel(message)
+  }
+
+  /**
+   * Peek at one click without settling: when it targets a pending question,
+   * return the question card itself so the click can be acknowledged with a
+   * same-type in-place update. Must be read BEFORE settling, which removes
+   * the pending entry.
+   */
+  pendingQuestionCard(message: EventMessageWith<TemplateCardEventData>): TemplateCard | undefined {
+    return this.questions.questionCard(message)
   }
 
   /**
@@ -264,7 +316,7 @@ export class ConversationManager {
     this.activeTurns.clear()
     this.activeStreams.clear()
     this.pendingCards.clear()
-    this.cardLabels.clear()
+    this.cardRegistry.clear()
   }
 
   private enqueue<T>(baseId: string, operation: () => Promise<T>): Promise<T> {
@@ -395,18 +447,14 @@ export class ConversationManager {
   }
 
   /**
-   * Attach the turn's queued cards to a collected reply. In "auto" mode an
-   * adaptive interaction card accompanies the Markdown reply whenever the
-   * reply asks the user to choose or confirm and the model did not send an
-   * explicit card first.
+   * Attach the turn's queued cards to a collected reply. Cards are only ever
+   * produced by explicit `wecom_send_card` calls (or the question bridge):
+   * the Markdown message carries the full content, the card carries only the
+   * interaction surface.
    */
   private finalizeReply(id: string, collected: Omit<ConversationReply, 'cards'>): ConversationReply {
     const cards = this.takeCards(id)
-    if (this.config.cardMode === 'auto' && cards.length === 0 && collected.text.trim().length > 0) {
-      const derived = deriveAdaptiveCard(collected.text, this.config.cardTaskIdPrefix)
-      if (derived !== undefined) cards.push(derived.card)
-    }
-    this.registerCardLabels(cards)
+    this.registerCards(cards)
     return { ...collected, cards }
   }
 
@@ -415,31 +463,6 @@ export class ConversationManager {
     const cards = this.pendingCards.get(id) ?? []
     this.pendingCards.delete(id)
     return cards
-  }
-
-  /**
-   * Remember every sent card's button key → visible label pairs so a later
-   * click (which only echoes event_key) can be resolved to the chosen option.
-   */
-  private registerCardLabels(cards: readonly TemplateCard[]): void {
-    for (const card of cards) {
-      const taskId = card.task_id
-      if (taskId === undefined) continue
-      let labels = this.cardLabels.get(taskId)
-      if (labels === undefined) {
-        labels = new Map()
-        this.cardLabels.set(taskId, labels)
-        while (this.cardLabels.size > MAX_CARD_LABEL_TASKS) {
-          const oldest = this.cardLabels.keys().next().value
-          if (oldest === undefined) break
-          this.cardLabels.delete(oldest)
-        }
-      }
-      for (const button of card.button_list ?? []) labels.set(button.key, button.text)
-      if (card.submit_button !== undefined) {
-        labels.set(card.submit_button.key, `提交：${card.submit_button.text}`)
-      }
-    }
   }
 
   private async includeImages(agent: Agent): Promise<boolean> {

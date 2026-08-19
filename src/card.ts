@@ -1,7 +1,8 @@
 /**
  * WeCom template card construction: strict truncation against the official
  * protocol's recommended display limits, task-id generation, and the
- * Markdown-reply → summary-card derivation used by cardMode "auto".
+ * same-type in-place click acknowledgement used inside the 5-second update
+ * window.
  */
 
 import { randomBytes } from 'node:crypto'
@@ -343,116 +344,128 @@ export function buildTemplateCard(input: CardInput, taskIdPrefix: string): Templ
   }
 }
 
+/** Facts needed to build the in-place acknowledgement for one card click. */
+export interface ClickAckInput {
+  /** The card that was clicked; undefined when the task id is unknown. */
+  original?: TemplateCard | undefined
+  /**
+   * The clicked event's task id; preferred over the snapshot's own id so the
+   * update addresses the right card even without a registered snapshot.
+   */
+  taskId?: string | undefined
+  eventKey: string
+  /** Visible label resolved from the clicked button key (button cards). */
+  selectedLabel?: string | undefined
+  /** Option ids chosen in a vote/multiple submission. */
+  selectedOptionIds?: string[] | undefined
+  ackTitle: string
+  ackSubtitle: string
+}
+
 /**
- * Derive the Markdown+card pairing for cardMode "auto": an adaptive interaction
- * card. The Markdown reply keeps the full content while the card carries the
- * interaction surface:
- * - a trailing option list (2–6 numbered or bulleted items with a choice cue)
- *   becomes a button_interaction card whose buttons hold the short labels;
- * - a yes/no or confirm question becomes a 确认/取消 (or 继续/取消) button card;
- * - informational replies get no card, so ordinary chat stays clean.
- *
- * Returned labels map every button key to its visible label so a later click
- * (which only carries event_key) can be resolved back to the chosen option.
+ * Build the in-place update card for one click inside the protocol's 5-second
+ * window. Interaction cards are updated AS THE SAME CARD TYPE so the option
+ * surface stays visible: buttons remain (the clicked one marked with ✓), vote
+ * checkboxes become disabled with the chosen options checked, and the title's
+ * desc reports the selection. Only cards without an interaction surface fall
+ * back to a plain text_notice confirmation.
  */
-export interface DerivedAdaptiveCard {
-  card: TemplateCard
-  labels: Map<string, string>
-}
-
-export function deriveAdaptiveCard(text: string, taskIdPrefix: string): DerivedAdaptiveCard | undefined {
-  const choice = deriveChoiceCard(text, taskIdPrefix)
-  if (choice !== undefined) return choice
-  return deriveConfirmCard(text, taskIdPrefix)
-}
-
-const LIST_ITEM_PATTERN = /^\s*(?:\d+[.、)）]\s*|[-*•·]\s+)(.+)$/u
-const CHOICE_CUE_PATTERN = /选择|选项|choose|select|pick|哪一个|哪个|which|回复数字|确认|是否|投票/iu
-
-function deriveChoiceCard(text: string, taskIdPrefix: string): DerivedAdaptiveCard | undefined {
-  const lines = text.split('\n')
-  while (lines.length > 0 && lines[lines.length - 1]?.trim() === '') lines.pop()
-  const items: string[] = []
-  let cueLine = ''
-  for (let index = lines.length - 1; index >= 0; index -= 1) {
-    const match = LIST_ITEM_PATTERN.exec(lines[index] ?? '')
-    if (match === null) {
-      cueLine = lines[index] ?? ''
-      break
+export function buildClickAckCard(input: ClickAckInput): TemplateCard {
+  const original = input.original
+  const taskId = input.taskId ?? original?.task_id
+  const id = taskId === undefined ? {} : { task_id: taskId }
+  if (original?.card_type === 'button_interaction') {
+    const label = input.selectedLabel
+      ?? original.button_list?.find(button => button.key === input.eventKey)?.text
+    const desc = truncateChars(
+      label === undefined ? input.ackSubtitle : `已选择「${label}」，正在处理…`,
+      CARD_LIMITS.titleDesc,
+    )
+    return {
+      card_type: 'button_interaction',
+      main_title: { title: original.main_title?.title ?? input.ackTitle, desc },
+      ...(original.sub_title_text === undefined ? {} : { sub_title_text: original.sub_title_text }),
+      button_list: (original.button_list ?? []).map(button => button.key === input.eventKey
+        ? { ...button, text: markSelectedLabel(button.text) }
+        : button),
+      ...id,
     }
-    items.unshift(match[1] ?? '')
   }
-  if (items.length < 2 || items.length > CARD_LIMITS.maxButtons) return undefined
-  if (cueLine === '') return undefined
-
-  const labels: string[] = []
-  let allShort = true
-  for (const item of items) {
-    const label = optionLabel(item)
-    if (label === undefined) return undefined
-    if (label.length > CARD_LIMITS.buttonText) allShort = false
-    labels.push(label)
+  if (original?.card_type === 'vote_interaction' && original.checkbox !== undefined) {
+    const selected = new Set(input.selectedOptionIds ?? [])
+    const labels = original.checkbox.option_list
+      .filter(option => selected.has(option.id))
+      .map(option => option.text)
+    const desc = truncateChars(
+      labels.length > 0 ? `已选择「${labels.join('、')}」，正在处理…` : input.ackSubtitle,
+      CARD_LIMITS.titleDesc,
+    )
+    return {
+      card_type: 'vote_interaction',
+      main_title: { title: original.main_title?.title ?? input.ackTitle, desc },
+      checkbox: {
+        ...original.checkbox,
+        disable: true,
+        option_list: original.checkbox.option_list.map(option => selected.size > 0
+          ? { ...option, is_checked: selected.has(option.id) }
+          : option),
+      },
+      ...(original.submit_button === undefined ? {} : { submit_button: original.submit_button }),
+      ...id,
+    }
   }
-  const cue = CHOICE_CUE_PATTERN.test(cueLine)
-  if (!cue && !(allShort && cueLine.trim().endsWith('？'))) return undefined
-
-  const buttons: CardButtonInput[] = labels.map((label, index) => ({
-    text: label,
-    key: `opt-${index + 1}`,
-  }))
-  const title = truncateChars(stripMarkdownPrefix(cueLine).replace(/[：:？?。.!！]+$/u, ''), CARD_LIMITS.title) || '请选择'
-  const card = buildTemplateCard({
-    cardType: 'button_interaction',
-    title,
-    buttons,
-  }, taskIdPrefix)
-  const keyLabels = new Map<string, string>()
-  for (let index = 0; index < buttons.length; index += 1) {
-    const button = buttons[index]
-    if (button !== undefined) keyLabels.set(button.key, labels[index] ?? button.text)
+  if (original?.card_type === 'multiple_interaction') {
+    const selected = new Set(input.selectedOptionIds ?? [])
+    const labels: string[] = []
+    for (const select of original.select_list ?? []) {
+      for (const option of select.option_list ?? []) {
+        if (selected.has(option.id)) labels.push(option.text)
+      }
+    }
+    const desc = truncateChars(
+      labels.length > 0 ? `已选择「${labels.join('、')}」，正在处理…` : input.ackSubtitle,
+      CARD_LIMITS.titleDesc,
+    )
+    return {
+      card_type: 'multiple_interaction',
+      main_title: { title: original.main_title?.title ?? input.ackTitle, desc },
+      ...(original.select_list === undefined ? {} : { select_list: original.select_list }),
+      ...(original.submit_button === undefined ? {} : { submit_button: original.submit_button }),
+      ...id,
+    }
   }
-  return { card, labels: keyLabels }
+  return buildTextNoticeAckCard(taskId, input.ackTitle, input.ackSubtitle)
 }
 
-const CONFIRM_QUESTION_PATTERN = /是否|要不要|需不需要|确认|继续|取消/u
-
-function deriveConfirmCard(text: string, taskIdPrefix: string): DerivedAdaptiveCard | undefined {
-  const lines = text.trim().split('\n')
-  const last = lines[lines.length - 1]?.trim() ?? ''
-  if (!last.endsWith('？') && !last.endsWith('?')) return undefined
-  if (!CONFIRM_QUESTION_PATTERN.test(last)) return undefined
-  const verb = /继续/u.test(last) ? '继续' : '确认'
-  const buttons: CardButtonInput[] = [
-    { text: verb, key: 'confirm', style: 1 },
-    { text: '取消', key: 'cancel', style: 2 },
-  ]
-  const title = truncateChars(stripMarkdownPrefix(last).replace(/[：:？?。.!！]+$/u, ''), CARD_LIMITS.title) || verb
-  const card = buildTemplateCard({
-    cardType: 'button_interaction',
-    title,
-    buttons,
-  }, taskIdPrefix)
+/**
+ * The legacy notification-style click acknowledgement, kept as the fallback
+ * for unknown tasks and for platforms that reject a same-type update. The
+ * update API reportedly requires a card_action on text_notice cards
+ * (errcode 42045 otherwise): `jump=false` sends a linkless type-0 action so
+ * the card does not render a misleading "查看详情" external jump; callers keep
+ * the type-1 variant as a last-resort retry.
+ */
+export function buildTextNoticeAckCard(
+  taskId: string | undefined,
+  ackTitle: string,
+  ackSubtitle: string,
+  jump = true,
+): TemplateCard {
   return {
-    card,
-    labels: new Map<string, string>([
-      ['confirm', verb],
-      ['cancel', '取消'],
-    ]),
+    card_type: 'text_notice',
+    main_title: {
+      title: truncateChars(ackTitle, CARD_LIMITS.title),
+      desc: truncateChars(ackSubtitle, CARD_LIMITS.titleDesc),
+    },
+    card_action: jump
+      ? { type: 1, url: 'https://open.work.weixin.qq.com/' }
+      : { type: 0 },
+    ...(taskId === undefined ? {} : { task_id: taskId }),
   }
 }
 
-/** The short visible head of one option line, or undefined when the line is content, not an option. */
-function optionLabel(item: string): string | undefined {
-  const content = item.trim()
-  if (content.length === 0) return undefined
-  const separator = content.search(/[：:｜|—–-]/u)
-  if (separator > 0) {
-    const head = content.slice(0, separator).trim()
-    return head.length === 0 ? undefined : stripMarkdownPrefix(head)
-  }
-  return content.length <= CARD_LIMITS.buttonText ? content : undefined
-}
-
-function stripMarkdownPrefix(value: string): string {
-  return value.replace(/^[#>+\-*]\s*/u, '').replace(/[*_`~]/gu, '').trim()
+/** Mark one clicked button in place, staying within the 10-character cap. */
+function markSelectedLabel(text: string): string {
+  const marked = `✓ ${text}`
+  return marked.length <= CARD_LIMITS.buttonText ? marked : truncateChars(marked, CARD_LIMITS.buttonText)
 }

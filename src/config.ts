@@ -20,14 +20,13 @@ export type ImageInputMode = 'auto' | 'always' | 'never'
 
 /**
  * How template cards accompany model replies.
- * - "auto" (default): adaptive interaction cards. Explicit `wecom_send_card`
- *   calls always win; otherwise the bridge inspects the reply and adds a
- *   button card automatically when the reply asks the user to choose among
- *   options or confirm/cancel — the Markdown message keeps the full details,
- *   the card carries the short option buttons. Informational replies get no
- *   card, so ordinary chat stays clean.
- * - "tool": cards are sent only when the model calls `wecom_send_card`.
+ * - "tool" (default): cards are sent only when the model calls
+ *   `wecom_send_card`. The Markdown message keeps the full content, the card
+ *   carries only the short-label interaction surface — deriving cards from
+ *   reply text was removed because protocol caps force truncated labels.
  * - "off": no cards; `wecom_send_card` fails with a teaching error.
+ * - "auto": deprecated alias of "tool"; accepted so existing configurations
+ *   keep loading, but no adaptive derivation happens anymore.
  */
 export type CardMode = 'auto' | 'tool' | 'off'
 
@@ -85,7 +84,7 @@ export const Config: z<Config> = z.object({
   groupAllowFrom: z.array(z.string()).default([]),
   allowedHarnessCommands: z.array(z.string().pattern(COMMAND_NAME_PATTERN)).default(['compact', 'goal', 'plan']),
   imageInputMode: z.union(['auto', 'always', 'never']).default('auto'),
-  cardMode: z.union(['auto', 'tool', 'off']).default('auto'),
+  cardMode: z.union(['auto', 'tool', 'off']).default('tool'),
   cardTaskIdPrefix: z.string().default('dshp'),
   cardClickAckTitle: z.string().default('正在处理…'),
   cardClickAckSubtitle: z.string().default('已收到按钮点击，正在处理，请稍候。'),

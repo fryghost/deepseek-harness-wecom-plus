@@ -128,6 +128,11 @@ function normalizeButtons(value: unknown): TemplateCardButton[] | undefined {
   if (value.length > CARD_LIMITS.maxButtons) {
     throw new Error(`wecom_send_card: at most ${CARD_LIMITS.maxButtons} buttons are supported`)
   }
+  // WeCom visual grammar: style 1 is the emphatic blue action, style 2 the
+  // subdued grey one. Three or more buttons are an option picker — equal
+  // options must not carry mixed emphasis, so the channel forces them all
+  // grey; one or two buttons keep their specified styles (confirm/cancel).
+  const optionPicker = value.length >= 3
   const buttons = value.map((entry): TemplateCardButton => {
     if (typeof entry !== 'object' || entry === null) {
       throw new Error('wecom_send_card: each button must be an object with text and key')
@@ -141,6 +146,7 @@ function normalizeButtons(value: unknown): TemplateCardButton[] | undefined {
     if (Buffer.byteLength(key) > CARD_LIMITS.buttonKeyBytes) {
       throw new Error(`wecom_send_card: button key exceeds ${CARD_LIMITS.buttonKeyBytes} bytes`)
     }
+    if (optionPicker) return { text, key, style: 2 }
     const numeric = typeof item.style === 'number' ? Math.trunc(item.style) : 1
     const style = numeric >= 1 && numeric <= 4 ? numeric : 1
     return { text, key, style }

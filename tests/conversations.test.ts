@@ -510,6 +510,55 @@ describe('ConversationManager', () => {
     await manager.dispose()
   })
 
+  it('keeps every assistant message of a multi-step turn in the final reply text', async () => {
+    const config = testConfig()
+    const events: unknown[] = []
+    const agent = {
+      status: 'idle',
+      options: { provider: 'deepseek', model: 'deepseek-chat' },
+      session: { events },
+      followup: vi.fn(() => {
+        // Step 1: the full question list. Then a tool step, then step 2's
+        // closing line — the final WeCom message must keep step 1's content.
+        events.push({
+          type: 'assistant/message',
+          data: { message: { content: [{ type: 'text', text: 'Q1 题目一\nQ2 题目二\nQ3 题目三' }] } },
+        })
+        events.push({ type: 'step/start', data: { step: 2 } })
+        events.push({
+          type: 'assistant/message',
+          data: { message: { content: [{ type: 'text', text: '卡片已发出，点按钮或直接回复题号。' }] } },
+        })
+        events.push({ type: 'turn/end', data: { reason: { kind: 'stop' } } })
+      }),
+      whenIdle: vi.fn(async () => undefined),
+    }
+    const ctx = {
+      on: vi.fn(() => vi.fn()),
+      sessionPersistence: { list: vi.fn(async () => []) },
+      agentDefaultModel: { currentSelection: vi.fn(() => ({ provider: 'deepseek', model: 'deepseek-chat' })) },
+      agentPresets: { defaultId: 'standard', mount: vi.fn(async () => ({ id: 'standard' })) },
+      llm: { resolveModelInfo: vi.fn(async () => ({ inputModalities: ['text'] })) },
+      agents: {
+        create: vi.fn(async (options: { setup?: (ctx: never) => Promise<void> }) => {
+          await options.setup?.(mockAgentCtx(vi.fn(() => vi.fn()), vi.fn(() => vi.fn())))
+          return { agent, dispose: vi.fn(async () => undefined) }
+        }),
+        get: vi.fn(),
+      },
+      attachments: {
+        imageLimits: { maxImagesPerMessage: 4, maxMessageImageBytes: 10_000, maxImageBytes: 10_000 },
+      },
+    } as never
+    const manager = new ConversationManager(ctx, config, vi.fn(async () => undefined), vi.fn(async () => undefined), vi.fn(async () => undefined))
+    await manager.initialize()
+
+    const reply = await manager.process(textMessage('u-multi', 'm-multi', '出几道题'), downloadPort, noopTransport())
+
+    expect(reply.text).toBe('Q1 题目一\nQ2 题目二\nQ3 题目三\n\n卡片已发出，点按钮或直接回复题号。')
+    await manager.dispose()
+  })
+
   it('turns a template card button click into a user message and collects the reply', async () => {    const config = testConfig()
     const events: unknown[] = []
     let followedUp: unknown

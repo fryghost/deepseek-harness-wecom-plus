@@ -120,7 +120,7 @@ Template cards have strict row and character limits, and cramming a long reply i
 | `text_notice` | title + subtitle notification card |
 | `news_notice` | image card (requires `image_url`, optional whole-card jump) |
 
-All display text is truncated against the protocol caps (title 26, desc 30, subtitle 112, button 10, vote option 11 characters); button keys, option ids, and task ids are validated and deduplicated, and task ids are auto-generated when omitted.
+All display text is truncated against the protocol caps (title 26, desc 30, subtitle 112, button 10, vote option 11 characters); button keys, option ids, and task ids are validated and deduplicated, and task ids are auto-generated when omitted. Button styles follow the WeCom visual grammar: 1–2 button cards keep the caller's styles (the confirm/cancel pattern); 3 or more buttons are an equal-option picker and are **all rendered grey (style 2)**, so model-supplied styles can never produce a mixed blue/grey emphasis mess.
 
 When a user clicks a button or submits a selection, WeCom pushes `template_card_event` (carrying only `task_id` and `event_key`). The plugin:
 

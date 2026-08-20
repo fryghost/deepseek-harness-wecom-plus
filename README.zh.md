@@ -125,7 +125,7 @@ pnpm dsh plugin --profile web add /absolute/path/to/deepseek-harness-wecom-plus
 | `text_notice` | 标题 + 副标题的通知卡 |
 | `news_notice` | 图文卡（需 `image_url`，可整卡跳转） |
 
-所有展示文本都按协议上限自动截断（标题 26、辅助 30、副标题 112、按钮 10、投票选项 11 字），按钮 key / 选项 id / task_id 自动校验与去重，task_id 缺省自动生成。
+所有展示文本都按协议上限自动截断（标题 26、辅助 30、副标题 112、按钮 10、投票选项 11 字），按钮 key / 选项 id / task_id 自动校验与去重，task_id 缺省自动生成。按钮样式按企微视觉规范兼容处理：1~2 个按钮保留调用方指定的样式（确认/取消模式）；3 个及以上按钮视为等权选项组，**统一渲染为灰色（style 2）**，避免模型传参导致蓝灰混排的强调色错乱。
 
 用户点击按钮或提交选择后，企微推送 `template_card_event`（只带 `task_id` 和 `event_key`）。插件会：
 

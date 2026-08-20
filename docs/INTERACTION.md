@@ -1,4 +1,4 @@
-# WeCom 插件交互逻辑（v0.6.2）
+# WeCom 插件交互逻辑（v0.6.3）
 
 > 本文档描述 `deepseek-harness-wecom-plus` 在运行时的完整交互行为，与代码同步维护。
 
@@ -45,7 +45,7 @@
   5. 回合结束 → `finish=true` 定格最终 Markdown + 内联图片（png/jpeg ≤10MB ≤10 张）→ 其余图片走素材上传 → 卡片走 `sendMessage`；
   6. **保底**：流式最终帧失败 → 自动降级为主动推送 Markdown，回复永不丢失。
 - **超时**：`responseTimeoutMs` 到点 → `agent.cancel` + 流中告知「处理超时，已取消本次生成」。
-- **收尾**：`finalizeReply` 挂上本回合 `wecom_send_card` 排队的卡片并把卡片快照（含 key → 标签）登记进注册表；卡片只来自模型显式调用或提问桥接，插件不再解析回复文本自动派生（协议上限会强制标签缩略，已移除）。
+- **收尾**：`finalizeReply` 挂上本回合 `wecom_send_card` 排队的卡片并把卡片快照（含 key → 标签）登记进注册表；卡片只来自模型显式调用或提问桥接，插件不再解析回复文本自动派生（协议上限会强制标签缩略，已移除）。最终 Markdown 优先取回合内**全部** assistant 消息的汇总文本（多 step 回合不丢早期步骤内容，流式文本因 `step/start` 重置只保留最后一步）；
 
 ## 4. 卡片点击链路（`handleCardEvent`）
 
@@ -77,7 +77,7 @@
 ## 6. 模板卡片体系（`wecom_send_card`）
 
 - **五种卡片**：`text_notice`（标题+副标题）、`news_notice`（图文，需 image_url，可整卡跳转）、`button_interaction`（1~6 按钮）、`vote_interaction`（1~20 复选项+提交）、`multiple_interaction`（≤3 下拉+提交）；
-- **协议安全**：标题 26 / 辅助 30 / 副标题 112 / 按钮 10 / 投票选项 11 / 下拉选项 10 字自动截断；按钮 key、选项 id 去重；task_id 自动生成；
+- **协议安全**：标题 26 / 辅助 30 / 副标题 112 / 按钮 10 / 投票选项 11 / 下拉选项 10 字自动截断；按钮 key、选项 id 去重；task_id 自动生成；**按钮样式兼容**：1~2 按钮保留指定样式，≥3 按钮视为等权选项组统一置灰（style 2）；
 - **cardMode**：`tool`（默认，仅模型显式发卡）/ `off`（关闭）/ `auto`（已废弃，等同 `tool`，仅为旧配置兼容保留）；
 - **卡片快照注册表**：每张发出的卡片按 `task_id` 登记完整快照 + key → 标签，点击时用于同类型原位更新与文案还原；
 - **提交值解析**：按钮 → `event_key`；投票/下拉 → 原始事件 `selected_items`（question_key + option_ids）随点击消息注入模型。

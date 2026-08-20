@@ -83,6 +83,27 @@ describe('template card construction', () => {
     ])
   })
 
+  it('forces every button grey for 3+ button option pickers, whatever styles the model passed', () => {
+    const card = buildTemplateCard({
+      cardType: 'button_interaction',
+      title: '选一题来答',
+      buttons: [
+        { text: 'Q1', key: 'q1', style: 1 },
+        { text: 'Q2', key: 'q2', style: 1 },
+        { text: 'Q3', key: 'q3' },
+        { text: 'Q4', key: 'q4', style: 1 },
+        { text: 'Q5', key: 'q5', style: 2 },
+      ],
+    }, 'dshp')
+    expect(card.button_list).toEqual([
+      { text: 'Q1', key: 'q1', style: 2 },
+      { text: 'Q2', key: 'q2', style: 2 },
+      { text: 'Q3', key: 'q3', style: 2 },
+      { text: 'Q4', key: 'q4', style: 2 },
+      { text: 'Q5', key: 'q5', style: 2 },
+    ])
+  })
+
   it('rejects more than six buttons and overlong button keys', () => {
     expect(() => buildTemplateCard({
       cardType: 'button_interaction',

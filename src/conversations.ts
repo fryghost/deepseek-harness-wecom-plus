@@ -383,8 +383,12 @@ export class ConversationManager {
         throw error
       }
       const collected = await this.collectReply(agent, agent.session.events.slice(start))
+      // The collected events carry EVERY assistant message of the turn, while
+      // the stream text only holds the latest step (step/start resets it for
+      // retry correctness): prefer the full collected text so a multi-step
+      // turn does not lose its earlier content in the final WeCom message.
       const reply = this.finalizeReply(id, {
-        text: stream.text.trim() || collected.text,
+        text: collected.text.trim() || stream.text.trim(),
         images: collected.images,
       })
       await transport.finish(reply)
@@ -435,8 +439,10 @@ export class ConversationManager {
         throw error
       }
       const collected = await this.collectReply(agent, agent.session.events.slice(start))
+      // Same as processNow: the full collected text wins over the last step's
+      // stream text so multi-step turns keep every assistant message.
       const reply = this.finalizeReply(id, {
-        text: stream.text.trim() || collected.text,
+        text: collected.text.trim() || stream.text.trim(),
         images: collected.images,
       })
       await transport.finish(reply)
@@ -782,7 +788,7 @@ export class ConversationManager {
             properties: {
               text: { type: 'string', required: true, description: 'Short option label, capped at 10 characters.' },
               key: { type: 'string', required: true, description: 'Stable key echoed back on click (event_key), max 1024 bytes.' },
-              style: { type: 'integer', description: 'Button style 1-4; defaults to 1.' },
+              style: { type: 'integer', description: 'Button style 1 (emphatic blue) to 4; honored only for 1-2 button cards. With 3 or more buttons the channel renders every button grey (style 2) because equal options must not carry mixed emphasis.' },
             },
           },
           description: 'Buttons for button_interaction cards; 1 to 6 entries. Keep labels short; '

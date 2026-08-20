@@ -72,6 +72,7 @@ function normalizeButtons(value) {
   if (value.length > CARD_LIMITS.maxButtons) {
     throw new Error(`wecom_send_card: at most ${CARD_LIMITS.maxButtons} buttons are supported`);
   }
+  const optionPicker = value.length >= 3;
   const buttons = value.map((entry) => {
     if (typeof entry !== "object" || entry === null) {
       throw new Error("wecom_send_card: each button must be an object with text and key");
@@ -85,6 +86,7 @@ function normalizeButtons(value) {
     if (Buffer.byteLength(key) > CARD_LIMITS.buttonKeyBytes) {
       throw new Error(`wecom_send_card: button key exceeds ${CARD_LIMITS.buttonKeyBytes} bytes`);
     }
+    if (optionPicker) return { text, key, style: 2 };
     const numeric = typeof item.style === "number" ? Math.trunc(item.style) : 1;
     const style = numeric >= 1 && numeric <= 4 ? numeric : 1;
     return { text, key, style };
@@ -1178,7 +1180,7 @@ var ConversationManager = class {
       }
       const collected = await this.collectReply(agent, agent.session.events.slice(start));
       const reply = this.finalizeReply(id, {
-        text: stream.text.trim() || collected.text,
+        text: collected.text.trim() || stream.text.trim(),
         images: collected.images
       });
       await transport.finish(reply);
@@ -1223,7 +1225,7 @@ var ConversationManager = class {
       }
       const collected = await this.collectReply(agent, agent.session.events.slice(start));
       const reply = this.finalizeReply(id, {
-        text: stream.text.trim() || collected.text,
+        text: collected.text.trim() || stream.text.trim(),
         images: collected.images
       });
       await transport.finish(reply);
@@ -1534,7 +1536,7 @@ var ConversationManager = class {
             properties: {
               text: { type: "string", required: true, description: "Short option label, capped at 10 characters." },
               key: { type: "string", required: true, description: "Stable key echoed back on click (event_key), max 1024 bytes." },
-              style: { type: "integer", description: "Button style 1-4; defaults to 1." }
+              style: { type: "integer", description: "Button style 1 (emphatic blue) to 4; honored only for 1-2 button cards. With 3 or more buttons the channel renders every button grey (style 2) because equal options must not carry mixed emphasis." }
             }
           },
           description: "Buttons for button_interaction cards; 1 to 6 entries. Keep labels short; spell out the full option details in your Markdown reply instead."
@@ -1840,7 +1842,7 @@ var WeComHarnessBridge = class {
       maxReconnectAttempts: this.config.maxReconnectAttempts,
       maxAuthFailureAttempts: this.config.maxAuthFailureAttempts,
       requestTimeout: this.config.sendTimeoutMs,
-      plug_version: "deepseek-harness-wecom-plus/0.6.2"
+      plug_version: "deepseek-harness-wecom-plus/0.6.3"
     });
   }
   async handleWelcome(frame) {
@@ -2501,7 +2503,7 @@ import {
 } from "@deepseek-ai/dsh-settings";
 
 // src/version.ts
-var PLUGIN_VERSION = "0.6.2";
+var PLUGIN_VERSION = "0.6.3";
 
 // src/settings-web.ts
 var SETTINGS_ROUTE = "/_dsh/deepseek-harness-wecom-plus/settings";

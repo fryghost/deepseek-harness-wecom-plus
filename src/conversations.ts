@@ -56,11 +56,15 @@ export interface TurnTransport {
   /** Show a transient activity line (e.g. the tool being executed). */
   setActivity(line: string): void
   /**
-   * Deliver an ask_user_question card. Both transports send it as a
-   * standalone card message right after the question's Markdown explanation:
-   * the platform renders a card only on a stream's FIRST frame, so a
-   * mid-stream attachment would silently fail to appear.
+   * Deliver one ask_user_question message. Both transports send the question
+   * as standalone messages (Markdown explanation, then the card): the
+   * platform renders a card only on a stream's FIRST frame, and a stream
+   * bubble keeps its chat position while proactive messages append after it
+   * — so the message-initiated transport finalizes the stream at the first
+   * question, keeping "text → question → post-answer reply" in order.
    */
+  sendQuestionText(text: string): Promise<void>
+  /** Deliver the ask_user_question card, right after its explanation. */
   sendQuestionCard(card: TemplateCard): Promise<void>
   /** Deliver the complete reply (final stream frame / Markdown + media + cards). */
   finish(reply: ConversationReply): Promise<void>
@@ -675,9 +679,12 @@ export class ConversationManager {
           : await this.questions.present(
             request,
             this.activeTurns.get(id) as string,
-            // Route the question card through the turn's transport so it is
-            // delivered as a standalone message ordered after the explanation.
+            // Route the question's messages through the turn's transport so
+            // the stream is finalized first and the explanation/card/order
+            // of any post-answer reply stay correct in the chat.
             (_target, card) => this.activeStreams.get(id)?.transport.sendQuestionCard(card)
+              ?? Promise.resolve(),
+            (_target, text) => this.activeStreams.get(id)?.transport.sendQuestionText(text)
               ?? Promise.resolve(),
           )
         return {

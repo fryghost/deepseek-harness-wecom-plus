@@ -383,6 +383,110 @@ describe('WeComHarnessBridge', () => {
     await bridge.stop()
   })
 
+  it('keeps chat order when a question interrupts a streaming turn: text, then question, then post-answer reply', async () => {
+    let askTool: { execute(args: unknown, exec: unknown): Promise<unknown> } | undefined
+    let runningAsk: Promise<unknown> | undefined
+    const events: unknown[] = []
+    const agent = {
+      status: 'idle',
+      options: { provider: 'deepseek', model: 'deepseek-chat' },
+      session: { events },
+      followup: vi.fn(() => {
+        if (askTool === undefined) throw new Error('ask_user_question was not registered')
+        events.push({
+          type: 'assistant/message',
+          data: { message: { content: [{ type: 'text', text: '先给你一点背景说明。' }] } },
+        })
+        runningAsk = askTool.execute({
+          questions: [{
+            id: 'qa',
+            question: '要不要继续？',
+            options: [
+              { label: '继续', description: '继续执行后续步骤' },
+              { label: '取消' },
+            ],
+          }],
+        }, { signal: new AbortController().signal }).then(result => {
+          events.push({
+            type: 'assistant/message',
+            data: { message: { content: [{ type: 'text', text: '好的，继续处理。' }] } },
+          })
+          events.push({ type: 'turn/end', data: { reason: { kind: 'stop' } } })
+          return result
+        })
+      }),
+      whenIdle: vi.fn(async () => runningAsk),
+    }
+    const ctx = {
+      logger: vi.fn(() => ({ info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() })),
+      on: vi.fn(() => vi.fn()),
+      credentials: { resolve: vi.fn(async () => ({ value: 'resolved-secret', source: 'test' })) },
+      sessionPersistence: { list: vi.fn(async () => []) },
+      agentDefaultModel: { currentSelection: vi.fn(() => ({ provider: 'deepseek', model: 'deepseek-chat' })) },
+      agentPresets: { defaultId: 'standard', mount: vi.fn(async () => ({ id: 'standard' })) },
+      llm: { resolveModelInfo: vi.fn(async () => ({ inputModalities: ['text'] })) },
+      agents: {
+        create: vi.fn(async (options: { setup?: (ctx: never) => Promise<void> }) => {
+          await options.setup?.({
+            systemPrompt: { section: vi.fn(() => vi.fn()) },
+            tools: {
+              register: vi.fn((definition: { name: string }) => {
+                if (definition.name === 'ask_user_question') askTool = definition as never
+                return vi.fn()
+              }),
+            },
+            get: vi.fn(() => undefined),
+            reflect: { provide: vi.fn(() => vi.fn()) },
+            effect: vi.fn((callback: unknown) => { if (typeof callback !== 'function') return () => {}; const generator = (callback as () => Generator)(); const first = generator.next(); return typeof first.value === 'function' ? first.value as () => void : () => {} }),
+          } as never)
+          return { agent, dispose: vi.fn(async () => undefined) }
+        }),
+        get: vi.fn(),
+      },
+      attachments: {
+        imageLimits: { maxImagesPerMessage: 4, maxMessageImageBytes: 10_000, maxImageBytes: 10_000 },
+      },
+    } as never
+    const client = new FakeClient()
+    const bridge = new WeComHarnessBridge(ctx, testConfig(), () => client as never)
+    await bridge.start()
+
+    // Fire the turn without awaiting: it parks on the question.
+    const done = client.message(textMessage('考考我', 'm-order'))
+    await vi.waitFor(() => { expect(client.sent.some(entry => entry.msgtype === 'template_card')).toBe(true) })
+
+    // The stream was finalized at the question with the explanation absorbed,
+    // so nothing can stream "ahead of" the question's position anymore.
+    const closed = client.replies.find(reply => reply.finish === true)
+    expect(closed?.content).toContain('要不要继续？')
+    expect(closed?.content).toContain('1. 继续')
+
+    // Answer by clicking; the question card is acknowledged same-type.
+    const card = client.sent.find(entry => entry.msgtype === 'template_card')
+    const questionTaskId = card?.template_card?.task_id
+    if (questionTaskId === undefined) throw new Error('the question card was not sent')
+    await client.cardEvent({
+      msgid: 'ev-answer',
+      aibotid: 'test-bot',
+      chattype: 'single',
+      from: { userid: 'u1' },
+      msgtype: 'event',
+      create_time: 1,
+      event: { eventtype: EventType.TemplateCardEvent, task_id: questionTaskId, event_key: 'q-opt-1' },
+    })
+    expect(client.cardUpdates[0]?.templateCard.card_type).toBe('button_interaction')
+
+    await done
+    // The post-answer reply arrives as a trailing standalone Markdown message
+    // — ordered after the question card, never streamed before it.
+    const markdowns = client.sent.filter(entry => entry.msgtype === 'markdown')
+    expect(markdowns).toHaveLength(1)
+    expect(markdowns[0]?.markdown?.content).toContain('好的，继续处理。')
+    expect(client.sent.findIndex(entry => entry.msgtype === 'markdown'))
+      .toBeGreaterThan(client.sent.findIndex(entry => entry.msgtype === 'template_card'))
+    await bridge.stop()
+  })
+
   it('silently drops a card button click from a sender excluded by policy', async () => {
     const client = new FakeClient()
     const bridge = new WeComHarnessBridge(commandContext('resolved-secret'), testConfig({

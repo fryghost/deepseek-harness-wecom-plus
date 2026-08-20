@@ -707,11 +707,12 @@ var WeComQuestionBridge = class {
   sendText;
   pending = /* @__PURE__ */ new Map();
   /** Present the questions to one conversation and wait for the human answers. */
-  async present(request, target, cardSender) {
+  async present(request, target, cardSender, textSender) {
     const answers = [];
     const sendCard = cardSender ?? this.sendCard;
+    const sendText = textSender ?? this.sendText;
     for (const question of request.questions) {
-      answers.push(await this.askOne(target, question, request.signal, sendCard));
+      answers.push(await this.askOne(target, question, request.signal, sendCard, sendText));
     }
     return { answers };
   }
@@ -791,7 +792,7 @@ var WeComQuestionBridge = class {
     this.pending.clear();
   }
   /** Ask one question: the card carries the question, the Markdown only carries what does not fit. */
-  askOne(target, question, signal, sendCard) {
+  askOne(target, question, signal, sendCard, sendText) {
     const options = question.options ?? [];
     const labelsFitButtons = options.every((option) => option.label.length <= BUTTON_LABEL_MAX_CHARS);
     const labelsFitVote = options.every((option) => option.label.length <= CARD_LIMITS.voteOptionText);
@@ -859,7 +860,7 @@ var WeComQuestionBridge = class {
       }
       const deliver = async () => {
         if (needsExplanation) {
-          await this.sendText(target, questionMarkdown(question, buttons, vote)).then(void 0, () => void 0);
+          await sendText(target, questionMarkdown(question, buttons, vote)).then(void 0, () => void 0);
         }
         await sendCard(target, card);
       };
@@ -1441,9 +1442,11 @@ var ConversationManager = class {
         }) : await this.questions.present(
           request,
           this.activeTurns.get(id),
-          // Route the question card through the turn's transport so it is
-          // delivered as a standalone message ordered after the explanation.
-          (_target, card) => this.activeStreams.get(id)?.transport.sendQuestionCard(card) ?? Promise.resolve()
+          // Route the question's messages through the turn's transport so
+          // the stream is finalized first and the explanation/card/order
+          // of any post-answer reply stay correct in the chat.
+          (_target, card) => this.activeStreams.get(id)?.transport.sendQuestionCard(card) ?? Promise.resolve(),
+          (_target, text) => this.activeStreams.get(id)?.transport.sendQuestionText(text) ?? Promise.resolve()
         );
         return {
           answers: result.answers.map((answer) => ({
@@ -1845,7 +1848,7 @@ var WeComHarnessBridge = class {
       maxReconnectAttempts: this.config.maxReconnectAttempts,
       maxAuthFailureAttempts: this.config.maxAuthFailureAttempts,
       requestTimeout: this.config.sendTimeoutMs,
-      plug_version: "deepseek-harness-wecom-plus/0.7.0"
+      plug_version: "deepseek-harness-wecom-plus/0.7.1"
     });
   }
   async handleWelcome(frame) {
@@ -2160,18 +2163,22 @@ ${outcome.response.text}` : direct;
    */
   beginMessageTransport(frame) {
     const streamId = generateReqId("dsh");
+    const target = chatTargetOf(frame);
     let text = "";
     let activity;
     let timer;
     let pending = false;
     let settled = false;
+    let questionMode = false;
+    let closedText = "";
+    let buffered = "";
     const content = () => truncateUtf8(
       activity ?? (text || "\u6B63\u5728\u601D\u8003\u2026"),
       this.config.maxReplyBytes,
       ""
     );
     const flush = async () => {
-      if (settled) return;
+      if (settled || questionMode) return;
       try {
         await this.retry(async () => withTimeout(
           this.requireClient().replyStream(frame, streamId, content(), false),
@@ -2183,33 +2190,76 @@ ${outcome.response.text}` : direct;
       }
     };
     const schedule = () => {
-      if (pending || settled) return;
+      if (pending || settled || questionMode) return;
       pending = true;
       timer = setTimeout(() => {
         pending = false;
         void flush();
       }, 200);
     };
+    const closeStreamForQuestion = async (overrideContent) => {
+      if (questionMode || settled) return;
+      questionMode = true;
+      closedText = text;
+      if (timer !== void 0) clearTimeout(timer);
+      pending = false;
+      const finalContent = truncateUtf8(overrideContent ?? (text || "\u8BF7\u5728\u4E0B\u65B9\u9009\u62E9\uFF1A"), this.config.maxReplyBytes, "");
+      try {
+        await this.retry(async () => withTimeout(
+          this.requireClient().replyStream(frame, streamId, finalContent, true),
+          this.config.sendTimeoutMs,
+          "WeCom stream close before question"
+        ));
+      } catch (error) {
+        this.log.warn("WeCom stream close before question failed: %s", String(error));
+      }
+    };
     void flush();
     return {
       pushText: (delta) => {
         if (settled) return;
+        if (questionMode) {
+          buffered += delta;
+          return;
+        }
         activity = void 0;
         text += delta;
         schedule();
       },
       setActivity: (line) => {
-        if (settled) return;
+        if (settled || questionMode) return;
         activity = line;
         schedule();
       },
+      sendQuestionText: async (line) => {
+        if (settled) return;
+        const absorb = !questionMode && text.trim().length === 0;
+        await closeStreamForQuestion(absorb ? line : void 0);
+        if (absorb) return;
+        await this.sendProactive(target, { text: line, images: [], cards: [] });
+      },
       sendQuestionCard: async (card) => {
         if (settled) return;
-        await this.sendCards(chatTargetOf(frame), [card]);
+        await closeStreamForQuestion();
+        await this.sendCards(target, [card]);
       },
       finish: async (reply) => {
         settled = true;
         if (timer !== void 0) clearTimeout(timer);
+        if (questionMode) {
+          const full = reply.text.trim();
+          const prefix = closedText.trim();
+          let out = buffered.trim();
+          if (prefix.length > 0 && full.startsWith(prefix)) {
+            out = full.slice(prefix.length).trim();
+          } else if (out.length === 0) {
+            out = full;
+          }
+          if (out.length > 0 || reply.images.length > 0 || reply.cards.length > 0) {
+            await this.sendProactive(target, { text: out, images: reply.images, cards: reply.cards });
+          }
+          return;
+        }
         const inline = reply.images.filter(
           (image) => (image.mediaType === "image/png" || image.mediaType === "image/jpeg") && image.data.byteLength <= 10 * 1024 * 1024
         ).slice(0, 10);
@@ -2223,7 +2273,6 @@ ${outcome.response.text}` : direct;
           }
         }));
         const fallback = reply.images.length > 0 ? "\u56FE\u7247\u56DE\u590D" : "\u5904\u7406\u5B8C\u6210\u3002";
-        const target = chatTargetOf(frame);
         try {
           await this.retry(async () => withTimeout(
             this.requireClient().replyStream(
@@ -2257,6 +2306,14 @@ ${outcome.response.text}` : direct;
         if (settled) return;
         settled = true;
         if (timer !== void 0) clearTimeout(timer);
+        if (questionMode) {
+          try {
+            await this.sendProactive(target, { text: message, images: [], cards: [] });
+          } catch (error) {
+            this.log.error("WeCom proactive failure send failed: %s", String(error));
+          }
+          return;
+        }
         try {
           await this.retry(async () => withTimeout(
             this.requireClient().replyStream(frame, streamId, truncateUtf8(message, this.config.maxReplyBytes, ""), true),
@@ -2267,7 +2324,7 @@ ${outcome.response.text}` : direct;
           this.log.warn("WeCom failure stream failed, falling back to proactive send: %s", String(error));
           try {
             await this.retry(async () => withTimeout(
-              this.requireClient().sendMessage(chatTargetOf(frame), {
+              this.requireClient().sendMessage(target, {
                 msgtype: "markdown",
                 markdown: { content: truncateUtf8(message, this.config.maxReplyBytes, "") }
               }),
@@ -2292,6 +2349,9 @@ ${outcome.response.text}` : direct;
       pushText: () => {
       },
       setActivity: () => {
+      },
+      sendQuestionText: async (line) => {
+        await this.sendProactive(target, { text: line, images: [], cards: [] });
       },
       sendQuestionCard: async (card) => {
         await this.sendCards(target, [card]);
@@ -2506,7 +2566,7 @@ import {
 } from "@deepseek-ai/dsh-settings";
 
 // src/version.ts
-var PLUGIN_VERSION = "0.7.0";
+var PLUGIN_VERSION = "0.7.1";
 
 // src/settings-web.ts
 var SETTINGS_ROUTE = "/_dsh/deepseek-harness-wecom-plus/settings";

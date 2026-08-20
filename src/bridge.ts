@@ -233,7 +233,7 @@ export class WeComHarnessBridge {
       maxReconnectAttempts: this.config.maxReconnectAttempts,
       maxAuthFailureAttempts: this.config.maxAuthFailureAttempts,
       requestTimeout: this.config.sendTimeoutMs,
-      plug_version: 'deepseek-harness-wecom-plus/0.7.0',
+      plug_version: 'deepseek-harness-wecom-plus/0.7.1',
     })
   }
 
@@ -591,18 +591,27 @@ export class WeComHarnessBridge {
    */
   private beginMessageTransport(frame: WsFrameHeaders): TurnTransport {
     const streamId = generateReqId('dsh')
+    const target = chatTargetOf(frame)
     let text = ''
     let activity: string | undefined
     let timer: ReturnType<typeof setTimeout> | undefined
     let pending = false
     let settled = false
+    // Set when a question interrupts the turn: the stream is finalized in
+    // place (a stream bubble keeps its chat position while proactive messages
+    // append after it), the question's messages go out proactively in order,
+    // and everything generated after the answer is buffered and delivered as
+    // one trailing Markdown message.
+    let questionMode = false
+    let closedText = ''
+    let buffered = ''
     const content = (): string => truncateUtf8(
       activity ?? (text || '正在思考…'),
       this.config.maxReplyBytes,
       '',
     )
     const flush = async (): Promise<void> => {
-      if (settled) return
+      if (settled || questionMode) return
       try {
         await this.retry(async () => withTimeout(
           this.requireClient().replyStream(frame, streamId, content(), false),
@@ -614,25 +623,58 @@ export class WeComHarnessBridge {
       }
     }
     const schedule = (): void => {
-      if (pending || settled) return
+      if (pending || settled || questionMode) return
       pending = true
       timer = setTimeout(() => {
         pending = false
         void flush()
       }, 200)
     }
+    /** Finalize the stream once at the first question; later deltas buffer. */
+    const closeStreamForQuestion = async (overrideContent?: string): Promise<void> => {
+      if (questionMode || settled) return
+      questionMode = true
+      closedText = text
+      if (timer !== undefined) clearTimeout(timer)
+      pending = false
+      const finalContent = truncateUtf8(overrideContent ?? (text || '请在下方选择：'), this.config.maxReplyBytes, '')
+      try {
+        await this.retry(async () => withTimeout(
+          this.requireClient().replyStream(frame, streamId, finalContent, true),
+          this.config.sendTimeoutMs,
+          'WeCom stream close before question',
+        ))
+      } catch (error) {
+        // The bubble stays at its last streamed frame; the turn still
+        // completes through the proactive channel.
+        this.log.warn('WeCom stream close before question failed: %s', String(error))
+      }
+    }
     void flush()
     return {
       pushText: (delta) => {
         if (settled) return
+        if (questionMode) {
+          buffered += delta
+          return
+        }
         activity = undefined
         text += delta
         schedule()
       },
       setActivity: (line) => {
-        if (settled) return
+        if (settled || questionMode) return
         activity = line
         schedule()
+      },
+      sendQuestionText: async (line) => {
+        if (settled) return
+        // No streamed content yet: absorb the explanation into the closing
+        // frame instead of emitting a duplicate standalone message.
+        const absorb = !questionMode && text.trim().length === 0
+        await closeStreamForQuestion(absorb ? line : undefined)
+        if (absorb) return
+        await this.sendProactive(target, { text: line, images: [], cards: [] })
       },
       sendQuestionCard: async (card) => {
         if (settled) return
@@ -640,11 +682,29 @@ export class WeComHarnessBridge {
         // requires the card on the stream's FIRST frame, and question cards
         // arrive mid-stream where an attachment silently fails to render.
         // A standalone card also stays updatable through the 5-second window.
-        await this.sendCards(chatTargetOf(frame), [card])
+        await closeStreamForQuestion()
+        await this.sendCards(target, [card])
       },
       finish: async (reply) => {
         settled = true
         if (timer !== undefined) clearTimeout(timer)
+        if (questionMode) {
+          // Deliver only what was generated after the question: strip the
+          // pre-question prefix (already finalized in the stream bubble) from
+          // the turn's full collected text, falling back to the raw buffer.
+          const full = reply.text.trim()
+          const prefix = closedText.trim()
+          let out = buffered.trim()
+          if (prefix.length > 0 && full.startsWith(prefix)) {
+            out = full.slice(prefix.length).trim()
+          } else if (out.length === 0) {
+            out = full
+          }
+          if (out.length > 0 || reply.images.length > 0 || reply.cards.length > 0) {
+            await this.sendProactive(target, { text: out, images: reply.images, cards: reply.cards })
+          }
+          return
+        }
         const inline = reply.images.filter(image =>
           (image.mediaType === 'image/png' || image.mediaType === 'image/jpeg') && image.data.byteLength <= 10 * 1024 * 1024,
         ).slice(0, 10)
@@ -658,7 +718,6 @@ export class WeComHarnessBridge {
           },
         }))
         const fallback = reply.images.length > 0 ? '图片回复' : '处理完成。'
-        const target = chatTargetOf(frame)
         try {
           await this.retry(async () => withTimeout(
             this.requireClient().replyStream(
@@ -695,6 +754,14 @@ export class WeComHarnessBridge {
         if (settled) return
         settled = true
         if (timer !== undefined) clearTimeout(timer)
+        if (questionMode) {
+          try {
+            await this.sendProactive(target, { text: message, images: [], cards: [] })
+          } catch (error) {
+            this.log.error('WeCom proactive failure send failed: %s', String(error))
+          }
+          return
+        }
         try {
           await this.retry(async () => withTimeout(
             this.requireClient().replyStream(frame, streamId, truncateUtf8(message, this.config.maxReplyBytes, ''), true),
@@ -705,7 +772,7 @@ export class WeComHarnessBridge {
           this.log.warn('WeCom failure stream failed, falling back to proactive send: %s', String(error))
           try {
             await this.retry(async () => withTimeout(
-              this.requireClient().sendMessage(chatTargetOf(frame), {
+              this.requireClient().sendMessage(target, {
                 msgtype: 'markdown',
                 markdown: { content: truncateUtf8(message, this.config.maxReplyBytes, '') },
               }),
@@ -730,6 +797,9 @@ export class WeComHarnessBridge {
     return {
       pushText: () => {},
       setActivity: () => {},
+      sendQuestionText: async (line) => {
+        await this.sendProactive(target, { text: line, images: [], cards: [] })
+      },
       sendQuestionCard: async (card) => {
         await this.sendCards(target, [card])
       },

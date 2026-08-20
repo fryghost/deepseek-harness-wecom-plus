@@ -13,6 +13,7 @@ function noopTransport(): import('../src/conversations.js').TurnTransport {
   return {
     pushText: vi.fn(),
     setActivity: vi.fn(),
+    sendQuestionText: vi.fn(async () => undefined),
     sendQuestionCard: vi.fn(async () => undefined),
     finish: vi.fn(async () => undefined),
     fail: vi.fn(async () => undefined),
@@ -629,6 +630,7 @@ describe('ConversationManager', () => {
     const transport = {
       pushText: vi.fn(),
       setActivity: vi.fn(),
+      sendQuestionText: vi.fn(async () => undefined),
       sendQuestionCard: vi.fn(async () => undefined),
       finish: vi.fn(async () => undefined),
       fail: vi.fn(async () => undefined),
@@ -755,6 +757,7 @@ describe('ConversationManager', () => {
     const transport = {
       pushText: vi.fn(),
       setActivity: vi.fn(),
+      sendQuestionText: vi.fn(async (_text: string) => undefined),
       sendQuestionCard: vi.fn(async (_card: TemplateCard) => { sentCards.push(_card) }),
       finish: vi.fn(async () => undefined),
       fail: vi.fn(async () => undefined),

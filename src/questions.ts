@@ -128,11 +128,13 @@ export class WeComQuestionBridge {
     request: AskUserQuestionRequest,
     target: string,
     cardSender?: QuestionCardSender,
+    textSender?: QuestionTextSender,
   ): Promise<AskUserQuestionAnswer> {
     const answers: AskUserQuestionAnswerItem[] = []
     const sendCard = cardSender ?? this.sendCard
+    const sendText = textSender ?? this.sendText
     for (const question of request.questions) {
-      answers.push(await this.askOne(target, question, request.signal, sendCard))
+      answers.push(await this.askOne(target, question, request.signal, sendCard, sendText))
     }
     return { answers }
   }
@@ -223,6 +225,7 @@ export class WeComQuestionBridge {
     question: AskUserQuestionItem,
     signal: AbortSignal | undefined,
     sendCard: QuestionCardSender,
+    sendText: QuestionTextSender,
   ): Promise<AskUserQuestionAnswerItem> {
     const options = question.options ?? []
     // Card selection strategy — the Markdown message always carries the full
@@ -313,7 +316,7 @@ export class WeComQuestionBridge {
       // only on the stream's FIRST frame, and questions arrive mid-stream.
       const deliver = async (): Promise<void> => {
         if (needsExplanation) {
-          await this.sendText(target, questionMarkdown(question, buttons, vote)).then(undefined, () => undefined)
+          await sendText(target, questionMarkdown(question, buttons, vote)).then(undefined, () => undefined)
         }
         await sendCard(target, card)
       }

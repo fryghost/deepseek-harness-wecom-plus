@@ -793,15 +793,18 @@ var WeComQuestionBridge = class {
   /** Ask one question: the card carries the question, the Markdown only carries what does not fit. */
   askOne(target, question, signal, sendCard) {
     const options = question.options ?? [];
-    const buttons = options.length >= 2 && options.length <= 6 && question.multiSelect !== true && options.every((option) => option.label.length <= BUTTON_LABEL_MAX_CHARS);
-    const vote = options.length >= 2 && options.length <= 20 && !buttons;
+    const labelsFitButtons = options.every((option) => option.label.length <= BUTTON_LABEL_MAX_CHARS);
+    const labelsFitVote = options.every((option) => option.label.length <= CARD_LIMITS.voteOptionText);
+    const buttons = options.length >= 2 && options.length <= 6 && question.multiSelect !== true && labelsFitButtons;
+    const vote = options.length >= 2 && options.length <= 20 && !buttons && labelsFitVote;
     const needsExplanation = !buttons || (question.detail?.trim().length ?? 0) > 0 || options.some((option) => (option.description?.trim().length ?? 0) > 0) || question.question.length > CARD_LIMITS.title;
     const mode = buttons ? "buttons" : vote ? "vote" : "text";
     const card = buttons ? buildTemplateCard({
       cardType: "button_interaction",
       title: question.question,
       ...question.header === void 0 ? {} : { desc: question.header },
-      buttons: options.map((option, index) => ({ text: option.label, key: `q-opt-${index + 1}` }))
+      // Equal-weight options: both buttons grey, no implied recommendation.
+      buttons: options.map((option, index) => ({ text: option.label, key: `q-opt-${index + 1}`, style: 2 }))
     }, this.config.cardTaskIdPrefix) : vote ? buildTemplateCard({
       cardType: "vote_interaction",
       title: question.question,
@@ -1842,7 +1845,7 @@ var WeComHarnessBridge = class {
       maxReconnectAttempts: this.config.maxReconnectAttempts,
       maxAuthFailureAttempts: this.config.maxAuthFailureAttempts,
       requestTimeout: this.config.sendTimeoutMs,
-      plug_version: "deepseek-harness-wecom-plus/0.6.3"
+      plug_version: "deepseek-harness-wecom-plus/0.7.0"
     });
   }
   async handleWelcome(frame) {
@@ -2503,7 +2506,7 @@ import {
 } from "@deepseek-ai/dsh-settings";
 
 // src/version.ts
-var PLUGIN_VERSION = "0.6.3";
+var PLUGIN_VERSION = "0.7.0";
 
 // src/settings-web.ts
 var SETTINGS_ROUTE = "/_dsh/deepseek-harness-wecom-plus/settings";

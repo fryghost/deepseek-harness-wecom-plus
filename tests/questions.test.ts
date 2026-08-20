@@ -57,6 +57,8 @@ describe('WeComQuestionBridge', () => {
     expect(card).toBeDefined()
     expect(card?.card_type).toBe('button_interaction')
     expect(card?.button_list).toHaveLength(3)
+    // Equal-weight option pickers render every button grey.
+    expect(card?.button_list?.every(button => button.style === 2)).toBe(true)
     expect(texts[0]).toContain('1. 发布到生产')
     expect(texts[0]).toContain('三个方案的影响各不相同。')
 
@@ -177,8 +179,8 @@ describe('WeComQuestionBridge', () => {
     await expect(asking).resolves.toEqual({ answers: [{ id: 'q14', selected: ['继续'] }] })
   })
 
-  it('uses a vote card when any option label is too long for a button', async () => {
-    const { instance, cards } = bridge()
+  it('falls back to the text card when any label exceeds the vote option cap', async () => {
+    const { instance, cards, texts } = bridge()
     const asking = instance.present({
       questions: [{
         id: 'q13',
@@ -190,9 +192,34 @@ describe('WeComQuestionBridge', () => {
       }],
     }, 'u1')
     await vi.waitFor(() => { expect(cards).toHaveLength(1) })
-    expect(cards[0]?.card_type).toBe('vote_interaction')
+    // No truncated option surface: the Markdown carries the full labels and
+    // the card only prompts for a numbered reply.
+    expect(cards[0]?.card_type).toBe('text_notice')
+    expect(texts[0]).toContain('1. 查看说明：我会回一段关于三种卡片类型的总结')
     expect(instance.tryAnswerFromText(textMessage('结束测试'))).toBe(true)
     await expect(asking).resolves.toEqual({ answers: [{ id: 'q13', selected: ['结束测试'] }] })
+  })
+
+  it('uses a vote card for labels that fit vote options but not buttons', async () => {
+    const { instance, cards } = bridge()
+    const asking = instance.present({
+      questions: [{
+        id: 'q16',
+        question: '选择下一步',
+        options: [
+          { label: '灰度发布到生产' },
+          { label: '回滚上个版本' },
+        ],
+      }],
+    }, 'u1')
+    await vi.waitFor(() => { expect(cards).toHaveLength(1) })
+    expect(cards[0]?.card_type).toBe('vote_interaction')
+    expect(cards[0]?.checkbox?.option_list).toEqual([
+      expect.objectContaining({ id: 'q-opt-1', text: '灰度发布到生产' }),
+      expect.objectContaining({ id: 'q-opt-2', text: '回滚上个版本' }),
+    ])
+    expect(instance.tryAnswerFromText(textMessage('2'))).toBe(true)
+    await expect(asking).resolves.toEqual({ answers: [{ id: 'q16', selected: ['回滚上个版本'] }] })
   })
 
   it('renders a multi-select question as a vote card and settles from the submit event', async () => {

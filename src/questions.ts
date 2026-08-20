@@ -225,14 +225,19 @@ export class WeComQuestionBridge {
     sendCard: QuestionCardSender,
   ): Promise<AskUserQuestionAnswerItem> {
     const options = question.options ?? []
-    // Card selection strategy, by label fit and option count:
+    // Card selection strategy — the Markdown message always carries the full
+    // question and option details, the card is only the selector, so no card
+    // surface may truncate content:
     // - buttons: 2-6 single-choice, every label ≤ 6 chars (fits WeCom buttons)
-    // - vote: multi-select, or more than 6 options, or long labels (checkbox + submit)
-    // - text: no options, or more than 20 options (numbered Markdown + reply)
+    // - vote: multi-select or 7-20 options, every label ≤ 11 chars (the vote
+    //   option cap — anything longer would truncate, so it goes to text mode)
+    // - text: everything else (numbered Markdown + reply with 1 / 1,3 / label)
+    const labelsFitButtons = options.every(option => option.label.length <= BUTTON_LABEL_MAX_CHARS)
+    const labelsFitVote = options.every(option => option.label.length <= CARD_LIMITS.voteOptionText)
     const buttons = options.length >= 2 && options.length <= 6
       && question.multiSelect !== true
-      && options.every(option => option.label.length <= BUTTON_LABEL_MAX_CHARS)
-    const vote = options.length >= 2 && options.length <= 20 && !buttons
+      && labelsFitButtons
+    const vote = options.length >= 2 && options.length <= 20 && !buttons && labelsFitVote
     // A Markdown message duplicates the card unless something needs the room:
     // numbered answers (text mode), option descriptions, extra detail, or a
     // question that exceeds the card title.
@@ -246,7 +251,8 @@ export class WeComQuestionBridge {
         cardType: 'button_interaction',
         title: question.question,
         ...(question.header === undefined ? {} : { desc: question.header }),
-        buttons: options.map((option, index) => ({ text: option.label, key: `q-opt-${index + 1}` })),
+        // Equal-weight options: both buttons grey, no implied recommendation.
+        buttons: options.map((option, index) => ({ text: option.label, key: `q-opt-${index + 1}`, style: 2 })),
       }, this.config.cardTaskIdPrefix)
       : vote
         ? buildTemplateCard({

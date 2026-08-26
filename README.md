@@ -118,7 +118,9 @@ Template cards have strict row and character limits, and cramming a long reply i
 | `vote_interaction` | checkbox vote (1–20 options, single/multiple) + submit button |
 | `multiple_interaction` | up to 3 dropdown selectors + submit button |
 | `text_notice` | title + subtitle notification card |
-| `news_notice` | image card (requires `image_url`, optional whole-card jump) |
+| `news_notice` | image card (requires `image_url`, optional whole-card jump; `image_url` must be a publicly reachable HTTPS direct link — redirecting or overseas-CDN sources tend to break) |
+
+The smart-bot channel rejects `news_notice` without a `card_action` (errcode 42045): when `jump_url` is absent the plugin fills a linkless type-0 action, and if the platform still refuses it resends once with a neutral link, logging the outcome.
 
 All display text is truncated against the protocol caps (title 26, desc 30, subtitle 112, button 10, vote option 11 characters); button keys, option ids, and task ids are validated and deduplicated, and task ids are auto-generated when omitted. Button styles follow the WeCom visual grammar: 1–2 button cards keep the caller's styles (the confirm/cancel pattern); 3 or more buttons are an equal-option picker and are **all rendered grey (style 2)**, so model-supplied styles can never produce a mixed blue/grey emphasis mess.
 

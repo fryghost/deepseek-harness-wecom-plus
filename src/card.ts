@@ -307,7 +307,13 @@ export function buildTemplateCard(input: CardInput, taskIdPrefix: string): Templ
         ...base,
         main_title: { title, ...(desc === undefined ? {} : { desc }) },
         card_image: { url: imageUrl },
-        ...(jumpUrl === undefined ? {} : { card_action: { type: 1, url: jumpUrl } }),
+        // The smart-bot channel rejects news_notice without card_action
+        // (errcode 42045): a real jump when given, otherwise a linkless
+        // type-0 action; sendCards retries with a neutral link if the
+        // platform refuses even that.
+        card_action: jumpUrl === undefined || jumpUrl.length === 0
+          ? { type: 0 }
+          : { type: 1, url: jumpUrl },
       }
     }
     case 'button_interaction': {
@@ -494,4 +500,18 @@ export function buildTextNoticeAckCard(
 function markSelectedLabel(text: string): string {
   const marked = `✓ ${text}`
   return marked.length <= CARD_LIMITS.buttonText ? marked : truncateChars(marked, CARD_LIMITS.buttonText)
+}
+
+/** Platform errcode for a missing/invalid template-card card_action. */
+export const ERRCODE_CARD_ACTION_INVALID = 42045
+
+/**
+ * Repair one rejected card for a single resend: the smart-bot channel answers
+ * 42045 when card_action is absent or linkless on types that demand it, so
+ * attach a neutral whole-card link. Returns undefined when nothing can help.
+ */
+export function repairCardForResend(card: TemplateCard, errcode: unknown): TemplateCard | undefined {
+  if (errcode !== ERRCODE_CARD_ACTION_INVALID) return undefined
+  if (card.card_action !== undefined && card.card_action.type === 1) return undefined
+  return { ...card, card_action: { type: 1, url: 'https://work.weixin.qq.com/' } }
 }

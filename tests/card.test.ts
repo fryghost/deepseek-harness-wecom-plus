@@ -4,7 +4,9 @@ import {
   buildTemplateCard,
   buildTextNoticeAckCard,
   CARD_LIMITS,
+  ERRCODE_CARD_ACTION_INVALID,
   generateTaskId,
+  repairCardForResend,
   truncateChars,
 } from '../src/card.js'
 
@@ -127,6 +129,34 @@ describe('template card construction', () => {
     }, 'dshp')
     expect(card.card_image).toEqual({ url: 'https://example.com/report.png' })
     expect(card.card_action).toEqual({ type: 1, url: 'https://example.com/report' })
+  })
+
+  it('always gives news_notice a card_action because the channel rejects it missing (42045)', () => {
+    const card = buildTemplateCard({
+      cardType: 'news_notice',
+      title: '周报',
+      imageUrl: 'https://example.com/report.png',
+    }, 'dshp')
+    expect(card.card_action).toEqual({ type: 0 })
+
+    const repaired = repairCardForResend(
+      { card_type: 'news_notice', main_title: { title: 't' }, task_id: 'x' },
+      ERRCODE_CARD_ACTION_INVALID,
+    )
+    expect(repaired?.card_action).toEqual(expect.objectContaining({ type: 1 }))
+
+    // A type-0 action is still repairable; a real type-1 link is not, and
+    // other errcodes are out of scope.
+    const withJump = buildTemplateCard({
+      cardType: 'news_notice',
+      title: '周报',
+      imageUrl: 'https://example.com/report.png',
+      jumpUrl: 'https://example.com/report',
+    }, 'dshp')
+    expect(repairCardForResend(card, ERRCODE_CARD_ACTION_INVALID)?.card_action)
+      .toEqual(expect.objectContaining({ type: 1 }))
+    expect(repairCardForResend(withJump, ERRCODE_CARD_ACTION_INVALID)).toBeUndefined()
+    expect(repairCardForResend({ card_type: 'text_notice' }, 40058)).toBeUndefined()
   })
 
   it('acknowledges a button card click same-type, keeping every option and marking the selection', () => {

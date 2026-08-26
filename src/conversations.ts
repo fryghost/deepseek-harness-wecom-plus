@@ -769,7 +769,7 @@ export class ConversationManager {
           type: 'string',
           required: true,
           enum: ['text_notice', 'news_notice', 'button_interaction', 'vote_interaction', 'multiple_interaction'],
-          description: 'Card layout: text_notice (title + subtitle), news_notice (image card, needs image_url), '
+          description: 'Card layout: text_notice (title + subtitle), news_notice (image card, needs a publicly reachable direct-HTTPS image_url — redirecting sources break; the channel also demands a card_action, filled automatically when jump_url is omitted), '
             + 'button_interaction (option/confirm buttons), vote_interaction (checkbox list + submit), '
             + 'multiple_interaction (up to 3 dropdown selectors + submit). Clicks and submissions come back as '
             + 'WeCom messages carrying task_id and event_key.',

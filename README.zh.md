@@ -123,7 +123,9 @@ pnpm dsh plugin --profile web add /absolute/path/to/deepseek-harness-wecom-plus
 | `vote_interaction` | 投票复选框（1~20 个选项，单选/多选）+ 提交按钮 |
 | `multiple_interaction` | 最多 3 个下拉选择器 + 提交按钮 |
 | `text_notice` | 标题 + 副标题的通知卡 |
-| `news_notice` | 图文卡（需 `image_url`，可整卡跳转） |
+| `news_notice` | 图文卡（需 `image_url`，可整卡跳转；`image_url` 要求公网可直接访问的 HTTPS 直链，重定向/海外 CDN 图源易裂图） |
+
+智能机器人通道要求 `news_notice` 必须携带 `card_action`，否则拒收（errcode 42045）：未提供 `jump_url` 时插件自动填充无跳转的 type 0，若平台仍拒绝则带中性链接重发一次并记录日志。
 
 所有展示文本都按协议上限自动截断（标题 26、辅助 30、副标题 112、按钮 10、投票选项 11 字），按钮 key / 选项 id / task_id 自动校验与去重，task_id 缺省自动生成。按钮样式按企微视觉规范兼容处理：1~2 个按钮保留调用方指定的样式（确认/取消模式）；3 个及以上按钮视为等权选项组，**统一渲染为灰色（style 2）**，避免模型传参导致蓝灰混排的强调色错乱。
 

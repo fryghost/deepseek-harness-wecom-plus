@@ -228,7 +228,11 @@ function buildTemplateCard(input, taskIdPrefix) {
         ...base,
         main_title: { title, ...desc === void 0 ? {} : { desc } },
         card_image: { url: imageUrl },
-        ...jumpUrl === void 0 ? {} : { card_action: { type: 1, url: jumpUrl } }
+        // The smart-bot channel rejects news_notice without card_action
+        // (errcode 42045): a real jump when given, otherwise a linkless
+        // type-0 action; sendCards retries with a neutral link if the
+        // platform refuses even that.
+        card_action: jumpUrl === void 0 || jumpUrl.length === 0 ? { type: 0 } : { type: 1, url: jumpUrl }
       };
     }
     case "button_interaction": {
@@ -355,6 +359,12 @@ function buildTextNoticeAckCard(taskId, ackTitle, ackSubtitle, jump = true) {
 function markSelectedLabel(text) {
   const marked = `\u2713 ${text}`;
   return marked.length <= CARD_LIMITS.buttonText ? marked : truncateChars(marked, CARD_LIMITS.buttonText);
+}
+var ERRCODE_CARD_ACTION_INVALID = 42045;
+function repairCardForResend(card, errcode) {
+  if (errcode !== ERRCODE_CARD_ACTION_INVALID) return void 0;
+  if (card.card_action !== void 0 && card.card_action.type === 1) return void 0;
+  return { ...card, card_action: { type: 1, url: "https://work.weixin.qq.com/" } };
 }
 
 // src/conversations.ts
@@ -1519,7 +1529,7 @@ var ConversationManager = class {
           type: "string",
           required: true,
           enum: ["text_notice", "news_notice", "button_interaction", "vote_interaction", "multiple_interaction"],
-          description: "Card layout: text_notice (title + subtitle), news_notice (image card, needs image_url), button_interaction (option/confirm buttons), vote_interaction (checkbox list + submit), multiple_interaction (up to 3 dropdown selectors + submit). Clicks and submissions come back as WeCom messages carrying task_id and event_key."
+          description: "Card layout: text_notice (title + subtitle), news_notice (image card, needs a publicly reachable direct-HTTPS image_url \u2014 redirecting sources break; the channel also demands a card_action, filled automatically when jump_url is omitted), button_interaction (option/confirm buttons), vote_interaction (checkbox list + submit), multiple_interaction (up to 3 dropdown selectors + submit). Clicks and submissions come back as WeCom messages carrying task_id and event_key."
         },
         title: {
           type: "string",
@@ -1848,7 +1858,7 @@ var WeComHarnessBridge = class {
       maxReconnectAttempts: this.config.maxReconnectAttempts,
       maxAuthFailureAttempts: this.config.maxAuthFailureAttempts,
       requestTimeout: this.config.sendTimeoutMs,
-      plug_version: "deepseek-harness-wecom-plus/0.7.2"
+      plug_version: "deepseek-harness-wecom-plus/0.7.3"
     });
   }
   async handleWelcome(frame) {
@@ -2426,7 +2436,25 @@ ${outcome.response.text}` : direct;
           this.config.sendTimeoutMs,
           "WeCom template card send"
         ));
+        continue;
       } catch (error) {
+        const repaired = repairCardForResend(card, wireErrcode(error));
+        if (repaired !== void 0) {
+          try {
+            await this.retry(async () => withTimeout(
+              this.requireClient().sendMessage(target, { msgtype: "template_card", template_card: repaired }),
+              this.config.sendTimeoutMs,
+              "WeCom template card repaired resend"
+            ));
+            console.error("[wecom-plus] card send repaired task=%s (42045: neutral card_action attached)", card.task_id ?? "?");
+            this.log.warn("WeCom card %s rejected with 42045; resent with a neutral card_action", card.task_id ?? "?");
+            continue;
+          } catch (resendError) {
+            console.error("[wecom-plus] card resend failed task=%s err=%s", card.task_id ?? "?", wireErrorDetail(resendError));
+            this.log.error("WeCom card %s repaired resend failed: %s", card.task_id ?? "?", wireErrorDetail(resendError));
+            continue;
+          }
+        }
         console.error(
           "[wecom-plus] card send failed task=%s err=%s card=%s",
           card.task_id ?? "?",
@@ -2509,6 +2537,12 @@ function wireErrorDetail(error) {
   }
   return String(error);
 }
+function wireErrcode(error) {
+  if (typeof error === "object" && error !== null) {
+    return error.errcode;
+  }
+  return void 0;
+}
 function chatTargetOf(frame) {
   const body = frame.body;
   if (body === void 0) throw new Error("WeCom stream frame has no message body");
@@ -2572,7 +2606,7 @@ import {
 } from "@deepseek-ai/dsh-settings";
 
 // src/version.ts
-var PLUGIN_VERSION = "0.7.2";
+var PLUGIN_VERSION = "0.7.3";
 
 // src/settings-web.ts
 var SETTINGS_ROUTE = "/_dsh/deepseek-harness-wecom-plus/settings";

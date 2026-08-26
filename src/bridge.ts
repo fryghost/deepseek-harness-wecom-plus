@@ -21,7 +21,7 @@ import {
   type WsFrame,
   type WsFrameHeaders,
 } from '@wecom/aibot-node-sdk'
-import { buildClickAckCard, buildTemplateCard, buildTextNoticeAckCard } from './card.js'
+import { buildClickAckCard, buildTemplateCard, buildTextNoticeAckCard, repairCardForResend } from './card.js'
 import type { Config } from './config.js'
 import {
   ConversationManager,
@@ -233,7 +233,7 @@ export class WeComHarnessBridge {
       maxReconnectAttempts: this.config.maxReconnectAttempts,
       maxAuthFailureAttempts: this.config.maxAuthFailureAttempts,
       requestTimeout: this.config.sendTimeoutMs,
-      plug_version: 'deepseek-harness-wecom-plus/0.7.2',
+      plug_version: 'deepseek-harness-wecom-plus/0.7.3',
     })
   }
 
@@ -877,7 +877,27 @@ export class WeComHarnessBridge {
           this.config.sendTimeoutMs,
           'WeCom template card send',
         ))
+        continue
       } catch (error) {
+        // The platform rejects cards missing a valid card_action with 42045:
+        // resend once with the repaired shape before giving up.
+        const repaired = repairCardForResend(card, wireErrcode(error))
+        if (repaired !== undefined) {
+          try {
+            await this.retry(async () => withTimeout(
+              this.requireClient().sendMessage(target, { msgtype: 'template_card', template_card: repaired }),
+              this.config.sendTimeoutMs,
+              'WeCom template card repaired resend',
+            ))
+            console.error('[wecom-plus] card send repaired task=%s (42045: neutral card_action attached)', card.task_id ?? '?')
+            this.log.warn('WeCom card %s rejected with 42045; resent with a neutral card_action', card.task_id ?? '?')
+            continue
+          } catch (resendError) {
+            console.error('[wecom-plus] card resend failed task=%s err=%s', card.task_id ?? '?', wireErrorDetail(resendError))
+            this.log.error('WeCom card %s repaired resend failed: %s', card.task_id ?? '?', wireErrorDetail(resendError))
+            continue
+          }
+        }
         // Surface the platform errcode: the tool only QUEUES the card, so a
         // send failure here never reaches the model and must be diagnosable.
         console.error(
@@ -985,6 +1005,14 @@ function wireErrorDetail(error: unknown): string {
     }
   }
   return String(error)
+}
+
+/** The platform errcode of one rejected reply ack, when present. */
+function wireErrcode(error: unknown): unknown {
+  if (typeof error === 'object' && error !== null) {
+    return (error as { errcode?: unknown }).errcode
+  }
+  return undefined
 }
 
 /** Outbound target of one stream frame's message body. */

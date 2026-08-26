@@ -1,4 +1,4 @@
-# WeCom 插件交互逻辑（v0.7.1）
+# WeCom 插件交互逻辑（v0.7.3）
 
 > 本文档描述 `deepseek-harness-wecom-plus` 在运行时的完整交互行为，与代码同步维护。
 
@@ -81,6 +81,7 @@
 - **五种卡片**：`text_notice`（标题+副标题）、`news_notice`（图文，需 image_url，可整卡跳转）、`button_interaction`（1~6 按钮）、`vote_interaction`（1~20 复选项+提交）、`multiple_interaction`（≤3 下拉+提交）；
 - **协议安全**：标题 26 / 辅助 30 / 副标题 112 / 按钮 10 / 投票选项 11 / 下拉选项 10 字自动截断；按钮 key、选项 id 去重；task_id 自动生成；**按钮样式兼容**：1~2 按钮保留指定样式，≥3 按钮视为等权选项组统一置灰（style 2）；
 - **cardMode**：`tool`（默认，仅模型显式发卡）/ `off`（关闭）/ `auto`（已废弃，等同 `tool`，仅为旧配置兼容保留）；
+- **news_notice 的 42045 兼容**：智能机器人通道要求 `news_notice` 必须带 `card_action`，否则拒收（errcode 42045）；无 `jump_url` 时自动填充 type 0，平台仍拒则带中性链接重发一次（`card send repaired` 日志）；`image_url` 需公网直链（重定向/海外 CDN 易裂图）；
 - **卡片快照注册表**：每张发出的卡片按 `task_id` 登记完整快照 + key → 标签，点击时用于同类型原位更新与文案还原；
 - **提交值解析**：按钮 → `event_key`；投票/下拉 → 原始事件 `selected_items`（question_key + option_ids）随点击消息注入模型。
 

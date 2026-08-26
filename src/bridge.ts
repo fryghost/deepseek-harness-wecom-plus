@@ -233,7 +233,7 @@ export class WeComHarnessBridge {
       maxReconnectAttempts: this.config.maxReconnectAttempts,
       maxAuthFailureAttempts: this.config.maxAuthFailureAttempts,
       requestTimeout: this.config.sendTimeoutMs,
-      plug_version: 'deepseek-harness-wecom-plus/0.7.1',
+      plug_version: 'deepseek-harness-wecom-plus/0.7.2',
     })
   }
 
@@ -517,11 +517,11 @@ export class WeComHarnessBridge {
       try {
         await this.conversations.process(message, this.requireClient(), transport)
       } catch (error) {
-        this.log.error('WeCom message %s failed: %s', message.msgid, String(error))
+        this.log.error('WeCom message %s failed: %s', message.msgid, wireErrorDetail(error))
         await transport.fail('处理消息时发生错误，请稍后重试。')
       }
     } catch (error) {
-      this.log.error('WeCom message %s failed: %s', message.msgid, String(error))
+      this.log.error('WeCom message %s failed: %s', message.msgid, wireErrorDetail(error))
       try {
         await this.sendReply(frame, { text: '处理消息时发生错误，请稍后重试。', images: [], cards: [] })
       } catch (sendError) {
@@ -878,7 +878,15 @@ export class WeComHarnessBridge {
           'WeCom template card send',
         ))
       } catch (error) {
-        this.log.error('WeCom template card send failed: %s', String(error))
+        // Surface the platform errcode: the tool only QUEUES the card, so a
+        // send failure here never reaches the model and must be diagnosable.
+        console.error(
+          '[wecom-plus] card send failed task=%s err=%s card=%s',
+          card.task_id ?? '?',
+          wireErrorDetail(error),
+          JSON.stringify(card),
+        )
+        this.log.error('WeCom template card send failed (task %s): %s', card.task_id ?? '?', wireErrorDetail(error))
       }
     }
   }

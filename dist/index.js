@@ -1848,7 +1848,7 @@ var WeComHarnessBridge = class {
       maxReconnectAttempts: this.config.maxReconnectAttempts,
       maxAuthFailureAttempts: this.config.maxAuthFailureAttempts,
       requestTimeout: this.config.sendTimeoutMs,
-      plug_version: "deepseek-harness-wecom-plus/0.7.1"
+      plug_version: "deepseek-harness-wecom-plus/0.7.2"
     });
   }
   async handleWelcome(frame) {
@@ -2094,11 +2094,11 @@ var WeComHarnessBridge = class {
       try {
         await this.conversations.process(message, this.requireClient(), transport);
       } catch (error) {
-        this.log.error("WeCom message %s failed: %s", message.msgid, String(error));
+        this.log.error("WeCom message %s failed: %s", message.msgid, wireErrorDetail(error));
         await transport.fail("\u5904\u7406\u6D88\u606F\u65F6\u53D1\u751F\u9519\u8BEF\uFF0C\u8BF7\u7A0D\u540E\u91CD\u8BD5\u3002");
       }
     } catch (error) {
-      this.log.error("WeCom message %s failed: %s", message.msgid, String(error));
+      this.log.error("WeCom message %s failed: %s", message.msgid, wireErrorDetail(error));
       try {
         await this.sendReply(frame, { text: "\u5904\u7406\u6D88\u606F\u65F6\u53D1\u751F\u9519\u8BEF\uFF0C\u8BF7\u7A0D\u540E\u91CD\u8BD5\u3002", images: [], cards: [] });
       } catch (sendError) {
@@ -2427,7 +2427,13 @@ ${outcome.response.text}` : direct;
           "WeCom template card send"
         ));
       } catch (error) {
-        this.log.error("WeCom template card send failed: %s", String(error));
+        console.error(
+          "[wecom-plus] card send failed task=%s err=%s card=%s",
+          card.task_id ?? "?",
+          wireErrorDetail(error),
+          JSON.stringify(card)
+        );
+        this.log.error("WeCom template card send failed (task %s): %s", card.task_id ?? "?", wireErrorDetail(error));
       }
     }
   }
@@ -2566,7 +2572,7 @@ import {
 } from "@deepseek-ai/dsh-settings";
 
 // src/version.ts
-var PLUGIN_VERSION = "0.7.1";
+var PLUGIN_VERSION = "0.7.2";
 
 // src/settings-web.ts
 var SETTINGS_ROUTE = "/_dsh/deepseek-harness-wecom-plus/settings";

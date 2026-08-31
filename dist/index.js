@@ -365,7 +365,6 @@ function repairCardForResend(card, errcode) {
 }
 
 // src/conversations.ts
-import { resolveSessionPreset } from "@deepseek-ai/dsh-agent-presets";
 import { createUserMessage } from "@deepseek-ai/dsh-llm";
 import { SessionId } from "@deepseek-ai/dsh-session";
 import { defineTool } from "@deepseek-ai/dsh-tools";
@@ -930,6 +929,15 @@ ${question.detail}`
 }
 
 // src/conversations.ts
+function resolveSessionPreset(header, events) {
+  let preset = header.agentPreset;
+  for (const event of events) {
+    if (event.type === "agent-preset/selected") {
+      preset = event.data.agentPreset;
+    }
+  }
+  return preset ?? void 0;
+}
 var MAX_CARD_LABEL_TASKS = 500;
 var ConversationManager = class {
   constructor(ctx, config, sendFile, sendQuestionCard, sendQuestionText) {
@@ -1295,10 +1303,7 @@ var ConversationManager = class {
     const agentOptions = { provider: current.provider, model: current.model };
     if (this.persistedIds.has(id)) {
       const inspected = await this.ctx.sessionPersistence.inspect(sessionId);
-      const agentPreset2 = resolveSessionPreset({
-        header: inspected.meta,
-        events: inspected.events
-      }) ?? this.resolveAgentPreset();
+      const agentPreset2 = resolveSessionPreset(inspected.meta, inspected.events) ?? this.resolveAgentPreset();
       try {
         return this.ownAgent(await this.ctx.agents.resume({
           resumeSessionId: sessionId,

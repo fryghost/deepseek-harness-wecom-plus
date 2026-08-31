@@ -1,7 +1,7 @@
 import type { Context } from '@deepseek-ai/cordis'
 import type { Agent, AgentHandle } from '@deepseek-ai/dsh-agent'
 import type {} from '@deepseek-ai/dsh-agent-default-model'
-import { resolveSessionPreset } from '@deepseek-ai/dsh-agent-presets'
+import type {} from '@deepseek-ai/dsh-agent-presets'
 import type { CommandExecution } from '@deepseek-ai/dsh-commands'
 import { createUserMessage } from '@deepseek-ai/dsh-llm'
 import { SessionId, type SessionEvent } from '@deepseek-ai/dsh-session'
@@ -25,6 +25,25 @@ import { inboundContent, type WeComDownloadPort } from './inbound.js'
 import { resolveOutboundFile, type OutboundFile } from './outbound-file.js'
 import { WeComQuestionBridge, cardEventFacts, type QuestionCardSender, type QuestionTextSender } from './questions.js'
 import { chatTarget, sessionIdFor, withTimeout } from './util.js'
+
+/**
+ * dsh 0.1.2-alpha.x turned session preset resolution into a session
+ * projection (agentPresetProjectionDefinition). The fold is trivial and
+ * stable: the header seeds it, agent-preset/selected events advance it.
+ * Inlined here so the plugin stops importing a deleted helper.
+ */
+function resolveSessionPreset(
+  header: { agentPreset?: string },
+  events: readonly SessionEvent[],
+): string | undefined {
+  let preset = header.agentPreset
+  for (const event of events) {
+    if (event.type === 'agent-preset/selected') {
+      preset = (event.data as { agentPreset: string }).agentPreset
+    }
+  }
+  return preset ?? undefined
+}
 
 /** Completed response from one WeCom-triggered Harness turn. */
 export interface ConversationReply {
@@ -512,10 +531,8 @@ export class ConversationManager {
     const agentOptions = { provider: current.provider, model: current.model }
     if (this.persistedIds.has(id)) {
       const inspected = await this.ctx.sessionPersistence.inspect(sessionId)
-      const agentPreset = resolveSessionPreset({
-        header: inspected.meta,
-        events: inspected.events,
-      }) ?? this.resolveAgentPreset()
+      const agentPreset = resolveSessionPreset(inspected.meta, inspected.events)
+        ?? this.resolveAgentPreset()
       try {
         return this.ownAgent(await this.ctx.agents.resume({
           resumeSessionId: sessionId,

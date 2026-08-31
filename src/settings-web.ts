@@ -5,7 +5,7 @@
  * to the browser; a pasted Secret goes one way — through `set-key` into the
  * DSH credentials seam, the same write path first-party pages use. Saving the
  * settings section restarts the channel live through the owning plugin's
- * installSettingsSection hook.
+ * settings wiring.
  * @module deepseek-harness-wecom-plus/settings-web
  */
 
@@ -15,7 +15,6 @@ import { credentialRef } from '@deepseek-ai/dsh-credentials'
 import type {} from '@deepseek-ai/dsh-host-webserver'
 import {
   SettingsConflictError,
-  settingsNamespace,
   type SettingsDescriptor,
   type SettingsNamespace,
   type SettingsProvider,
@@ -25,8 +24,14 @@ import { PLUGIN_VERSION } from './version.js'
 
 /** Exact route used by the browser Settings page. */
 export const SETTINGS_ROUTE = '/_dsh/deepseek-harness-wecom-plus/settings'
+/** dsh 0.1.2-alpha.1 removed the `settingsNamespace` helper; inline its check. */
+const NAMESPACE_PATTERN = /^[a-z][a-z0-9]*(?:-[a-z0-9]+)*$/
+
 /** The settings namespace this plugin owns. */
-export const SETTINGS_NS: SettingsNamespace = settingsNamespace('deepseek-harness-wecom-plus')
+export const SETTINGS_NS: SettingsNamespace = 'deepseek-harness-wecom-plus' as SettingsNamespace
+if (!NAMESPACE_PATTERN.test(SETTINGS_NS)) {
+  throw new TypeError(`settings namespace "${SETTINGS_NS}" must match ${String(NAMESPACE_PATTERN)}`)
+}
 
 /** Channel connection facts the Settings page surfaces (no credentials, ever). */
 export interface WeComChannelStatus {

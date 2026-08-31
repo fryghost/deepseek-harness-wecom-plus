@@ -1,6 +1,5 @@
-import * as z from '@deepseek-ai/schemastery';
-import z__default from '@deepseek-ai/schemastery';
 import { Context } from '@deepseek-ai/cordis';
+import z from '@deepseek-ai/schemastery';
 import { BaseMessage, WSClientOptions, WsFrame, EventMessageWith, EnterChatEvent, TemplateCardEventData, WsFrameHeaders, ReplyMsgItem, TemplateCard, UploadMediaOptions, WeComMediaType } from '@wecom/aibot-node-sdk';
 import { ImageMediaType } from '@deepseek-ai/dsh-attachment';
 import { ContentBlock } from '@deepseek-ai/dsh-llm';
@@ -59,7 +58,7 @@ interface Config {
     systemPrompt: string;
 }
 /** Runtime-validated plugin configuration. */
-declare const Config: z__default<Config>;
+declare const Config: z<Config>;
 
 /** Minimal official-SDK media download surface used by inbound conversion. */
 interface WeComDownloadPort {
@@ -223,7 +222,7 @@ declare class SeenMessageIds {
  * to the browser; a pasted Secret goes one way — through `set-key` into the
  * DSH credentials seam, the same write path first-party pages use. Saving the
  * settings section restarts the channel live through the owning plugin's
- * installSettingsSection hook.
+ * settings wiring.
  * @module deepseek-harness-wecom-plus/settings-web
  */
 
@@ -300,6 +299,8 @@ declare class WeComWebBackend {
     handle(req: IncomingMessage, res: ServerResponse): Promise<void>;
 }
 
+/** WeCom AI Bot channel bundle for DeepSeek Harness. */
+
 declare const name = "deepseek-harness-wecom-plus";
 declare const inject: string[];
 
@@ -314,7 +315,7 @@ declare function apply(ctx: Context, config: Config): Promise<void>;
 declare const _default: {
     name: string;
     inject: string[];
-    Config: z.default<Config>;
+    Config: z<Config>;
     apply: typeof apply;
 };
 

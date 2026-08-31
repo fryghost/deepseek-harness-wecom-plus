@@ -233,7 +233,7 @@ export class WeComHarnessBridge {
       maxReconnectAttempts: this.config.maxReconnectAttempts,
       maxAuthFailureAttempts: this.config.maxAuthFailureAttempts,
       requestTimeout: this.config.sendTimeoutMs,
-      plug_version: 'deepseek-harness-wecom-plus/0.7.3',
+      plug_version: 'deepseek-harness-wecom-plus/0.8.0',
     })
   }
 

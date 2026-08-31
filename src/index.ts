@@ -1,10 +1,57 @@
 /** WeCom AI Bot channel bundle for DeepSeek Harness. */
 
 import type { Context } from '@deepseek-ai/cordis'
-import { installSettingsSection } from '@deepseek-ai/dsh-settings'
+import type z from '@deepseek-ai/schemastery'
+import type { SettingsNamespace } from '@deepseek-ai/dsh-settings'
 import { WeComHarnessBridge } from './bridge.js'
 import { Config, type Config as WeComConfig } from './config.js'
 import { installWeComSettingsWeb, SETTINGS_NS, WeComWebBackend } from './settings-web.js'
+
+// dsh 0.1.2-alpha.1 removed the installSettingsSection/settingsNamespace
+// helpers. The settings service itself never changed, so this inlines what
+// the wrapper did (ported from its pre-0.1.2-alpha.1 source): an inject,
+// a register, a watch, and an unload-aware fallback effect.
+const FIBER_DISPOSED = 4
+const FIBER_UNLOADING = 5
+
+function isUnloading(ctx: Context): boolean {
+  const state: number = (ctx as { fiber?: { state?: number } }).fiber?.state ?? 0
+  return state === FIBER_UNLOADING || state === FIBER_DISPOSED
+}
+
+interface SettingsSectionHooks<T> {
+  setSource: (source: () => T) => void
+  onChange: () => void
+  validate?: (value: T) => void
+}
+
+function installSettingsSection<T>(
+  ctx: Context,
+  ns: SettingsNamespace,
+  schema: z<T>,
+  entry: T,
+  hooks: SettingsSectionHooks<T>,
+): void {
+  ctx.inject(['settings'], (sctx) => {
+    const scope = sctx.settings.register(ns, schema, {
+      base: entry,
+      ...(hooks.validate === undefined ? {} : { validate: hooks.validate }),
+    })
+    hooks.setSource(() => scope.get())
+    sctx.effect(() => () => {
+      // settings provider detaching → fall back to composition entry and re-judge;
+      // consumer's own unload → fallback is pointless and onChange harmful.
+      if (isUnloading(ctx)) return
+      hooks.setSource(() => entry)
+      hooks.onChange()
+    })
+    hooks.onChange()
+    scope.watch(() => {
+      if (isUnloading(ctx)) return
+      hooks.onChange()
+    })
+  })
+}
 
 export const name = 'deepseek-harness-wecom-plus'
 export const inject = [

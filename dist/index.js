@@ -1,6 +1,3 @@
-// src/index.ts
-import { installSettingsSection } from "@deepseek-ai/dsh-settings";
-
 // src/bridge.ts
 import { createHash as createHash3 } from "crypto";
 import { readFile as readFile2 } from "fs/promises";
@@ -1858,7 +1855,7 @@ var WeComHarnessBridge = class {
       maxReconnectAttempts: this.config.maxReconnectAttempts,
       maxAuthFailureAttempts: this.config.maxAuthFailureAttempts,
       requestTimeout: this.config.sendTimeoutMs,
-      plug_version: "deepseek-harness-wecom-plus/0.7.3"
+      plug_version: "deepseek-harness-wecom-plus/0.8.0"
     });
   }
   async handleWelcome(frame) {
@@ -2601,16 +2598,19 @@ var Config = z.object({
 // src/settings-web.ts
 import { credentialRef as credentialRef2 } from "@deepseek-ai/dsh-credentials";
 import {
-  SettingsConflictError,
-  settingsNamespace
+  SettingsConflictError
 } from "@deepseek-ai/dsh-settings";
 
 // src/version.ts
-var PLUGIN_VERSION = "0.7.3";
+var PLUGIN_VERSION = "0.8.0";
 
 // src/settings-web.ts
 var SETTINGS_ROUTE = "/_dsh/deepseek-harness-wecom-plus/settings";
-var SETTINGS_NS = settingsNamespace("deepseek-harness-wecom-plus");
+var NAMESPACE_PATTERN = /^[a-z][a-z0-9]*(?:-[a-z0-9]+)*$/;
+var SETTINGS_NS = "deepseek-harness-wecom-plus";
+if (!NAMESPACE_PATTERN.test(SETTINGS_NS)) {
+  throw new TypeError(`settings namespace "${SETTINGS_NS}" must match ${String(NAMESPACE_PATTERN)}`);
+}
 var USER_SETTINGS_KEYS = ["botId", "cardMode", "singlePolicy", "groupPolicy", "welcomeText"];
 function isRecord(value) {
   return typeof value === "object" && value !== null && !Array.isArray(value);
@@ -2832,6 +2832,31 @@ function installWeComSettingsWeb(ctx, backend) {
 }
 
 // src/index.ts
+var FIBER_DISPOSED = 4;
+var FIBER_UNLOADING = 5;
+function isUnloading(ctx) {
+  const state = ctx.fiber?.state ?? 0;
+  return state === FIBER_UNLOADING || state === FIBER_DISPOSED;
+}
+function installSettingsSection(ctx, ns, schema, entry, hooks) {
+  ctx.inject(["settings"], (sctx) => {
+    const scope = sctx.settings.register(ns, schema, {
+      base: entry,
+      ...hooks.validate === void 0 ? {} : { validate: hooks.validate }
+    });
+    hooks.setSource(() => scope.get());
+    sctx.effect(() => () => {
+      if (isUnloading(ctx)) return;
+      hooks.setSource(() => entry);
+      hooks.onChange();
+    });
+    hooks.onChange();
+    scope.watch(() => {
+      if (isUnloading(ctx)) return;
+      hooks.onChange();
+    });
+  });
+}
 var name = "deepseek-harness-wecom-plus";
 var inject = [
   "agentDefaultModel",

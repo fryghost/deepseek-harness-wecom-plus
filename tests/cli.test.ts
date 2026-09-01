@@ -198,9 +198,10 @@ describe('WeComCliService', () => {
     setTimeout(() => child.stdout.emit('data', Buffer.from('https://login.work.weixin.qq.com/qr/XYZ')), 150)
     await expect(cli.beginAuth()).rejects.toThrow('qr failed')
     expect(child.killed).toBe(true)
-    // The mutex is released: a retry reaches the probe stage again.
-    // The retry finds no URL, so it runs out the full 10s wait window.
-    await expect(cli.beginAuth()).resolves.toMatchObject({ outcome: expect.any(String) })
+    // The mutex is released: the retry reaches the 10s no-url wait instead of
+    // returning 'in-progress' — the reused FakeChild never emits again, so it
+    // deterministically resolves with 'no-url'.
+    await expect(cli.beginAuth()).resolves.toMatchObject({ outcome: 'no-url' })
   }, 12_000)
 
   it('fails beginAuth when no URL appears', async () => {

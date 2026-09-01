@@ -273,6 +273,7 @@ function CliCard({ controller, initial }: { controller: WeComSettingsController;
       const result = await controller.cliAction('cli-install') as { outcome: string; output: string; probe: CliInfo }
       setInstallOutput(result.output)
       setCli(result.probe)
+      if (result.outcome === 'failed') setError('安装失败，请查看下方输出，或复制命令手动安装。')
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : String(cause))
     } finally {

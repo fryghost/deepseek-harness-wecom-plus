@@ -112,6 +112,14 @@ var WeComSettingsController = class {
       this.set({ ...this.state, action: void 0, error: error instanceof Error ? error.message : String(error) });
     }
   }
+  /** Run one CLI action against the backend; returns the action payload. */
+  async cliAction(action) {
+    return apiRequest({
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ action })
+    });
+  }
 };
 function Field({ label, hint, children }) {
   return /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("label", { className: "wc-field", children: [
@@ -157,6 +165,112 @@ function SettingsSection(props) {
     return /* @__PURE__ */ (0, import_jsx_runtime.jsx)("div", { className: "wc-settings", children: /* @__PURE__ */ (0, import_jsx_runtime.jsx)("div", { className: "wc-alert error", children: "\u5185\u90E8\u9519\u8BEF\uFF1A\u63A7\u5236\u5668\u672A\u6CE8\u5165\uFF08controller is undefined\uFF09\u3002\u8BF7\u6309 F12 \u6253\u5F00\u6D4F\u89C8\u5668\u63A7\u5236\u53F0\uFF0C\u628A\u7EA2\u8272\u62A5\u9519\u622A\u56FE\u6216\u590D\u5236\u7ED9\u6211\u3002" }) });
   }
   return /* @__PURE__ */ (0, import_jsx_runtime.jsx)(SectionErrorBoundary, { children: /* @__PURE__ */ (0, import_jsx_runtime.jsx)(LoadedSettings, { controller }) });
+}
+function CliCard({ controller, initial }) {
+  const [cli, setCli] = (0, import_react.useState)(initial);
+  const [busy, setBusy] = (0, import_react.useState)(void 0);
+  const [installOutput, setInstallOutput] = (0, import_react.useState)("");
+  const [error, setError] = (0, import_react.useState)(void 0);
+  const [qr, setQr] = (0, import_react.useState)(void 0);
+  const probe = async () => {
+    setBusy("probe");
+    setError(void 0);
+    try {
+      setCli(await controller.cliAction("cli-probe"));
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : String(cause));
+    } finally {
+      setBusy(void 0);
+    }
+  };
+  const install = async () => {
+    setBusy("install");
+    setError(void 0);
+    setInstallOutput("");
+    try {
+      const result = await controller.cliAction("cli-install");
+      setInstallOutput(result.output);
+      setCli(result.probe);
+      if (result.outcome === "failed") setError("\u5B89\u88C5\u5931\u8D25\uFF0C\u8BF7\u67E5\u770B\u4E0B\u65B9\u8F93\u51FA\uFF0C\u6216\u590D\u5236\u547D\u4EE4\u624B\u52A8\u5B89\u88C5\u3002");
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : String(cause));
+    } finally {
+      setBusy(void 0);
+    }
+  };
+  const authorize = async () => {
+    setBusy("auth");
+    setError(void 0);
+    try {
+      const result = await controller.cliAction("cli-authorize");
+      if (result.outcome === "started" && result.qrDataUrl !== void 0) setQr(result.qrDataUrl);
+      else setError(result.outcome === "in-progress" ? "\u5DF2\u6709\u6388\u6743\u6D41\u7A0B\u5728\u8FDB\u884C\u4E2D\u3002" : "\u672A\u80FD\u53D6\u5F97\u6388\u6743\u94FE\u63A5\uFF0C\u8BF7\u91CD\u8BD5\u3002");
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : String(cause));
+    } finally {
+      setBusy(void 0);
+    }
+  };
+  const cancelAuth = async () => {
+    setQr(void 0);
+    try {
+      await controller.cliAction("cli-cancel-auth");
+    } catch {
+    }
+  };
+  (0, import_react.useEffect)(() => {
+    if (qr === void 0) return;
+    const timer = setInterval(async () => {
+      try {
+        const status = await controller.cliAction("cli-auth-status");
+        if (status.auth === "authorized") {
+          setQr(void 0);
+          setCli((current) => current === void 0 ? current : { ...current, auth: "authorized" });
+        } else if (!status.waiting) {
+          setQr(void 0);
+        }
+      } catch {
+      }
+    }, 2e3);
+    return () => {
+      clearInterval(timer);
+    };
+  }, [qr, controller]);
+  const dotClass = cli === void 0 ? "" : !cli.installed || !cli.meetsMin || cli.auth !== "authorized" ? "warn" : "ok";
+  const statusText = cli === void 0 ? "\u672A\u68C0\u6D4B" : !cli.installed ? "\u672A\u5B89\u88C5" : !cli.meetsMin ? `\u7248\u672C\u8FC7\u4F4E \xB7 v${cli.version}\uFF08\u9700 \u22651.1.0\uFF09` : cli.auth === "authorized" ? `\u5DF2\u6388\u6743 \xB7 v${cli.version}` : `\u5DF2\u5B89\u88C5 \xB7 v${cli.version} \xB7 \u5F85\u6388\u6743`;
+  return /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("section", { className: "wc-panel", children: [
+    /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", { className: "wc-panel-title", children: [
+      /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", { children: [
+        /* @__PURE__ */ (0, import_jsx_runtime.jsx)("h3", { children: "CLI \u96C6\u6210" }),
+        /* @__PURE__ */ (0, import_jsx_runtime.jsx)("p", { children: "\u68C0\u6D4B\u4F01\u4E1A\u5FAE\u4FE1\u5B98\u65B9\u547D\u4EE4\u884C\u5DE5\u5177\uFF08wecom-cli\uFF09\u7684\u5B89\u88C5\u4E0E\u6388\u6743\u72B6\u6001\u3002\u5B89\u88C5\u5E76\u6388\u6743\u540E\uFF0C\u540E\u7EED\u7248\u672C\u7684\u63D2\u4EF6\u53EF\u8BA9 AI \u76F4\u63A5\u64CD\u4F5C\u4F01\u5FAE\u7684\u6587\u6863\u3001\u65E5\u7A0B\u3001\u5F85\u529E\u7B49\u3002" })
+      ] }),
+      /* @__PURE__ */ (0, import_jsx_runtime.jsx)("button", { type: "button", className: "wc-button", disabled: busy !== void 0, onClick: () => {
+        void probe();
+      }, children: busy === "probe" ? "\u68C0\u6D4B\u4E2D\u2026" : "\u91CD\u65B0\u68C0\u6D4B" })
+    ] }),
+    /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", { className: "wc-cli-status", children: [
+      /* @__PURE__ */ (0, import_jsx_runtime.jsx)("span", { className: `wc-cli-dot ${dotClass}` }),
+      /* @__PURE__ */ (0, import_jsx_runtime.jsx)("strong", { children: statusText })
+    ] }),
+    error === void 0 ? null : /* @__PURE__ */ (0, import_jsx_runtime.jsx)("div", { className: "wc-alert error", children: error }),
+    cli !== void 0 && (!cli.installed || !cli.meetsMin) ? /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", { className: "wc-cli-actions", children: [
+      /* @__PURE__ */ (0, import_jsx_runtime.jsx)("button", { type: "button", className: "wc-button primary", disabled: busy !== void 0, onClick: () => {
+        void install();
+      }, children: busy === "install" ? "\u5B89\u88C5\u4E2D\u2026" : "\u4E00\u952E\u5B89\u88C5 / \u5347\u7EA7" }),
+      /* @__PURE__ */ (0, import_jsx_runtime.jsx)("code", { children: "npm install -g @wecom/cli" })
+    ] }) : null,
+    installOutput === "" ? null : /* @__PURE__ */ (0, import_jsx_runtime.jsx)("pre", { className: "wc-cli-output", children: installOutput }),
+    cli !== void 0 && cli.installed && cli.meetsMin && cli.auth !== "authorized" ? /* @__PURE__ */ (0, import_jsx_runtime.jsx)("div", { className: "wc-cli-actions", children: qr === void 0 ? /* @__PURE__ */ (0, import_jsx_runtime.jsx)("button", { type: "button", className: "wc-button primary", disabled: busy !== void 0, onClick: () => {
+      void authorize();
+    }, children: busy === "auth" ? "\u51C6\u5907\u4E2D\u2026" : "\u53D1\u8D77\u6388\u6743" }) : /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", { className: "wc-cli-qr", children: [
+      /* @__PURE__ */ (0, import_jsx_runtime.jsx)("img", { src: qr, alt: "wecom-cli \u6388\u6743\u4E8C\u7EF4\u7801", width: 160, height: 160 }),
+      /* @__PURE__ */ (0, import_jsx_runtime.jsx)("small", { children: "\u7528\u624B\u673A\u4F01\u4E1A\u5FAE\u4FE1\u626B\u7801\u5B8C\u6210\u6388\u6743\u3002CLI \u5C06\u4EE5\u6388\u6743\u771F\u4EBA\u8EAB\u4EFD\u64CD\u4F5C\u4F01\u4E1A\u5FAE\u4FE1\u3002" }),
+      /* @__PURE__ */ (0, import_jsx_runtime.jsx)("button", { type: "button", className: "wc-button", onClick: () => {
+        void cancelAuth();
+      }, children: "\u53D6\u6D88" })
+    ] }) }) : null,
+    cli !== void 0 && cli.installed && cli.meetsMin && cli.auth === "authorized" ? /* @__PURE__ */ (0, import_jsx_runtime.jsx)("small", { className: "wc-cli-note", children: "\u5DF2\u5C31\u7EEA\u3002\u6A21\u578B\u64CD\u4F5C\u80FD\u529B\u5373\u5C06\u4E0A\u7EBF\uFF0C\u5C4A\u65F6\u65E0\u9700\u518D\u6B21\u6388\u6743\u3002" }) : null
+  ] });
 }
 function LoadedSettings({ controller }) {
   const state = (0, import_react.useSyncExternalStore)(controller.subscribe, controller.snapshot, controller.snapshot);
@@ -276,6 +390,7 @@ function LoadedSettings({ controller }) {
         } }) })
       ] })
     ] }),
+    /* @__PURE__ */ (0, import_jsx_runtime.jsx)(CliCard, { controller, initial: snapshot.cli }),
     /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", { className: "wc-save-row", children: [
       /* @__PURE__ */ (0, import_jsx_runtime.jsx)("button", { type: "button", className: "wc-button primary", disabled: !snapshot.writable || busy, onClick: () => {
         void controller.save(draft, snapshot.settings.revision);
@@ -284,8 +399,8 @@ function LoadedSettings({ controller }) {
         void controller.load();
       }, children: "\u91CD\u65B0\u52A0\u8F7D" })
     ] }),
-    /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("section", { className: "wc-panel", children: [
-      /* @__PURE__ */ (0, import_jsx_runtime.jsx)("div", { className: "wc-panel-title", children: /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", { children: [
+    /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("details", { className: "wc-details", children: [
+      /* @__PURE__ */ (0, import_jsx_runtime.jsx)("summary", { children: /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", { children: [
         /* @__PURE__ */ (0, import_jsx_runtime.jsx)("h3", { children: "\u4F01\u5FAE\u5185\u81EA\u68C0" }),
         /* @__PURE__ */ (0, import_jsx_runtime.jsx)("p", { children: "\u8FDE\u63A5\u6210\u529F\u540E\uFF0C\u5728\u4F01\u5FAE\u4E2D\u5411\u673A\u5668\u4EBA\u53D1\u9001\u4EE5\u4E0B\u547D\u4EE4\u5373\u53EF\u9A8C\u8BC1\u6574\u6761\u94FE\u8DEF\u3002" })
       ] }) }),
@@ -307,6 +422,10 @@ function LoadedSettings({ controller }) {
           " \u2014 \u6587\u4EF6\u53D1\u9001\u68C0\u67E5"
         ] }),
         /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("li", { children: [
+          /* @__PURE__ */ (0, import_jsx_runtime.jsx)("code", { children: "/bot-cli" }),
+          " \u2014 wecom-cli \u72B6\u6001\u68C0\u67E5\u4E0E\u5F15\u5BFC"
+        ] }),
+        /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("li", { children: [
           /* @__PURE__ */ (0, import_jsx_runtime.jsx)("code", { children: "/help" }),
           " \u2014 \u67E5\u770B\u5168\u90E8\u547D\u4EE4"
         ] })
@@ -315,7 +434,7 @@ function LoadedSettings({ controller }) {
   ] });
 }
 var CSS = `
-.wc-settings{display:grid;gap:14px;max-width:900px;padding:8px 2px 32px;color:var(--dsw-alias-fg-primary,#26231f)}
+.wc-settings{display:grid;gap:14px;max-width:900px;padding:8px 2px 32px;color:var(--dsw-alias-fg-primary,#26231f);contain:content}
 .wc-settings-header{display:flex;justify-content:space-between;gap:20px;align-items:flex-start;padding:8px 2px}
 .wc-settings-header h2{font-size:25px;letter-spacing:-.025em;margin:3px 0 6px}
 .wc-settings-header p{max-width:620px;margin:0;color:var(--dsw-alias-fg-muted,#77736d);font-size:13px;line-height:1.55}
@@ -348,6 +467,23 @@ var CSS = `
 .wc-checklist{display:grid;gap:6px;margin:0;padding:0;list-style:none;font-size:12px;color:var(--dsw-alias-fg-muted,#77736d)}
 .wc-checklist code{background:var(--dsw-alias-bg-layer-2,#f7f5f1);padding:1px 6px;border-radius:6px;font-size:11px}
 @media(max-width:720px){.wc-settings-header{display:grid}.wc-release{width:auto}.wc-form-grid{grid-template-columns:1fr}.wc-panel-title{flex-direction:column}}
+.wc-details{display:grid;gap:10px;padding:13px 15px;border:1px solid var(--dsw-alias-border-subtle,#dedbd5);border-radius:14px;background:var(--dsw-alias-bg-layer-1,#fff);content-visibility:auto;contain-intrinsic-size:auto 120px}
+.wc-details summary{cursor:pointer;list-style:none;display:flex;justify-content:space-between;align-items:flex-start;gap:12px}
+.wc-details summary::-webkit-details-marker{display:none}
+.wc-details summary h3{font-size:14px;margin:0}
+.wc-details summary p{font-size:11px;line-height:1.45;color:var(--dsw-alias-fg-muted,#77736d);margin:4px 0 0;max-width:620px}
+.wc-details[open] summary{margin-bottom:4px}
+.wc-cli-status{display:flex;align-items:center;gap:9px;font-size:13px}
+.wc-cli-dot{width:9px;height:9px;border-radius:999px;background:#b9b5ae;flex:none}
+.wc-cli-dot.ok{background:#309a64}
+.wc-cli-dot.warn{background:#e0a237}
+.wc-cli-actions{display:flex;gap:10px;align-items:center;flex-wrap:wrap}
+.wc-cli-actions code{background:var(--dsw-alias-bg-layer-2,#f7f5f1);padding:3px 8px;border-radius:7px;font-size:11px}
+.wc-cli-qr{display:grid;gap:8px;justify-items:start}
+.wc-cli-qr img{border:1px solid var(--dsw-alias-border-subtle,#dedbd5);border-radius:10px;background:#fff}
+.wc-cli-qr small{font-size:11px;color:var(--dsw-alias-fg-muted,#77736d);line-height:1.45;max-width:340px}
+.wc-cli-note{font-size:11px;color:var(--dsw-alias-fg-muted,#77736d)}
+.wc-cli-output{margin:0;font-family:ui-monospace,monospace;font-size:11px;line-height:1.5;background:var(--dsw-alias-bg-layer-2,#f7f5f1);border-radius:9px;padding:9px 11px;white-space:pre-wrap;max-height:130px;overflow:auto}
 `;
 function installStyles() {
   const id = "deepseek-harness-wecom-plus/client";

@@ -1,6 +1,6 @@
 {
   "name": "deepseek-harness-wecom-plus",
-  "version": "0.8.4",
+  "version": "0.9.0",
   "description": "WeCom AI Bot channel bridge for DeepSeek Harness with template card support (text, image, file, Markdown + card pairing, button interactions, Web settings page)",
   "type": "module",
   "main": "dist/index.js",

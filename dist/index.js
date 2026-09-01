@@ -1,3 +1,169 @@
+// src/cli.ts
+import { spawn } from "child_process";
+var MIN_CLI_VERSION = "1.1.0";
+var defaultSpawn = (command, args) => spawn(command, args, {
+  // Windows ships npm/wecom as .cmd shims, which require a shell.
+  shell: process.platform === "win32",
+  windowsHide: true
+});
+var defaultQr = async (text) => {
+  const { default: QRCode } = await import("qrcode");
+  return QRCode.toDataURL(text, { margin: 1, width: 240 });
+};
+function compareVersions(a, b) {
+  const pa = a.split(".").map((part) => Number.parseInt(part, 10));
+  const pb = b.split(".").map((part) => Number.parseInt(part, 10));
+  for (let i = 0; i < 3; i++) {
+    const diff = (pa[i] ?? 0) - (pb[i] ?? 0);
+    if (diff !== 0) return diff;
+  }
+  return 0;
+}
+var AUTH_URL_PATTERN = /https?:\/\/\S+/u;
+var VERSION_PATTERN = /(\d+\.\d+\.\d+(?:[-+][\w.]+)?)/u;
+var WeComCliService = class {
+  constructor(spawnFn = defaultSpawn, qrFn) {
+    this.spawnFn = spawnFn;
+    this.qrFn = qrFn ?? defaultQr;
+  }
+  spawnFn;
+  authProcess;
+  /** Synchronous mutex covering the async probe window inside beginAuth. */
+  authBusy = false;
+  qrFn;
+  /** Kill any pending authorization process; safe to call at any time. */
+  dispose() {
+    this.cancelAuth();
+  }
+  /**
+   * One process run with a hard timeout. A spawn failure (binary missing)
+   * resolves with code null and empty output instead of rejecting.
+   */
+  run(command, args, timeoutMs) {
+    return new Promise((resolve2) => {
+      let child;
+      try {
+        child = this.spawnFn(command, args);
+      } catch {
+        resolve2({ code: null, stdout: "", stderr: "", timedOut: false });
+        return;
+      }
+      let stdout = "";
+      let stderr = "";
+      let timedOut = false;
+      let settled = false;
+      let killTimer;
+      const timer = setTimeout(() => {
+        timedOut = true;
+        child.kill();
+        killTimer = setTimeout(() => finish(null), 1e3);
+      }, timeoutMs);
+      const finish = (code) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        if (killTimer !== void 0) clearTimeout(killTimer);
+        resolve2({ code, stdout, stderr, timedOut });
+      };
+      child.stdout?.on("data", (chunk) => {
+        stdout += String(chunk);
+      });
+      child.stderr?.on("data", (chunk) => {
+        stderr += String(chunk);
+      });
+      child.on("error", () => finish(null));
+      child.on("close", (code) => finish(code));
+    });
+  }
+  async probe() {
+    const versionRun = await this.run("wecom-cli", ["--version"], 3e3);
+    if (versionRun.timedOut || versionRun.code === null && versionRun.stdout.length === 0) {
+      return { installed: false, meetsMin: false, auth: "unknown" };
+    }
+    const version = versionRun.stdout.match(VERSION_PATTERN)?.[1];
+    if (version === void 0) {
+      return { installed: false, meetsMin: false, auth: "unknown" };
+    }
+    const authRun = await this.run("wecom-cli", ["auth", "show", "--status"], 3e3);
+    const output = `${authRun.stdout}
+${authRun.stderr}`;
+    const auth = output.includes("unauthorized") ? "unauthorized" : output.includes("authorized") ? "authorized" : "unknown";
+    return {
+      installed: true,
+      version,
+      meetsMin: compareVersions(version, MIN_CLI_VERSION) >= 0,
+      auth
+    };
+  }
+  async install() {
+    const before = await this.probe();
+    if (before.installed && before.meetsMin) {
+      return { outcome: "already-installed", output: "", probe: before };
+    }
+    const run = await this.run("npm", ["install", "-g", "@wecom/cli"], 18e4);
+    const output = `${run.stdout}
+${run.stderr}`.trim().split(/\r?\n/).slice(-8).join("\n");
+    const after = await this.probe();
+    if (run.timedOut || run.code !== 0 || !after.installed || !after.meetsMin) {
+      return { outcome: "failed", output, probe: after };
+    }
+    return { outcome: "installed", output, probe: after };
+  }
+  /**
+   * Spawn `auth init --noninteractive`, capture the authorization URL from
+   * stdout, and render it into a QR data URL. The URL never leaves memory
+   * and is never logged. Only one authorization may run at a time.
+   */
+  async beginAuth() {
+    if (this.authBusy || this.authProcess !== void 0) return { outcome: "in-progress" };
+    this.authBusy = true;
+    try {
+      const check = await this.probe();
+      if (!check.installed) return { outcome: "cli-missing" };
+      const child = this.spawnFn("wecom-cli", ["auth", "init", "--noninteractive"]);
+      this.authProcess = child;
+      let url;
+      let seen = "";
+      child.stdout?.on("data", (chunk) => {
+        if (url !== void 0) return;
+        seen += String(chunk);
+        url = seen.match(AUTH_URL_PATTERN)?.[0];
+      });
+      const clear = () => {
+        if (this.authProcess === child) this.authProcess = void 0;
+      };
+      child.once("error", clear);
+      child.once("close", clear);
+      const startedAt = Date.now();
+      while (url === void 0 && this.authProcess === child && Date.now() - startedAt < 1e4) {
+        await new Promise((resolve2) => setTimeout(resolve2, 100));
+      }
+      if (url === void 0 || this.authProcess !== child) {
+        this.cancelAuth();
+        return { outcome: "no-url" };
+      }
+      try {
+        const qrDataUrl = await this.qrFn(url);
+        return { outcome: "started", authUrl: url, qrDataUrl };
+      } catch (error) {
+        this.cancelAuth();
+        throw error;
+      }
+    } finally {
+      this.authBusy = false;
+    }
+  }
+  cancelAuth() {
+    const child = this.authProcess;
+    this.authProcess = void 0;
+    child?.kill();
+  }
+  async authStatus() {
+    const probe = await this.probe();
+    return { auth: probe.auth, waiting: this.authProcess !== void 0 };
+  }
+};
+
 // src/bridge.ts
 import { createHash as createHash3 } from "crypto";
 import { readFile as readFile2 } from "fs/promises";
@@ -1788,6 +1954,9 @@ function requireUserQuestions(service) {
   return service;
 }
 
+// src/version.ts
+var PLUGIN_VERSION = "0.9.0";
+
 // src/bridge.ts
 var OUTBOUND_TEST_PNG = Buffer.from(
   "iVBORw0KGgoAAAANSUhEUgAAAMgAAABkCAYAAADDhn8LAAAACXBIWXMAAAPoAAAD6AG1e1JrAAACn0lEQVR4nO3XsZFCQRDEUDIhxA28g1gS4JwrCmQ8QwmoR/vh8Ty74MAN7K2DBzHicAP704FABCKQIxBH4CG4/3HgC+JwPB5HII7AQ3B9QRyBh+B81oGfWKIS1RGII/AQXF8QR+AhOH5iOQIPwf2WA/9BHJsH5wjEEXgIri+II/AQHD+xHIGH4PoP4gg8BOf3DvxJD4yAZR0IJDAClnUgkMAIWNaBQAIjYFkHAgmMgGUdCCQwApZ1IJDACFjWgUACI2BZBwIJjIBlHQgkMAKWdSCQwAhY1oFAAiNgWQcCCYyAZR0IJDAClnUgkMAIWNaBQAIjYFkHAgmMgGUdCCQwApZ1IJDACFjWgUACI2BZBwIJjIBlHQgkMAKWdSCQwAhY1oFAAiNgWQcCCYyAZR0IJDAClnUgkMAIWNaBQAIjYFkHAgmMgGUdCCQwApZ1IJDACFjWgUACI2BZBwIJjIBlHQgkMAKWdSCQwAhY1oFAAiNgWQcCCYyAZR0IJDAClnUgkMAIWNaBQAIjYFkHAgmMgGUdCCQwApZ1IJDACFjWgUACI2BZBwIJjIBlHQgkMAKWdSCQwAhY1oFAAiNgWQcCCYyAZR0IJDAClnUgkMAIWNaBQAIjYFkHAgmMgGUdCCQwAroOBBIYAcs6EEhgBCzrQCCBEbCsA4EERsCyDgQSGAHLOhBIYAQs60AggRGwrAOBBEbAsg4EEhgByzoQSGAELOtAIIERsKwDgQRGwLIOBBIYAcs6EEhgBCzrQCCBEbCsA4EERsCyDgQSGAHLOhBIYAQs6+AFcF3qQZOWm4IAAAAASUVORK5CYII=",
@@ -1795,10 +1964,11 @@ var OUTBOUND_TEST_PNG = Buffer.from(
 );
 var OUTBOUND_TEST_FILE = Buffer.from("DeepSeek Harness WeCom file upload test\n", "utf8");
 var WeComHarnessBridge = class {
-  constructor(ctx, config, clientFactory = (options) => new WSClient(options)) {
+  constructor(ctx, config, clientFactory = (options) => new WSClient(options), cli) {
     this.ctx = ctx;
     this.config = config;
     this.clientFactory = clientFactory;
+    this.cli = cli;
     if (!isAbsolute3(config.cwd)) throw new Error(`wecom-channel: cwd must be absolute, got ${JSON.stringify(config.cwd)}`);
     if (!isAbsolute3(config.inboundFileDirectory)) {
       throw new Error(
@@ -1819,6 +1989,7 @@ var WeComHarnessBridge = class {
   ctx;
   config;
   clientFactory;
+  cli;
   log;
   conversations;
   seen;
@@ -1923,7 +2094,7 @@ var WeComHarnessBridge = class {
       maxReconnectAttempts: this.config.maxReconnectAttempts,
       maxAuthFailureAttempts: this.config.maxAuthFailureAttempts,
       requestTimeout: this.config.sendTimeoutMs,
-      plug_version: "deepseek-harness-wecom-plus/0.8.0"
+      plug_version: `deepseek-harness-wecom-plus/${PLUGIN_VERSION}`
     });
   }
   async handleWelcome(frame) {
@@ -2132,6 +2303,10 @@ var WeComHarnessBridge = class {
         });
         return;
       }
+      if (command?.name === "bot-cli") {
+        await this.sendReply(frame, { text: await this.cliStatusText(), images: [], cards: [] });
+        return;
+      }
       if (this.conversations.tryAnswerFromText(message)) {
         try {
           await this.sendProactive(chatTarget(message), {
@@ -2201,10 +2376,39 @@ var WeComHarnessBridge = class {
       "/bot-card-test \u2014 \u53D1\u9001\u4E00\u5F20\u6309\u94AE\u4EA4\u4E92\u6A21\u677F\u5361\u7247\uFF0C\u68C0\u67E5\u5361\u7247\u4E0E\u6309\u94AE\u70B9\u51FB\u94FE\u8DEF",
       "/bot-file-test \u2014 \u53D1\u9001\u4E00\u4E2A\u6587\u672C\u9644\u4EF6\uFF0C\u68C0\u67E5\u6587\u4EF6\u51FA\u7AD9\u94FE\u8DEF",
       "/bot-status \u2014 \u67E5\u770B\u5F53\u524D\u4F1A\u8BDD\u72B6\u6001",
+      "/bot-cli \u2014 wecom-cli \u72B6\u6001\u68C0\u67E5\u4E0E\u5B89\u88C5/\u6388\u6743\u5F15\u5BFC",
       "/bot-cancel \u2014 \u53D6\u6D88\u5F53\u524D\u751F\u6210",
       `\u5DF2\u5F00\u653E\u7684 Harness \u547D\u4EE4\uFF1A${harnessCommands}\uFF08\u4EC5\u5728\u5F53\u524D preset \u6CE8\u518C\u540E\u53EF\u7528\uFF09`,
       "\u5176\u4ED6\u659C\u6760\u547D\u4EE4\u4F1A\u88AB\u63D2\u4EF6\u62D2\u7EDD\uFF0C\u4E0D\u4F1A\u9001\u7ED9\u6A21\u578B\uFF1B\u666E\u901A\u6D88\u606F\u4F1A\u4EA4\u7ED9\u5F53\u524D Harness \u9ED8\u8BA4\u6A21\u578B\u5904\u7406\u3002"
     ].join("\n");
+  }
+  /** Human guidance for the three CLI states; probing errors stay soft. */
+  async cliStatusText() {
+    if (this.cli === void 0) return "CLI \u96C6\u6210\u672A\u5728\u672C\u901A\u9053\u542F\u7528\u3002";
+    let probe;
+    try {
+      probe = await this.cli.probe();
+    } catch (error) {
+      this.log.warn("WeCom cli probe failed: %s", String(error));
+      return "CLI \u72B6\u6001\u68C0\u67E5\u5931\u8D25\uFF0C\u8BF7\u7A0D\u540E\u91CD\u8BD5\uFF08/bot-cli\uFF09\u3002";
+    }
+    if (!probe.installed) {
+      return [
+        "\u4F01\u4E1A\u5FAE\u4FE1\u5B98\u65B9\u547D\u4EE4\u884C\u5DE5\u5177\uFF08wecom-cli\uFF09\u5C1A\u672A\u5B89\u88C5\u3002\u5B89\u88C5\u540E\uFF0C\u540E\u7EED\u7248\u672C\u7684\u63D2\u4EF6\u53EF\u4EE5\u8BA9 AI \u76F4\u63A5\u64CD\u4F5C\u4F01\u5FAE\u7684\u6587\u6863\u3001\u65E5\u7A0B\u3001\u5F85\u529E\u7B49\u3002",
+        "\u5B89\u88C5\u547D\u4EE4\uFF1Anpm install -g @wecom/cli",
+        "\u6216\u5728 DSH \u8BBE\u7F6E\u9875 \u2192 \u4F01\u5FAE\u63D2\u4EF6 \u2192 CLI \u96C6\u6210 \u4E2D\u4E00\u952E\u5B89\u88C5\u3002"
+      ].join("\n");
+    }
+    if (!probe.meetsMin) {
+      return `wecom-cli \u7248\u672C ${probe.version} \u4F4E\u4E8E\u8981\u6C42\u7684 1.1.0\u3002\u8BF7\u5347\u7EA7\uFF1Anpm install -g @wecom/cli`;
+    }
+    if (probe.auth !== "authorized") {
+      return [
+        `wecom-cli ${probe.version} \u5DF2\u5B89\u88C5\uFF0C\u4F46\u8FD8\u672A\u6388\u6743\u3002`,
+        "\u8BF7\u5728 DSH \u8BBE\u7F6E\u9875 \u2192 \u4F01\u5FAE\u63D2\u4EF6 \u2192 CLI \u96C6\u6210 \u4E2D\u626B\u7801\u6388\u6743\uFF08\u6388\u6743\u94FE\u63A5\u4E0D\u5728\u804A\u5929\u4E2D\u53D1\u9001\uFF0C\u907F\u514D\u88AB\u8F6C\u53D1\u6269\u6563\uFF09\u3002"
+      ].join("\n");
+    }
+    return `wecom-cli ${probe.version} \u5DF2\u5C31\u7EEA\uFF08\u6A21\u578B\u64CD\u4F5C\u80FD\u529B\u5373\u5C06\u4E0A\u7EBF\uFF09\u3002`;
   }
   commandReply(name2, outcome) {
     if (outcome.execution === void 0) {
@@ -2724,17 +2928,13 @@ import { credentialRef as credentialRef2 } from "@deepseek-ai/dsh-credentials";
 import {
   SettingsConflictError
 } from "@deepseek-ai/dsh-settings";
-
-// src/version.ts
-var PLUGIN_VERSION = "0.8.4";
-
-// src/settings-web.ts
 var SETTINGS_ROUTE = "/_dsh/deepseek-harness-wecom-plus/settings";
 var NAMESPACE_PATTERN = /^[a-z][a-z0-9]*(?:-[a-z0-9]+)*$/;
 var SETTINGS_NS = "deepseek-harness-wecom-plus";
 if (!NAMESPACE_PATTERN.test(SETTINGS_NS)) {
   throw new TypeError(`settings namespace "${SETTINGS_NS}" must match ${String(NAMESPACE_PATTERN)}`);
 }
+var CLI_ACTIONS = ["cli-probe", "cli-install", "cli-authorize", "cli-auth-status", "cli-cancel-auth"];
 var USER_SETTINGS_KEYS = ["botId", "cardMode", "singlePolicy", "groupPolicy", "welcomeText"];
 function isRecord(value) {
   return typeof value === "object" && value !== null && !Array.isArray(value);
@@ -2829,6 +3029,9 @@ function parseRequest(value) {
     }
     return { action: "set-key", value: value.value.trim() };
   }
+  if (typeof value.action === "string" && CLI_ACTIONS.includes(value.action)) {
+    return { action: value.action };
+  }
   if (value.action === "clear-key") return { action: "clear-key" };
   throw new TypeError(`unsupported action: ${String(value.action)}`);
 }
@@ -2837,12 +3040,15 @@ function publicMessage(error) {
   return String(error);
 }
 var WeComWebBackend = class {
-  constructor(ctx, status) {
+  constructor(ctx, status, cli) {
     this.ctx = ctx;
     this.status = status;
+    this.cli = cli;
   }
   ctx;
   status;
+  cli;
+  cliProbeCache;
   async credential(config) {
     const info = await this.ctx.credentials.describe(credentialRef2(config.secretRef));
     return {
@@ -2871,8 +3077,34 @@ var WeComWebBackend = class {
         writable: credential.writable
       },
       channel: this.status(),
+      ...this.cli === void 0 ? {} : { cli: await this.cliSnapshot() },
       release: { pluginVersion: PLUGIN_VERSION }
     };
+  }
+  /** Probe with a tiny cache: GET snapshots may arrive in bursts. */
+  async cliSnapshot() {
+    const cached = this.cliProbeCache;
+    if (cached !== void 0 && Date.now() - cached.at < 3e3) return cached.value;
+    const value = await this.cli.probe();
+    this.cliProbeCache = { at: Date.now(), value };
+    return value;
+  }
+  async handleCli(action) {
+    const cli = this.cli;
+    this.cliProbeCache = void 0;
+    switch (action) {
+      case "cli-probe":
+        return cli.probe();
+      case "cli-install":
+        return cli.install();
+      case "cli-authorize":
+        return cli.beginAuth();
+      case "cli-auth-status":
+        return cli.authStatus();
+      case "cli-cancel-auth":
+        cli.cancelAuth();
+        return { cancelled: true };
+    }
   }
   /** Merge the UI-editable subset into the namespace's user layer. */
   async save(request) {
@@ -2924,7 +3156,13 @@ var WeComWebBackend = class {
       return;
     }
     try {
-      if (parsed.action === "set-key") {
+      if (CLI_ACTIONS.includes(parsed.action)) {
+        if (this.cli === void 0) {
+          requestError(res, 503, "cli-unavailable", "The CLI integration is not wired into this channel");
+          return;
+        }
+        responseJson(res, 200, { ok: true, value: await this.handleCli(parsed.action) });
+      } else if (parsed.action === "set-key") {
         responseJson(res, 200, { ok: true, value: await this.setKey(parsed.value) });
       } else if (parsed.action === "clear-key") {
         responseJson(res, 200, { ok: true, value: await this.clearKey() });
@@ -2995,16 +3233,19 @@ var inject = [
 ];
 async function apply(ctx, config) {
   const log = ctx.logger(name);
+  const cli = new WeComCliService();
   let current = () => config;
   let bridge;
   let restarting;
   let lastResolved;
+  let disposed = false;
   const stopBridge = async () => {
     const previous = bridge;
     bridge = void 0;
     if (previous !== void 0) await previous.stop();
   };
   const restartBridge = async () => {
+    if (disposed) return;
     let resolved;
     try {
       resolved = Config(current());
@@ -3016,7 +3257,7 @@ async function apply(ctx, config) {
     if (bridge !== void 0 && fingerprint === lastResolved) return;
     await stopBridge();
     lastResolved = fingerprint;
-    const next = new WeComHarnessBridge(ctx, resolved);
+    const next = new WeComHarnessBridge(ctx, resolved, void 0, cli);
     bridge = next;
     try {
       await next.start();
@@ -3028,7 +3269,7 @@ async function apply(ctx, config) {
     restarting = (restarting ?? Promise.resolve()).then(restartBridge, restartBridge);
     restarting.catch(() => void 0);
   };
-  installWeComSettingsWeb(ctx, new WeComWebBackend(ctx, () => bridge?.status() ?? { state: "inactive" }));
+  installWeComSettingsWeb(ctx, new WeComWebBackend(ctx, () => bridge?.status() ?? { state: "inactive" }, cli));
   installSettingsSection(ctx, SETTINGS_NS, Config, Config(config), {
     setSource: (source) => {
       current = source;
@@ -3042,7 +3283,9 @@ async function apply(ctx, config) {
   });
   await ctx.effect(async function* () {
     yield async () => {
+      disposed = true;
       await stopBridge();
+      cli.dispose();
       if (restarting !== void 0) await restarting;
     };
   }, "deepseek-harness-wecom-plus.websocket");

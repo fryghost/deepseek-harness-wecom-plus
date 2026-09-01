@@ -1,10 +1,74 @@
 import { Context } from '@deepseek-ai/cordis';
 import z from '@deepseek-ai/schemastery';
 import { BaseMessage, WSClientOptions, WsFrame, EventMessageWith, EnterChatEvent, TemplateCardEventData, WsFrameHeaders, ReplyMsgItem, TemplateCard, UploadMediaOptions, WeComMediaType } from '@wecom/aibot-node-sdk';
+import { EventEmitter } from 'node:events';
 import { ImageMediaType } from '@deepseek-ai/dsh-attachment';
 import { ContentBlock } from '@deepseek-ai/dsh-llm';
 import { IncomingMessage, ServerResponse } from 'node:http';
 import { SettingsNamespace } from '@deepseek-ai/dsh-settings';
+
+/**
+ * WeComCliService: the only module allowed to spawn wecom-cli processes.
+ * Probe/install/authorize live here so both the Settings backend and the
+ * /bot-cli command share one set of timeouts and one auth-process singleton.
+ * The spawn function and the QR renderer are injectable for tests.
+ * @module deepseek-harness-wecom-plus/cli
+ */
+
+interface CliProbeResult {
+    installed: boolean;
+    version?: string;
+    meetsMin: boolean;
+    auth: 'authorized' | 'unauthorized' | 'unknown';
+}
+interface CliInstallResult {
+    outcome: 'already-installed' | 'installed' | 'failed';
+    /** Tail of the installer output for the Settings page to display. */
+    output: string;
+    probe: CliProbeResult;
+}
+interface CliAuthStart {
+    outcome: 'started' | 'in-progress' | 'cli-missing' | 'no-url';
+    authUrl?: string;
+    qrDataUrl?: string;
+}
+interface CliAuthStatus {
+    auth: CliProbeResult['auth'];
+    waiting: boolean;
+}
+/** The subset of ChildProcess behaviour WeComCliService relies on. */
+interface CliChild extends EventEmitter {
+    stdout: EventEmitter | null;
+    stderr: EventEmitter | null;
+    kill(): boolean;
+}
+type CliSpawn = (command: string, args: string[]) => CliChild;
+type CliQrRenderer = (text: string) => Promise<string>;
+declare class WeComCliService {
+    private readonly spawnFn;
+    private authProcess;
+    /** Synchronous mutex covering the async probe window inside beginAuth. */
+    private authBusy;
+    private readonly qrFn;
+    constructor(spawnFn?: CliSpawn, qrFn?: CliQrRenderer);
+    /** Kill any pending authorization process; safe to call at any time. */
+    dispose(): void;
+    /**
+     * One process run with a hard timeout. A spawn failure (binary missing)
+     * resolves with code null and empty output instead of rejecting.
+     */
+    private run;
+    probe(): Promise<CliProbeResult>;
+    install(): Promise<CliInstallResult>;
+    /**
+     * Spawn `auth init --noninteractive`, capture the authorization URL from
+     * stdout, and render it into a QR data URL. The URL never leaves memory
+     * and is never logged. Only one authorization may run at a time.
+     */
+    beginAuth(): Promise<CliAuthStart>;
+    cancelAuth(): void;
+    authStatus(): Promise<CliAuthStatus>;
+}
 
 /** Access policy for one WeCom chat scope. */
 type AccessMode = 'open' | 'allowlist' | 'disabled';
@@ -118,6 +182,7 @@ declare class WeComHarnessBridge {
     private readonly ctx;
     private readonly config;
     private readonly clientFactory;
+    private readonly cli?;
     private readonly log;
     private readonly conversations;
     private readonly seen;
@@ -127,7 +192,7 @@ declare class WeComHarnessBridge {
     private lastError;
     /** Task ids whose click was already processed; re-clicks are dropped. */
     private readonly consumedCardTasks;
-    constructor(ctx: Context, config: Config, clientFactory?: WeComClientFactory);
+    constructor(ctx: Context, config: Config, clientFactory?: WeComClientFactory, cli?: WeComCliService | undefined);
     /** Latest channel fact for configuration surfaces. */
     status(): {
         state: 'inactive' | 'connecting' | 'connected';
@@ -159,6 +224,8 @@ declare class WeComHarnessBridge {
     private rememberConsumedTask;
     private handleMessage;
     private helpText;
+    /** Human guidance for the three CLI states; probing errors stay soft. */
+    private cliStatusText;
     private commandReply;
     private allowed;
     /** Access policy check for an event frame (its chattype is optional). */
@@ -262,6 +329,7 @@ interface WeComSettingsSnapshot {
         writable: boolean;
     };
     channel: WeComChannelStatus;
+    cli?: CliProbeResult;
     release: {
         pluginVersion: string;
     };
@@ -278,17 +346,27 @@ interface SetKeyRequest {
 interface ClearKeyRequest {
     action: 'clear-key';
 }
-type SettingsRequest = SaveRequest | SetKeyRequest | ClearKeyRequest;
+declare const CLI_ACTIONS: readonly ["cli-probe", "cli-install", "cli-authorize", "cli-auth-status", "cli-cancel-auth"];
+type CliActionName = typeof CLI_ACTIONS[number];
+interface CliActionRequest {
+    action: CliActionName;
+}
+type SettingsRequest = SaveRequest | SetKeyRequest | ClearKeyRequest | CliActionRequest;
 /** Validate and parse one POST body; throws TypeError on a malformed request. */
 declare function parseRequest(value: unknown): SettingsRequest;
 /** Same-origin Settings handler for the WeCom channel. */
 declare class WeComWebBackend {
     private readonly ctx;
     private readonly status;
-    constructor(ctx: Context, status: () => WeComChannelStatus);
+    private readonly cli?;
+    private cliProbeCache;
+    constructor(ctx: Context, status: () => WeComChannelStatus, cli?: WeComCliService | undefined);
     private credential;
     /** Build the current settings/credential/channel snapshot without secrets. */
     snapshot(): Promise<WeComSettingsSnapshot>;
+    /** Probe with a tiny cache: GET snapshots may arrive in bursts. */
+    private cliSnapshot;
+    private handleCli;
     /** Merge the UI-editable subset into the namespace's user layer. */
     private save;
     /**

@@ -87,6 +87,7 @@ export async function apply(ctx: Context, config: WeComConfig): Promise<void> {
   let bridge: WeComHarnessBridge | undefined
   let restarting: Promise<void> | undefined
   let lastResolved: string | undefined
+  let disposed = false
 
   const stopBridge = async (): Promise<void> => {
     const previous = bridge
@@ -96,6 +97,8 @@ export async function apply(ctx: Context, config: WeComConfig): Promise<void> {
 
   /** Rebuild the channel from the current settings source; failures stay dormant. */
   const restartBridge = async (): Promise<void> => {
+    // A restart queued before unload must not bring the channel back up.
+    if (disposed) return
     let resolved: WeComConfig
     try {
       resolved = Config(current())
@@ -143,6 +146,7 @@ export async function apply(ctx: Context, config: WeComConfig): Promise<void> {
 
   await ctx.effect(async function* () {
     yield async () => {
+      disposed = true
       await stopBridge()
       cli.dispose()
       if (restarting !== undefined) await restarting

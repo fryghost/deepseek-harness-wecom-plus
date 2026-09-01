@@ -80,6 +80,8 @@ const VERSION_PATTERN = /(\d+\.\d+\.\d+(?:[-+][\w.]+)?)/u
 
 export class WeComCliService {
   private authProcess: CliChild | undefined
+  /** Synchronous mutex covering the async probe window inside beginAuth. */
+  private authBusy = false
   private readonly qrFn: CliQrRenderer
 
   constructor(
@@ -111,14 +113,18 @@ export class WeComCliService {
       let stderr = ''
       let timedOut = false
       let settled = false
+      let killTimer: ReturnType<typeof setTimeout> | undefined
       const timer = setTimeout(() => {
         timedOut = true
         child.kill()
+        // Grandchildren can hold the pipes open past SIGTERM; settle regardless.
+        killTimer = setTimeout(() => finish(null), 1_000)
       }, timeoutMs)
       const finish = (code: number | null): void => {
         if (settled) return
         settled = true
         clearTimeout(timer)
+        if (killTimer !== undefined) clearTimeout(killTimer)
         resolve({ code, stdout, stderr, timedOut })
       }
       child.stdout?.on('data', (chunk: Buffer | string) => { stdout += String(chunk) })
@@ -159,7 +165,7 @@ export class WeComCliService {
       return { outcome: 'already-installed', output: '', probe: before }
     }
     const run = await this.run('npm', ['install', '-g', '@wecom/cli'], 180_000)
-    const output = `${run.stdout}\n${run.stderr}`.trim().split('\n').slice(-8).join('\n')
+    const output = `${run.stdout}\n${run.stderr}`.trim().split(/\r?\n/).slice(-8).join('\n')
     const after = await this.probe()
     if (run.timedOut || run.code !== 0 || !after.installed || !after.meetsMin) {
       return { outcome: 'failed', output, probe: after }
@@ -173,31 +179,47 @@ export class WeComCliService {
    * and is never logged. Only one authorization may run at a time.
    */
   async beginAuth(): Promise<CliAuthStart> {
-    if (this.authProcess !== undefined) return { outcome: 'in-progress' }
-    const check = await this.probe()
-    if (!check.installed) return { outcome: 'cli-missing' }
-    const child = this.spawnFn('wecom-cli', ['auth', 'init', '--noninteractive'])
-    this.authProcess = child
-    let url: string | undefined
-    child.stdout?.on('data', (chunk: Buffer | string) => {
-      if (url !== undefined) return
-      url = String(chunk).match(AUTH_URL_PATTERN)?.[0]
-    })
-    const clear = (): void => {
-      if (this.authProcess === child) this.authProcess = undefined
+    if (this.authBusy || this.authProcess !== undefined) return { outcome: 'in-progress' }
+    this.authBusy = true
+    try {
+      const check = await this.probe()
+      if (!check.installed) return { outcome: 'cli-missing' }
+      const child = this.spawnFn('wecom-cli', ['auth', 'init', '--noninteractive'])
+      this.authProcess = child
+      let url: string | undefined
+      let seen = ''
+      child.stdout?.on('data', (chunk: Buffer | string) => {
+        if (url !== undefined) return
+        seen += String(chunk)
+        url = seen.match(AUTH_URL_PATTERN)?.[0]
+      })
+      const clear = (): void => {
+        if (this.authProcess === child) this.authProcess = undefined
+      }
+      child.once('error', clear)
+      child.once('close', clear)
+      const startedAt = Date.now()
+      while (url === undefined && this.authProcess === child && Date.now() - startedAt < 10_000) {
+        await new Promise(resolve => setTimeout(resolve, 100))
+      }
+      if (url === undefined || this.authProcess !== child) {
+        // Deliberate choice: a URL captured before the child exited is
+        // discarded — the process died before the authorization flow
+        // completed, so the URL is stale and must not reach the caller.
+        this.cancelAuth()
+        return { outcome: 'no-url' }
+      }
+      try {
+        const qrDataUrl = await this.qrFn(url)
+        return { outcome: 'started', authUrl: url, qrDataUrl }
+      } catch (error) {
+        // A QR render failure must not leave the auth process pending.
+        this.cancelAuth()
+        throw error
+      }
+    } finally {
+      this.authBusy = false
     }
-    child.once('error', clear)
-    child.once('close', clear)
-    const startedAt = Date.now()
-    while (url === undefined && this.authProcess === child && Date.now() - startedAt < 10_000) {
-      await new Promise(resolve => setTimeout(resolve, 100))
-    }
-    if (url === undefined || this.authProcess !== child) {
-      this.cancelAuth()
-      return { outcome: 'no-url' }
-    }
-    const qrDataUrl = await this.qrFn(url)
-    return { outcome: 'started', authUrl: url, qrDataUrl }
   }
 
   cancelAuth(): void {

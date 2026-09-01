@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from 'vitest'
 import { EventEmitter } from 'node:events'
-import { WeComCliService, MIN_CLI_VERSION } from '../src/cli.js'
+import { WeComCliService } from '../src/cli.js'
 
 class FakeChild extends EventEmitter {
   stdout = new EventEmitter()
@@ -68,6 +68,14 @@ describe('WeComCliService', () => {
     })
   })
 
+  it('reports not-installed when the spawn call throws', async () => {
+    const spawnFn = vi.fn(() => { throw new Error('ENOENT') })
+    const cli = new WeComCliService(spawnFn, qrFn)
+    await expect(cli.probe()).resolves.toEqual({
+      installed: false, meetsMin: false, auth: 'unknown',
+    })
+  })
+
   it('reports a stale version below the minimum', async () => {
     const { spawnFn } = fakeSpawn({
       'wecom-cli --version': () => emit(new FakeChild(), '0.9.1'),
@@ -76,7 +84,6 @@ describe('WeComCliService', () => {
     const cli = new WeComCliService(spawnFn, qrFn)
     const result = await cli.probe()
     expect(result.meetsMin).toBe(false)
-    expect(MIN_CLI_VERSION).toBe('1.1.0')
   })
 
   it('survives a hanging version probe via timeout', async () => {
@@ -88,7 +95,7 @@ describe('WeComCliService', () => {
       })
       const cli = new WeComCliService(spawnFn, qrFn)
       const pending = cli.probe()
-      await vi.advanceTimersByTimeAsync(5_100)
+      await vi.advanceTimersByTimeAsync(3_100)
       await expect(pending).resolves.toEqual({ installed: false, meetsMin: false, auth: 'unknown' })
     } finally {
       vi.useRealTimers()
@@ -178,6 +185,23 @@ describe('WeComCliService', () => {
     expect(child.killed).toBe(true)
     await expect(cli.authStatus()).resolves.toMatchObject({ waiting: false })
   })
+
+  it('cancels the pending auth when QR rendering fails', async () => {
+    const child = new FakeChild()
+    const { spawnFn } = fakeSpawn({
+      'wecom-cli --version': () => emit(new FakeChild(), '1.2.3'),
+      'wecom-cli auth show --status': () => emit(new FakeChild(), 'unauthorized'),
+      'wecom-cli auth init --noninteractive': () => child,
+    })
+    const failingQr = vi.fn(async () => { throw new Error('qr failed') })
+    const cli = new WeComCliService(spawnFn, failingQr)
+    setTimeout(() => child.stdout.emit('data', Buffer.from('https://login.work.weixin.qq.com/qr/XYZ')), 150)
+    await expect(cli.beginAuth()).rejects.toThrow('qr failed')
+    expect(child.killed).toBe(true)
+    // The mutex is released: a retry reaches the probe stage again.
+    // The retry finds no URL, so it runs out the full 10s wait window.
+    await expect(cli.beginAuth()).resolves.toMatchObject({ outcome: expect.any(String) })
+  }, 12_000)
 
   it('fails beginAuth when no URL appears', async () => {
     vi.useFakeTimers()

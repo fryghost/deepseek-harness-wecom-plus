@@ -452,7 +452,7 @@ export function apply(ctx: ClientContext): void {
     name: 'settings.section',
     id: 'deepseek-harness-wecom-plus',
     order: 50,
-    label: () => 'WeCom 企微',
+    label: () => '企微插件',
     inject: () => ({ controller }),
   }, SettingsSection))
 }

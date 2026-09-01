@@ -2726,7 +2726,7 @@ import {
 } from "@deepseek-ai/dsh-settings";
 
 // src/version.ts
-var PLUGIN_VERSION = "0.8.3";
+var PLUGIN_VERSION = "0.8.4";
 
 // src/settings-web.ts
 var SETTINGS_ROUTE = "/_dsh/deepseek-harness-wecom-plus/settings";

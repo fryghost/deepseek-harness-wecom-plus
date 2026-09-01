@@ -379,7 +379,7 @@ function apply(ctx) {
     name: "settings.section",
     id: "deepseek-harness-wecom-plus",
     order: 50,
-    label: () => "WeCom \u4F01\u5FAE",
+    label: () => "\u4F01\u5FAE\u63D2\u4EF6",
     inject: () => ({ controller })
   }, SettingsSection));
 }

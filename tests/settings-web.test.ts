@@ -57,6 +57,16 @@ function backend(value: unknown = testConfig(), writable = true) {
   return { instance, update, set, unset }
 }
 
+function backendWithCli(cli: Record<string, unknown>) {
+  const base = backend()
+  const instance = new WeComWebBackend(
+    (base.instance as unknown as { ctx: never }).ctx,
+    () => ({ state: 'inactive' as const }),
+    cli as never,
+  )
+  return { instance }
+}
+
 describe('WeCom settings web backend', () => {
   it('serves a settings snapshot without any credential value', async () => {
     const { instance } = backend()
@@ -168,5 +178,58 @@ describe('WeCom settings web backend', () => {
     expect(() => parseRequest({ action: 'set-key', value: '  ' })).toThrow('non-empty')
     expect(() => parseRequest({ action: 'unknown' })).toThrow('unsupported action')
     expect(parseRequest({ action: 'clear-key' })).toEqual({ action: 'clear-key' })
+  })
+
+  it('parses the five cli actions', () => {
+    for (const action of ['cli-probe', 'cli-install', 'cli-authorize', 'cli-auth-status', 'cli-cancel-auth']) {
+      expect(parseRequest({ action })).toEqual({ action })
+    }
+  })
+
+  it('exposes the cli probe result in the snapshot', async () => {
+    const { instance } = backendWithCli({
+      probe: vi.fn(async () => ({ installed: true, version: '1.2.3', meetsMin: true, auth: 'authorized' })),
+    })
+    const { res, captured } = mockResponse()
+
+    await instance.handle(mockRequest('GET'), res)
+
+    expect(captured.body.ok).toBe(true)
+    const value = captured.body.value as { cli?: { installed: boolean; version?: string } }
+    expect(value.cli).toEqual({ installed: true, version: '1.2.3', meetsMin: true, auth: 'authorized' })
+  })
+
+  it('dispatches cli actions to the service', async () => {
+    const cli = {
+      probe: vi.fn(async () => ({ installed: false, meetsMin: false, auth: 'unknown' })),
+      install: vi.fn(async () => ({ outcome: 'failed', output: 'boom', probe: { installed: false, meetsMin: false, auth: 'unknown' } })),
+      beginAuth: vi.fn(async () => ({ outcome: 'started', authUrl: 'https://x', qrDataUrl: 'data:image/png;base64,x' })),
+      authStatus: vi.fn(async () => ({ auth: 'unauthorized', waiting: true })),
+      cancelAuth: vi.fn(),
+    }
+    const { instance } = backendWithCli(cli)
+
+    const post = async (action: string): Promise<Captured> => {
+      const { res, captured } = mockResponse()
+      await instance.handle(mockRequest('POST', { action }), res)
+      return captured
+    }
+
+    expect((await post('cli-probe')).body.value).toEqual({ installed: false, meetsMin: false, auth: 'unknown' })
+    expect((await post('cli-install')).body.value).toEqual(expect.objectContaining({ outcome: 'failed' }))
+    expect((await post('cli-authorize')).body.value).toEqual(expect.objectContaining({ outcome: 'started' }))
+    expect((await post('cli-auth-status')).body.value).toEqual({ auth: 'unauthorized', waiting: true })
+    expect((await post('cli-cancel-auth')).body.value).toEqual({ cancelled: true })
+    expect(cli.cancelAuth).toHaveBeenCalledOnce()
+  })
+
+  it('answers cli actions with cli-unavailable when no service is wired', async () => {
+    const { instance } = backend()
+    const { res, captured } = mockResponse()
+
+    await instance.handle(mockRequest('POST', { action: 'cli-probe' }), res)
+
+    expect(captured.status).toBe(503)
+    expect(captured.body.error?.code).toBe('cli-unavailable')
   })
 })

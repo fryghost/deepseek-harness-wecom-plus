@@ -19,6 +19,8 @@ import {
   type SettingsNamespace,
   type SettingsProvider,
 } from '@deepseek-ai/dsh-settings'
+import type { CliAuthStart, CliAuthStatus, CliInstallResult, CliProbeResult } from './cli.js'
+import type { WeComCliService } from './cli.js'
 import type { Config } from './config.js'
 import { PLUGIN_VERSION } from './version.js'
 
@@ -64,6 +66,7 @@ export interface WeComSettingsSnapshot {
     writable: boolean
   }
   channel: WeComChannelStatus
+  cli?: CliProbeResult
   release: { pluginVersion: string }
 }
 
@@ -82,7 +85,14 @@ interface ClearKeyRequest {
   action: 'clear-key'
 }
 
-type SettingsRequest = SaveRequest | SetKeyRequest | ClearKeyRequest
+const CLI_ACTIONS = ['cli-probe', 'cli-install', 'cli-authorize', 'cli-auth-status', 'cli-cancel-auth'] as const
+type CliActionName = typeof CLI_ACTIONS[number]
+
+interface CliActionRequest {
+  action: CliActionName
+}
+
+type SettingsRequest = SaveRequest | SetKeyRequest | ClearKeyRequest | CliActionRequest
 
 interface JsonError {
   ok: false
@@ -200,6 +210,9 @@ export function parseRequest(value: unknown): SettingsRequest {
     }
     return { action: 'set-key', value: value.value.trim() }
   }
+  if (typeof value.action === 'string' && (CLI_ACTIONS as readonly string[]).includes(value.action)) {
+    return { action: value.action } as CliActionRequest
+  }
   if (value.action === 'clear-key') return { action: 'clear-key' }
   throw new TypeError(`unsupported action: ${String(value.action)}`)
 }
@@ -211,9 +224,12 @@ function publicMessage(error: unknown): string {
 
 /** Same-origin Settings handler for the WeCom channel. */
 export class WeComWebBackend {
+  private cliProbeCache: { at: number; value: CliProbeResult } | undefined
+
   constructor(
     private readonly ctx: Context,
     private readonly status: () => WeComChannelStatus,
+    private readonly cli?: WeComCliService,
   ) {}
 
   private async credential(config: Config): Promise<{ configured: boolean; source?: string; writable: boolean }> {
@@ -245,7 +261,31 @@ export class WeComWebBackend {
         writable: credential.writable,
       },
       channel: this.status(),
+      ...(this.cli === undefined ? {} : { cli: await this.cliSnapshot() }),
       release: { pluginVersion: PLUGIN_VERSION },
+    }
+  }
+
+  /** Probe with a tiny cache: GET snapshots may arrive in bursts. */
+  private async cliSnapshot(): Promise<CliProbeResult> {
+    const cached = this.cliProbeCache
+    if (cached !== undefined && Date.now() - cached.at < 3_000) return cached.value
+    const value = await this.cli!.probe()
+    this.cliProbeCache = { at: Date.now(), value }
+    return value
+  }
+
+  private async handleCli(action: CliActionName): Promise<CliProbeResult | CliInstallResult | CliAuthStart | CliAuthStatus | { cancelled: boolean }> {
+    const cli = this.cli!
+    this.cliProbeCache = undefined
+    switch (action) {
+      case 'cli-probe': return cli.probe()
+      case 'cli-install': return cli.install()
+      case 'cli-authorize': return cli.beginAuth()
+      case 'cli-auth-status': return cli.authStatus()
+      case 'cli-cancel-auth':
+        cli.cancelAuth()
+        return { cancelled: true }
     }
   }
 
@@ -302,12 +342,19 @@ export class WeComWebBackend {
       return
     }
     try {
-      if (parsed.action === 'set-key') {
+      if ((CLI_ACTIONS as readonly string[]).includes(parsed.action)) {
+        if (this.cli === undefined) {
+          requestError(res, 503, 'cli-unavailable', 'The CLI integration is not wired into this channel')
+          return
+        }
+        responseJson(res, 200, { ok: true, value: await this.handleCli(parsed.action as CliActionName) })
+      } else if (parsed.action === 'set-key') {
         responseJson(res, 200, { ok: true, value: await this.setKey(parsed.value) })
       } else if (parsed.action === 'clear-key') {
         responseJson(res, 200, { ok: true, value: await this.clearKey() })
       } else {
-        responseJson(res, 200, { ok: true, value: await this.save(parsed) })
+        // parseRequest guarantees only 'save' remains here.
+        responseJson(res, 200, { ok: true, value: await this.save(parsed as SaveRequest) })
       }
     } catch (error) {
       const conflict = error instanceof SettingsConflictError

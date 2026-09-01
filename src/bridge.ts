@@ -12,6 +12,7 @@ import {
   type EnterChatEvent,
   type EventMessageWith,
   type Logger,
+  type MixedMsgItem,
   type ReplyMsgItem,
   type TemplateCard,
   type TemplateCardEventData,
@@ -394,6 +395,17 @@ export class WeComHarnessBridge {
   private async handleMessage(frame: WsFrame<BaseMessage>): Promise<void> {
     const message = frame.body
     if (message === undefined || this.seen.hasOrAdd(message.msgid) || !this.allowed(message)) return
+    // Wire-shape diagnostic: proves exactly what WeCom delivered per message
+    // (item counts, payload presence, quote type) before any processing,
+    // so a lost image is attributable to the wire or to the parser.
+    console.error(
+      '[wecom-plus] inbound msgid=%s type=%s chat=%s from=%s %s',
+      message.msgid,
+      message.msgtype,
+      message.chattype,
+      message.from?.userid,
+      describeInboundShape(message),
+    )
     try {
       const command = slashCommand(message)
       if (command?.name === 'bot-ping') {
@@ -983,6 +995,29 @@ function slashCommand(message: BaseMessage): WeComSlashCommand | undefined {
   if (rawName === undefined) return undefined
   const name = rawName.toLowerCase()
   return { name, line: `/${name}${line.slice(match[0].length)}` }
+}
+
+/**
+ * One-line wire-shape summary of an inbound message for the diagnostic log:
+ * which content fields arrived, per-item payload presence for mixed messages,
+ * and the quoted message type.
+ */
+function describeInboundShape(message: BaseMessage): string {
+  const parts: string[] = []
+  if (message.text?.content !== undefined) parts.push(`text=${message.text.content.length}ch`)
+  if (message.image !== undefined) parts.push(`image=url=${message.image.url !== undefined ? 'yes' : 'no'}`)
+  if (message.mixed !== undefined) {
+    const items: readonly MixedMsgItem[] = message.mixed.msg_item ?? []
+    const texts = items.filter(item => item.msgtype === 'text').length
+    const withImage = items.filter(item => item.msgtype === 'image' && item.image !== undefined).length
+    const bareImages = items.filter(item => item.msgtype === 'image' && item.image === undefined).length
+    parts.push(`mixed items=${items.length}(text=${texts},image=${withImage},bare=${bareImages})`)
+  }
+  if (message.voice !== undefined) parts.push('voice=yes')
+  if (message.file !== undefined) parts.push(`file=url=${message.file.url !== undefined ? 'yes' : 'no'}`)
+  if (message.video !== undefined) parts.push(`video=url=${message.video.url !== undefined ? 'yes' : 'no'}`)
+  if (message.quote !== undefined) parts.push(`quote=${message.quote.msgtype}`)
+  return parts.length > 0 ? parts.join(' ') : 'no known content fields'
 }
 
 function imageFilename(mediaType: string): string {

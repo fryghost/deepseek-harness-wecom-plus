@@ -495,36 +495,50 @@ async function inboundContent(ctx, config, client, message, includeImages = true
   collectMessageContent(message, textParts, images, files);
   collectQuotedContent(message, textParts, images, files);
   const selectedImages = images.slice(0, ctx.attachments.imageLimits.maxImagesPerMessage);
+  if (selectedImages.length < images.length) {
+    textParts.push(
+      `[WeCom image omitted: only the first ${selectedImages.length} of ${images.length} images fit one message.]`
+    );
+  }
   const imageBlocks = [];
   let totalImageBytes = 0;
   for (const image of selectedImages) {
     const remaining = ctx.attachments.imageLimits.maxMessageImageBytes - totalImageBytes;
     const maxBytes = Math.min(ctx.attachments.imageLimits.maxImageBytes, remaining);
-    if (maxBytes <= 0) break;
-    const downloaded = await withTimeout(
-      client.downloadFile(image.url, image.aeskey),
-      config.mediaDownloadTimeoutMs,
-      "WeCom encrypted image download"
-    );
-    if (downloaded.buffer.byteLength > maxBytes) {
-      throw new Error(`WeCom image exceeds the ${maxBytes}-byte attachment limit`);
+    if (maxBytes <= 0) {
+      textParts.push(
+        `[WeCom image omitted: the message image byte budget was exhausted after ${imageBlocks.length} image(s).]`
+      );
+      break;
     }
-    const mediaType = detectImageMediaType(downloaded.buffer);
-    const ref = await ctx.attachments.saveImage({
-      data: downloaded.buffer,
-      mediaType,
-      ...downloaded.filename === void 0 ? {} : { name: downloaded.filename }
-    });
-    totalImageBytes += ref.bytes;
-    if (includeImages) {
-      imageBlocks.push({ type: "image", attachment: ref });
-    } else {
-      const label = downloaded.filename?.trim() || ref.mediaType;
-      textParts.push([
-        `[WeCom image received: ${label}.`,
-        `Stored as Harness attachment ${String(ref.attachmentId)}.`,
-        "The selected model is text-only and cannot inspect its pixels.]"
-      ].join(" "));
+    try {
+      const downloaded = await withTimeout(
+        client.downloadFile(image.url, image.aeskey),
+        config.mediaDownloadTimeoutMs,
+        "WeCom encrypted image download"
+      );
+      if (downloaded.buffer.byteLength > maxBytes) {
+        throw new Error(`exceeds the ${maxBytes}-byte attachment limit`);
+      }
+      const mediaType = detectImageMediaType(downloaded.buffer);
+      const ref = await ctx.attachments.saveImage({
+        data: downloaded.buffer,
+        mediaType,
+        ...downloaded.filename === void 0 ? {} : { name: downloaded.filename }
+      });
+      totalImageBytes += ref.bytes;
+      if (includeImages) {
+        imageBlocks.push({ type: "image", attachment: ref });
+      } else {
+        const label = downloaded.filename?.trim() || ref.mediaType;
+        textParts.push([
+          `[WeCom image received: ${label}.`,
+          `Stored as Harness attachment ${String(ref.attachmentId)}.`,
+          "The selected model is text-only and cannot inspect its pixels.]"
+        ].join(" "));
+      }
+    } catch (error) {
+      textParts.push(`[WeCom image not attached: ${wireErrorText(error)} The rest of the message was kept.]`);
     }
   }
   for (const pending of files) {
@@ -559,6 +573,7 @@ function collectMessageContent(message, text, images, files) {
       break;
     case "image":
       if (message.image !== void 0) images.push(message.image);
+      else text.push("[WeCom image message carried no downloadable payload.]");
       break;
     case "mixed":
       collectMixed(message.mixed?.msg_item ?? [], text, images);
@@ -581,7 +596,10 @@ function collectQuotedContent(message, text, images, files) {
   const quote = message.quote;
   if (quote === void 0) return;
   if (quote.msgtype === "text") pushText(text, quote.text?.content, "[Quoted text]\n");
-  if (quote.msgtype === "image" && quote.image !== void 0) images.push(quote.image);
+  if (quote.msgtype === "image") {
+    if (quote.image !== void 0) images.push(quote.image);
+    else text.push("[Quoted image carried no downloadable payload.]");
+  }
   if (quote.msgtype === "mixed") collectMixed(quote.mixed?.msg_item ?? [], text, images, "[Quoted text]\n");
   if (quote.msgtype === "voice") pushText(text, quote.voice?.content, "[Quoted voice transcription]\n");
   if (quote.msgtype === "file" && quote.file?.url) {
@@ -591,7 +609,10 @@ function collectQuotedContent(message, text, images, files) {
 function collectMixed(items, text, images, prefix = "") {
   for (const item of items) {
     if (item.msgtype === "text") pushText(text, item.text?.content, prefix);
-    if (item.msgtype === "image" && item.image !== void 0) images.push(item.image);
+    if (item.msgtype === "image") {
+      if (item.image !== void 0) images.push(item.image);
+      else text.push(`${prefix}[WeCom mixed image item had no downloadable payload.]`);
+    }
   }
 }
 function pushText(target, value, prefix = "") {
@@ -607,6 +628,11 @@ function detectImageMediaType(data) {
   if (startsWith(data, [71, 73, 70, 56])) return "image/gif";
   if (startsWith(data, [82, 73, 70, 70]) && data[8] === 87 && data[9] === 69 && data[10] === 66 && data[11] === 80) return "image/webp";
   throw new Error("WeCom image has an unsupported or unrecognized format");
+}
+function wireErrorText(error) {
+  const raw = String(error);
+  const normalized = raw.replace(/\s+/gu, " ").trim();
+  return normalized.length <= 200 ? normalized : `${normalized.slice(0, 197)}...`;
 }
 function startsWith(data, prefix) {
   return prefix.every((byte, index) => data[index] === byte);
@@ -1991,6 +2017,14 @@ var WeComHarnessBridge = class {
   async handleMessage(frame) {
     const message = frame.body;
     if (message === void 0 || this.seen.hasOrAdd(message.msgid) || !this.allowed(message)) return;
+    console.error(
+      "[wecom-plus] inbound msgid=%s type=%s chat=%s from=%s %s",
+      message.msgid,
+      message.msgtype,
+      message.chattype,
+      message.from?.userid,
+      describeInboundShape(message)
+    );
     try {
       const command = slashCommand(message);
       if (command?.name === "bot-ping") {
@@ -2523,6 +2557,23 @@ function slashCommand(message) {
   if (rawName === void 0) return void 0;
   const name2 = rawName.toLowerCase();
   return { name: name2, line: `/${name2}${line.slice(match[0].length)}` };
+}
+function describeInboundShape(message) {
+  const parts = [];
+  if (message.text?.content !== void 0) parts.push(`text=${message.text.content.length}ch`);
+  if (message.image !== void 0) parts.push(`image=url=${message.image.url !== void 0 ? "yes" : "no"}`);
+  if (message.mixed !== void 0) {
+    const items = message.mixed.msg_item ?? [];
+    const texts = items.filter((item) => item.msgtype === "text").length;
+    const withImage = items.filter((item) => item.msgtype === "image" && item.image !== void 0).length;
+    const bareImages = items.filter((item) => item.msgtype === "image" && item.image === void 0).length;
+    parts.push(`mixed items=${items.length}(text=${texts},image=${withImage},bare=${bareImages})`);
+  }
+  if (message.voice !== void 0) parts.push("voice=yes");
+  if (message.file !== void 0) parts.push(`file=url=${message.file.url !== void 0 ? "yes" : "no"}`);
+  if (message.video !== void 0) parts.push(`video=url=${message.video.url !== void 0 ? "yes" : "no"}`);
+  if (message.quote !== void 0) parts.push(`quote=${message.quote.msgtype}`);
+  return parts.length > 0 ? parts.join(" ") : "no known content fields";
 }
 function imageFilename(mediaType) {
   if (mediaType === "image/jpeg") return "image.jpg";

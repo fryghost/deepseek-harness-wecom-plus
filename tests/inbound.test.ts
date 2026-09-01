@@ -74,19 +74,73 @@ describe('inboundContent', () => {
     expect((blocks[0] as { text: string }).text).toContain('text-only')
   })
 
-  it('rejects decrypted image bytes over the Harness limit', async () => {
+  it('keeps the message and notes an image over the Harness limit', async () => {
     const ctx = {
       attachments: {
         imageLimits: { maxImagesPerMessage: 4, maxMessageImageBytes: 8, maxImageBytes: 8 },
         saveImage: vi.fn(),
       },
     } as never
-    await expect(inboundContent(ctx, testConfig(), {
+    const blocks = await inboundContent(ctx, testConfig(), {
       downloadFile: vi.fn(async () => ({ buffer: PNG })),
     }, {
       msgid: 'm3', aibotid: 'bot', chattype: 'single', from: { userid: 'u1' }, msgtype: 'image',
       image: { url: 'https://wecom.test/encrypted' },
-    } as never)).rejects.toThrow('attachment limit')
+    } as never)
+
+    expect(blocks).toHaveLength(1)
+    expect((blocks[0] as { text: string }).text).toContain('WeCom image not attached')
+    expect((blocks[0] as { text: string }).text).toContain('attachment limit')
+  })
+
+  it('notes a mixed image item that arrived without a downloadable payload', async () => {
+    const saveImage = vi.fn(async () => ({
+      attachmentId: 'sha256:ok', mediaType: 'image/png', bytes: PNG.length, width: 1, height: 1,
+    }))
+    const ctx = {
+      attachments: {
+        imageLimits: { maxImagesPerMessage: 4, maxMessageImageBytes: 10_000, maxImageBytes: 10_000 },
+        saveImage,
+      },
+    } as never
+    const blocks = await inboundContent(ctx, testConfig(), {
+      downloadFile: vi.fn(async () => ({ buffer: PNG })),
+    }, {
+      msgid: 'm4', aibotid: 'bot', chattype: 'single', from: { userid: 'u1' }, msgtype: 'mixed',
+      mixed: { msg_item: [
+        { msgtype: 'text', text: { content: '看图' } },
+        { msgtype: 'image' },
+      ] },
+    } as never)
+
+    const text = (blocks[0] as { text: string }).text
+    expect(text).toContain('WeCom mixed image item had no downloadable payload')
+    expect(saveImage).not.toHaveBeenCalled()
+  })
+
+  it('notes when the message image byte budget cuts off later images', async () => {
+    const ctx = {
+      attachments: {
+        imageLimits: { maxImagesPerMessage: 4, maxMessageImageBytes: PNG.byteLength, maxImageBytes: 10_000 },
+        saveImage: vi.fn(async () => ({
+          attachmentId: 'sha256:first', mediaType: 'image/png', bytes: PNG.length, width: 1, height: 1,
+        })),
+      },
+    } as never
+    const blocks = await inboundContent(ctx, testConfig(), {
+      downloadFile: vi.fn(async () => ({ buffer: PNG })),
+    }, {
+      msgid: 'm5', aibotid: 'bot', chattype: 'single', from: { userid: 'u1' }, msgtype: 'mixed',
+      mixed: { msg_item: [
+        { msgtype: 'image', image: { url: 'https://wecom.test/one', aeskey: 'k1' } },
+        { msgtype: 'image', image: { url: 'https://wecom.test/two', aeskey: 'k2' } },
+        { msgtype: 'image', image: { url: 'https://wecom.test/three', aeskey: 'k3' } },
+      ] },
+    } as never)
+
+    expect(blocks).toHaveLength(2)
+    expect((blocks[0] as { text: string }).text)
+      .toContain('message image byte budget was exhausted after 1 image(s)')
   })
 
   it('downloads and decrypts an inbound file to a model-readable local path', async () => {

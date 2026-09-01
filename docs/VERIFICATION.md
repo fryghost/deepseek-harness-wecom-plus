@@ -78,6 +78,15 @@ pnpm dsh web
 
 ## 8. 终端日志速查
 
+每条收到的企微消息必有一行（图片丢失时先看这行，能区分「企微没发图」还是「解析丢了图」）：
+
+```
+[wecom-plus] inbound msgid=... type=mixed chat=single from=... mixed items=4(text=1,image=3,bare=0)
+```
+
+- `mixed items=N(image=M,bare=B)`：消息里带了 N 个混排项，其中 M 个图片项有下载载荷；`bare>0` 表示企微发了图片位但没给载荷（会话里会出现「no downloadable payload」说明文字）；
+- 纯文本消息只有 `text=长度ch`；若连 `inbound` 行都没出现，消息根本没到达插件（检查 `allowed` 策略与消息去重）。
+
 每次卡片点击必有一行：
 
 ```

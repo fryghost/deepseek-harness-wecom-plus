@@ -33,36 +33,52 @@ export async function inboundContent(
   collectQuotedContent(message, textParts, images, files)
 
   const selectedImages = images.slice(0, ctx.attachments.imageLimits.maxImagesPerMessage)
+  if (selectedImages.length < images.length) {
+    textParts.push(
+      `[WeCom image omitted: only the first ${selectedImages.length} of ${images.length} images fit one message.]`,
+    )
+  }
   const imageBlocks: ContentBlock[] = []
   let totalImageBytes = 0
   for (const image of selectedImages) {
     const remaining = ctx.attachments.imageLimits.maxMessageImageBytes - totalImageBytes
     const maxBytes = Math.min(ctx.attachments.imageLimits.maxImageBytes, remaining)
-    if (maxBytes <= 0) break
-    const downloaded = await withTimeout(
-      client.downloadFile(image.url, image.aeskey),
-      config.mediaDownloadTimeoutMs,
-      'WeCom encrypted image download',
-    )
-    if (downloaded.buffer.byteLength > maxBytes) {
-      throw new Error(`WeCom image exceeds the ${maxBytes}-byte attachment limit`)
+    if (maxBytes <= 0) {
+      textParts.push(
+        `[WeCom image omitted: the message image byte budget was exhausted after ${imageBlocks.length} image(s).]`,
+      )
+      break
     }
-    const mediaType = detectImageMediaType(downloaded.buffer)
-    const ref = await ctx.attachments.saveImage({
-      data: downloaded.buffer,
-      mediaType,
-      ...(downloaded.filename === undefined ? {} : { name: downloaded.filename }),
-    })
-    totalImageBytes += ref.bytes
-    if (includeImages) {
-      imageBlocks.push({ type: 'image', attachment: ref })
-    } else {
-      const label = downloaded.filename?.trim() || ref.mediaType
-      textParts.push([
-        `[WeCom image received: ${label}.`,
-        `Stored as Harness attachment ${String(ref.attachmentId)}.`,
-        'The selected model is text-only and cannot inspect its pixels.]',
-      ].join(' '))
+    // One bad image must not lose the whole message: keep the text and the
+    // other images, and report the failed one in the transcript instead.
+    try {
+      const downloaded = await withTimeout(
+        client.downloadFile(image.url, image.aeskey),
+        config.mediaDownloadTimeoutMs,
+        'WeCom encrypted image download',
+      )
+      if (downloaded.buffer.byteLength > maxBytes) {
+        throw new Error(`exceeds the ${maxBytes}-byte attachment limit`)
+      }
+      const mediaType = detectImageMediaType(downloaded.buffer)
+      const ref = await ctx.attachments.saveImage({
+        data: downloaded.buffer,
+        mediaType,
+        ...(downloaded.filename === undefined ? {} : { name: downloaded.filename }),
+      })
+      totalImageBytes += ref.bytes
+      if (includeImages) {
+        imageBlocks.push({ type: 'image', attachment: ref })
+      } else {
+        const label = downloaded.filename?.trim() || ref.mediaType
+        textParts.push([
+          `[WeCom image received: ${label}.`,
+          `Stored as Harness attachment ${String(ref.attachmentId)}.`,
+          'The selected model is text-only and cannot inspect its pixels.]',
+        ].join(' '))
+      }
+    } catch (error) {
+      textParts.push(`[WeCom image not attached: ${wireErrorText(error)} The rest of the message was kept.]`)
     }
   }
 
@@ -105,6 +121,7 @@ function collectMessageContent(
       break
     case 'image':
       if (message.image !== undefined) images.push(message.image)
+      else text.push('[WeCom image message carried no downloadable payload.]')
       break
     case 'mixed':
       collectMixed(message.mixed?.msg_item ?? [], text, images)
@@ -132,7 +149,10 @@ function collectQuotedContent(
   const quote = message.quote
   if (quote === undefined) return
   if (quote.msgtype === 'text') pushText(text, quote.text?.content, '[Quoted text]\n')
-  if (quote.msgtype === 'image' && quote.image !== undefined) images.push(quote.image)
+  if (quote.msgtype === 'image') {
+    if (quote.image !== undefined) images.push(quote.image)
+    else text.push('[Quoted image carried no downloadable payload.]')
+  }
   if (quote.msgtype === 'mixed') collectMixed(quote.mixed?.msg_item ?? [], text, images, '[Quoted text]\n')
   if (quote.msgtype === 'voice') pushText(text, quote.voice?.content, '[Quoted voice transcription]\n')
   if (quote.msgtype === 'file' && quote.file?.url) {
@@ -148,7 +168,10 @@ function collectMixed(
 ): void {
   for (const item of items) {
     if (item.msgtype === 'text') pushText(text, item.text?.content, prefix)
-    if (item.msgtype === 'image' && item.image !== undefined) images.push(item.image)
+    if (item.msgtype === 'image') {
+      if (item.image !== undefined) images.push(item.image)
+      else text.push(`${prefix}[WeCom mixed image item had no downloadable payload.]`)
+    }
   }
 }
 
@@ -171,6 +194,13 @@ export function detectImageMediaType(data: Uint8Array): ImageMediaType {
     && data[8] === 0x57 && data[9] === 0x45 && data[10] === 0x42 && data[11] === 0x50
   ) return 'image/webp'
   throw new Error('WeCom image has an unsupported or unrecognized format')
+}
+
+/** Collapse any thrown value into one short wire-safe diagnostic line. */
+function wireErrorText(error: unknown): string {
+  const raw = String(error)
+  const normalized = raw.replace(/\s+/gu, ' ').trim()
+  return normalized.length <= 200 ? normalized : `${normalized.slice(0, 197)}...`
 }
 
 function startsWith(data: Uint8Array, prefix: readonly number[]): boolean {

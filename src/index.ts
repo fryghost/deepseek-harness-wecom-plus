@@ -3,6 +3,7 @@
 import type { Context } from '@deepseek-ai/cordis'
 import type z from '@deepseek-ai/schemastery'
 import type { SettingsNamespace } from '@deepseek-ai/dsh-settings'
+import { WeComCliService } from './cli.js'
 import { WeComHarnessBridge } from './bridge.js'
 import { Config, type Config as WeComConfig } from './config.js'
 import { installWeComSettingsWeb, SETTINGS_NS, WeComWebBackend } from './settings-web.js'
@@ -81,6 +82,7 @@ export { SETTINGS_NS, SETTINGS_ROUTE, parseRequest, WeComWebBackend } from './se
  */
 export async function apply(ctx: Context, config: WeComConfig): Promise<void> {
   const log = ctx.logger(name)
+  const cli = new WeComCliService()
   let current: () => WeComConfig = () => config
   let bridge: WeComHarnessBridge | undefined
   let restarting: Promise<void> | undefined
@@ -107,7 +109,7 @@ export async function apply(ctx: Context, config: WeComConfig): Promise<void> {
     if (bridge !== undefined && fingerprint === lastResolved) return
     await stopBridge()
     lastResolved = fingerprint
-    const next = new WeComHarnessBridge(ctx, resolved)
+    const next = new WeComHarnessBridge(ctx, resolved, undefined, cli)
     bridge = next
     try {
       await next.start()
@@ -123,7 +125,7 @@ export async function apply(ctx: Context, config: WeComConfig): Promise<void> {
   }
 
   // Optional Web Settings route; mounts only while an httpServer is present.
-  installWeComSettingsWeb(ctx, new WeComWebBackend(ctx, () => bridge?.status() ?? { state: 'inactive' }))
+  installWeComSettingsWeb(ctx, new WeComWebBackend(ctx, () => bridge?.status() ?? { state: 'inactive' }, cli))
 
   // The resolved composition entry doubles as the settings base layer; stored
   // sections override it, and every committed change restarts the channel.
@@ -142,6 +144,7 @@ export async function apply(ctx: Context, config: WeComConfig): Promise<void> {
   await ctx.effect(async function* () {
     yield async () => {
       await stopBridge()
+      cli.dispose()
       if (restarting !== undefined) await restarting
     }
   }, 'deepseek-harness-wecom-plus.websocket')

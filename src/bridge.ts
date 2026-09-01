@@ -573,7 +573,8 @@ export class WeComHarnessBridge {
     let probe
     try {
       probe = await this.cli.probe()
-    } catch {
+    } catch (error) {
+      this.log.warn('WeCom cli probe failed: %s', String(error))
       return 'CLI 状态检查失败，请稍后重试（/bot-cli）。'
     }
     if (!probe.installed) {

@@ -686,6 +686,8 @@ describe('WeComHarnessBridge', () => {
       await bridge.start()
       await client.message(textMessage('/bot-cli', `m-cli-${item.expect.length}`))
       expect(client.replies[0]?.content).toContain(item.expect)
+      // The authorization link must never be sent through chat.
+      expect(client.replies[0]?.content).not.toContain('https://')
       await bridge.stop()
     }
   })

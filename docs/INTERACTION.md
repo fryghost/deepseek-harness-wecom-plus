@@ -24,7 +24,7 @@
 2. **策略过滤**：单聊/群聊各自的 `open / allowlist / disabled`；
 3. **`/bot-cancel`**：取消当前模型回合（同时中止挂起的提问）；
 4. **提问消费**：`tryAnswerFromText` —— 若该会话有挂起的 `ask_user_question`，本次文字就是**答案**（数字 → 选项标签；精确标签 → 匹配；其他 → custom 自由文本），结算后立即回执「已收到你的回答，正在处理…」，**不再开启新回合**；
-5. **内置命令**：`/bot-ping` `/help` `/new` `/reset` `/bot-image-test` `/bot-card-test` `/bot-file-test` `/bot-status`，`/export` 明确拒绝；
+5. **内置命令**：`/bot-ping` `/help` `/new` `/reset` `/bot-image-test` `/bot-card-test` `/bot-file-test` `/bot-status` `/bot-cli`，`/export` 明确拒绝；
 6. **Harness 命令**：`allowedHarnessCommands`（默认 `/compact` `/goal` `/plan`）转发给命令服务；
 7. **普通消息**：进入模型回合（见下）。
 
@@ -112,6 +112,7 @@
 | --- | --- |
 | `/bot-ping` | `pong — …已连接` |
 | `/bot-card-test` | 按钮卡 → 点击 → 卡片原位仍是按钮卡（选项保留、选中打 ✓、辅助文案「已选择…正在处理…」）→ 模型回复；重复点击无反应 |
+| `/bot-cli` | wecom-cli 状态检查与安装/授权引导（未安装给安装指引，未授权引导到设置页扫码，已授权显示就绪与版本） |
 | 长文本问题 | 文字流式逐段出现，工具执行时显示「正在执行工具 xxx…」 |
 | ask 短选项问题 | Markdown + 按钮卡 → 点击 → 卡片原位保留选项并标记「已选择「xx」」→ 模型继续 |
 | ask 长选项问题 | Markdown 编号列表 + 文字卡 → 回数字 → 模型继续 |

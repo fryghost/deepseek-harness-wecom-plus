@@ -14,6 +14,7 @@
 - 新增 `/bot-card-test` 自检命令，无需模型即可验证卡片与按钮交互链路。
 - 新增 `cardMode`、`cardTaskIdPrefix`、`cardClickAckTitle`、`cardClickAckSubtitle`、`questionTimeoutMs` 配置项。
 - **长任务不误杀、不装死**：回合超时改为空闲看门狗——只要持续产出事件（文本增量、工具调用、step 边界）就永不打断，仅当 `responseTimeoutMs` 内毫无进展才取消；静默期每 `streamHeartbeatMs`（默认 5 秒，0 关闭）发送心跳帧，点动画 `.`/`..`/`...` 循环并显示已进行时长，气泡肉眼可见地保持活跃。
+- **WeCom CLI 体检与引导**：自动探测官方 `wecom-cli` 的安装、版本与授权状态；设置页一键安装、扫码授权（二维码本地生成，凭证不经插件），企微内 `/bot-cli` 随时自检。业务工具接入将在验证后推出。
 
 ## 功能
 

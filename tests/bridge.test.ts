@@ -659,4 +659,44 @@ describe('WeComHarnessBridge', () => {
       await bridge.stop()
     }
   })
+
+  it('replies to /bot-cli with per-state guidance', async () => {
+    const buildCli = (probe: Record<string, unknown>) => ({
+      probe: vi.fn(async () => probe),
+      install: vi.fn(), beginAuth: vi.fn(), authStatus: vi.fn(), cancelAuth: vi.fn(),
+    })
+    const cases: Array<{ probe: Record<string, unknown>; expect: string }> = [
+      { probe: { installed: false, meetsMin: false, auth: 'unknown' }, expect: 'npm install -g @wecom/cli' },
+      {
+        probe: { installed: true, version: '1.2.3', meetsMin: true, auth: 'unauthorized' },
+        expect: '设置页 → 企微插件 → CLI 集成',
+      },
+      {
+        probe: { installed: true, version: '1.2.3', meetsMin: true, auth: 'authorized' },
+        expect: '已就绪',
+      },
+      {
+        probe: { installed: true, version: '0.9.1', meetsMin: false, auth: 'unauthorized' },
+        expect: '版本 0.9.1 低于',
+      },
+    ]
+    for (const item of cases) {
+      const client = new FakeClient()
+      const bridge = new WeComHarnessBridge(agentContext(), testConfig(), () => client as never, buildCli(item.probe) as never)
+      await bridge.start()
+      await client.message(textMessage('/bot-cli', `m-cli-${item.expect.length}`))
+      expect(client.replies[0]?.content).toContain(item.expect)
+      await bridge.stop()
+    }
+  })
+
+  it('answers /bot-cli with a soft failure when probing errors', async () => {
+    const client = new FakeClient()
+    const brokenCli = { probe: vi.fn(async () => { throw new Error('spawn failed') }) }
+    const bridge = new WeComHarnessBridge(agentContext(), testConfig(), () => client as never, brokenCli as never)
+    await bridge.start()
+    await client.message(textMessage('/bot-cli', 'm-cli-error'))
+    expect(client.replies[0]?.content).toContain('CLI 状态检查失败')
+    await bridge.stop()
+  })
 })

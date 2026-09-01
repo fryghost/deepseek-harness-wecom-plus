@@ -23,6 +23,7 @@ import {
   type WsFrameHeaders,
 } from '@wecom/aibot-node-sdk'
 import { buildClickAckCard, buildTemplateCard, buildTextNoticeAckCard, repairCardForResend } from './card.js'
+import type { WeComCliService } from './cli.js'
 import type { Config } from './config.js'
 import {
   ConversationManager,
@@ -115,6 +116,7 @@ export class WeComHarnessBridge {
     private readonly ctx: Context,
     private readonly config: Config,
     private readonly clientFactory: WeComClientFactory = options => new WSClient(options),
+    private readonly cli?: WeComCliService | undefined,
   ) {
     if (!isAbsolute(config.cwd)) throw new Error(`wecom-channel: cwd must be absolute, got ${JSON.stringify(config.cwd)}`)
     if (!isAbsolute(config.inboundFileDirectory)) {
@@ -478,6 +480,10 @@ export class WeComHarnessBridge {
         })
         return
       }
+      if (command?.name === 'bot-cli') {
+        await this.sendReply(frame, { text: await this.cliStatusText(), images: [], cards: [] })
+        return
+      }
       // While an ask_user_question is open, the user's reply IS the answer:
       // settle the question, acknowledge the answer immediately, and let the
       // running turn continue instead of starting a new one.
@@ -554,10 +560,39 @@ export class WeComHarnessBridge {
       '/bot-card-test — 发送一张按钮交互模板卡片，检查卡片与按钮点击链路',
       '/bot-file-test — 发送一个文本附件，检查文件出站链路',
       '/bot-status — 查看当前会话状态',
+      '/bot-cli — wecom-cli 状态检查与安装/授权引导',
       '/bot-cancel — 取消当前生成',
       `已开放的 Harness 命令：${harnessCommands}（仅在当前 preset 注册后可用）`,
       '其他斜杠命令会被插件拒绝，不会送给模型；普通消息会交给当前 Harness 默认模型处理。',
     ].join('\n')
+  }
+
+  /** Human guidance for the three CLI states; probing errors stay soft. */
+  private async cliStatusText(): Promise<string> {
+    if (this.cli === undefined) return 'CLI 集成未在本通道启用。'
+    let probe
+    try {
+      probe = await this.cli.probe()
+    } catch {
+      return 'CLI 状态检查失败，请稍后重试（/bot-cli）。'
+    }
+    if (!probe.installed) {
+      return [
+        '企业微信官方命令行工具（wecom-cli）尚未安装。安装后，后续版本的插件可以让 AI 直接操作企微的文档、日程、待办等。',
+        '安装命令：npm install -g @wecom/cli',
+        '或在 DSH 设置页 → 企微插件 → CLI 集成 中一键安装。',
+      ].join('\n')
+    }
+    if (!probe.meetsMin) {
+      return `wecom-cli 版本 ${probe.version} 低于要求的 1.1.0。请升级：npm install -g @wecom/cli`
+    }
+    if (probe.auth !== 'authorized') {
+      return [
+        `wecom-cli ${probe.version} 已安装，但还未授权。`,
+        '请在 DSH 设置页 → 企微插件 → CLI 集成 中扫码授权（授权链接不在聊天中发送，避免被转发扩散）。',
+      ].join('\n')
+    }
+    return `wecom-cli ${probe.version} 已就绪（模型操作能力即将上线）。`
   }
 
   private commandReply(name: string, outcome: ConversationCommandReply): ConversationReply {

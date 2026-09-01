@@ -617,11 +617,27 @@ export class WeComHarnessBridge {
     let questionMode = false
     let closedText = ''
     let buffered = ''
-    const content = (): string => truncateUtf8(
-      activity ?? (text || '正在思考…'),
-      this.config.maxReplyBytes,
-      '',
-    )
+    // Heartbeat: silent phases (long tool executions, model thinking) emit no
+    // stream frames at all, so the bubble looks dead. A short interval re-sends
+    // a frame with animated dots (1→2→3→1) and elapsed time; 0 disables.
+    let beat = 0
+    const startedAt = Date.now()
+    const dots = (): string => '.'.repeat((beat % 3) + 1)
+    const elapsed = (): string => {
+      const total = Math.floor((Date.now() - startedAt) / 1000)
+      const minutes = Math.floor(total / 60)
+      return minutes > 0 ? `${minutes} 分 ${total % 60} 秒` : `${total} 秒`
+    }
+    const content = (): string => {
+      if (activity !== undefined) {
+        // Drop the static ellipsis from the activity line; the heartbeat dots
+        // replace it so the line visibly ticks while the tool keeps running.
+        const base = activity.replace(/[…‥.]+\s*$/u, '').trimEnd()
+        return truncateUtf8(`${base}${dots()}（已进行 ${elapsed()}）`, this.config.maxReplyBytes, '')
+      }
+      if (text.length > 0) return truncateUtf8(text, this.config.maxReplyBytes, '')
+      return truncateUtf8(`正在思考${dots()}`, this.config.maxReplyBytes, '')
+    }
     const flush = async (): Promise<void> => {
       if (settled || questionMode) return
       try {
@@ -633,6 +649,18 @@ export class WeComHarnessBridge {
       } catch (error) {
         this.log.warn('WeCom stream update failed: %s', String(error))
       }
+    }
+    let heartbeat: ReturnType<typeof setInterval> | undefined
+    const clearTimers = (): void => {
+      if (timer !== undefined) clearTimeout(timer)
+      if (heartbeat !== undefined) clearInterval(heartbeat)
+    }
+    if (this.config.streamHeartbeatMs > 0) {
+      heartbeat = setInterval(() => {
+        beat += 1
+        void flush()
+      }, this.config.streamHeartbeatMs)
+      heartbeat.unref?.()
     }
     const schedule = (): void => {
       if (pending || settled || questionMode) return
@@ -647,7 +675,7 @@ export class WeComHarnessBridge {
       if (questionMode || settled) return
       questionMode = true
       closedText = text
-      if (timer !== undefined) clearTimeout(timer)
+      clearTimers()
       pending = false
       const finalContent = truncateUtf8(overrideContent ?? (text || '请在下方选择：'), this.config.maxReplyBytes, '')
       try {
@@ -699,7 +727,7 @@ export class WeComHarnessBridge {
       },
       finish: async (reply) => {
         settled = true
-        if (timer !== undefined) clearTimeout(timer)
+        clearTimers()
         if (questionMode) {
           // Deliver only what was generated after the question: strip the
           // pre-question prefix (already finalized in the stream bubble) from
@@ -765,7 +793,7 @@ export class WeComHarnessBridge {
       fail: async (message) => {
         if (settled) return
         settled = true
-        if (timer !== undefined) clearTimeout(timer)
+        clearTimers()
         if (questionMode) {
           try {
             await this.sendProactive(target, { text: message, images: [], cards: [] })

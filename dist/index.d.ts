@@ -44,7 +44,10 @@ interface Config {
     inboundFileDirectory: string;
     welcomeText: string;
     startupTimeoutMs: number;
+    /** Turn inactivity limit: cancel only after this long with no session events. */
     responseTimeoutMs: number;
+    /** Streaming-bubble heartbeat interval; 0 disables the heartbeat. */
+    streamHeartbeatMs: number;
     mediaDownloadTimeoutMs: number;
     sendTimeoutMs: number;
     reconnectIntervalMs: number;

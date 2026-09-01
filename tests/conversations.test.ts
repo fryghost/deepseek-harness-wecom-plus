@@ -36,6 +36,59 @@ function mockAgentCtx(section: unknown, register: unknown): never {
   } as never
 }
 
+/** Controllable agent + ctx capturing the global session/event feed (for watchdog tests). */
+function watchdogHarness() {
+  const events: unknown[] = []
+  let idle = true
+  const waiters: Array<() => void> = []
+  const agent = {
+    get status(): string { return idle ? 'idle' : 'running' },
+    options: { provider: 'deepseek', model: 'deepseek-chat' },
+    session: { events },
+    followup: vi.fn(() => { idle = false }),
+    whenIdle: vi.fn(() => idle
+      ? Promise.resolve()
+      : new Promise<void>(resolve => { waiters.push(resolve) })),
+    cancel: vi.fn(() => {
+      idle = true
+      for (const release of waiters.splice(0)) release()
+    }),
+  }
+  let sessionEvent: ((session: { id: string }, event: unknown) => void) | undefined
+  const register = vi.fn(() => vi.fn())
+  const ctx = {
+    on: vi.fn((_event: string, handler: (session: { id: string }, event: unknown) => void) => {
+      sessionEvent = handler
+      return vi.fn()
+    }),
+    sessionPersistence: { list: vi.fn(async () => []) },
+    agentDefaultModel: { currentSelection: vi.fn(() => ({ provider: 'deepseek', model: 'deepseek-chat' })) },
+    agentPresets: { defaultId: 'standard', mount: vi.fn(async () => ({ id: 'standard' })) },
+    llm: { resolveModelInfo: vi.fn(async () => ({ inputModalities: ['text'] })) },
+    agents: {
+      create: vi.fn(async (options: { setup?: (ctx: never) => Promise<void> }) => {
+        await options.setup?.(mockAgentCtx(vi.fn(() => vi.fn()), register))
+        return { agent, dispose: vi.fn(async () => undefined) }
+      }),
+      get: vi.fn(),
+    },
+    attachments: {
+      imageLimits: { maxImagesPerMessage: 4, maxMessageImageBytes: 10_000, maxImageBytes: 10_000 },
+    },
+  } as never
+  return {
+    agent,
+    ctx,
+    emit: (sessionId: string, event: unknown): void => sessionEvent?.({ id: sessionId }, event),
+    finishTurn(text: string): void {
+      events.push({ type: 'assistant/message', data: { message: { content: [{ type: 'text', text }] } } })
+      events.push({ type: 'turn/end', data: { reason: { kind: 'stop' } } })
+      idle = true
+      for (const release of waiters.splice(0)) release()
+    },
+  }
+}
+
 function textMessage(userid: string, msgid: string, content = 'hello'): never {
   return {
     msgid,
@@ -786,5 +839,71 @@ describe('ConversationManager', () => {
       answers: [{ id: 'ask-1', selected: ['回滚'] }],
     })
     await manager.dispose()
+  })
+
+  it('keeps a long turn alive while session events keep arriving', async () => {
+    vi.useFakeTimers()
+    try {
+      const config = testConfig({ responseTimeoutMs: 1_000 })
+      const harness = watchdogHarness()
+      const manager = new ConversationManager(
+        harness.ctx,
+        config,
+        vi.fn(async () => undefined),
+        vi.fn(async () => undefined),
+        vi.fn(async () => undefined),
+      )
+      await manager.initialize()
+
+      const transport = noopTransport()
+      const message = textMessage('u-long', 'm-long')
+      const pending = manager.process(message, downloadPort, transport)
+      await vi.advanceTimersByTimeAsync(1)
+
+      // Ten seconds of steady progress against a one-second idle window:
+      // every event refreshes the watchdog, so nothing is ever cancelled.
+      const sid = sessionIdFor(config.accountId, message)
+      for (let i = 0; i < 12; i++) {
+        await vi.advanceTimersByTimeAsync(800)
+        harness.emit(sid, { type: 'assistant/chunk', data: { chunk: { type: 'text-delta', text: 'x' } } })
+      }
+      expect(harness.agent.cancel).not.toHaveBeenCalled()
+      expect(transport.pushText).toHaveBeenCalledTimes(12)
+
+      harness.finishTurn('slow but done')
+      const reply = await pending
+      expect(reply.text).toBe('slow but done')
+      expect(transport.finish).toHaveBeenCalledOnce()
+      await manager.dispose()
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('cancels a turn that stops emitting events for the whole idle window', async () => {
+    vi.useFakeTimers()
+    try {
+      const config = testConfig({ responseTimeoutMs: 1_000 })
+      const harness = watchdogHarness()
+      const manager = new ConversationManager(
+        harness.ctx,
+        config,
+        vi.fn(async () => undefined),
+        vi.fn(async () => undefined),
+        vi.fn(async () => undefined),
+      )
+      await manager.initialize()
+
+      const transport = noopTransport()
+      const pending = manager.process(textMessage('u-stall', 'm-stall'), downloadPort, transport)
+      await vi.advanceTimersByTimeAsync(1_100)
+
+      await expect(pending).rejects.toThrow('stalled')
+      expect(harness.agent.cancel).toHaveBeenCalledOnce()
+      expect(transport.fail).toHaveBeenCalledWith(expect.stringContaining('生成超时'))
+      await manager.dispose()
+    } finally {
+      vi.useRealTimers()
+    }
   })
 })

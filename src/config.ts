@@ -55,7 +55,10 @@ export interface Config {
   inboundFileDirectory: string
   welcomeText: string
   startupTimeoutMs: number
+  /** Turn inactivity limit: cancel only after this long with no session events. */
   responseTimeoutMs: number
+  /** Streaming-bubble heartbeat interval; 0 disables the heartbeat. */
+  streamHeartbeatMs: number
   mediaDownloadTimeoutMs: number
   sendTimeoutMs: number
   reconnectIntervalMs: number
@@ -92,7 +95,15 @@ export const Config: z<Config> = z.object({
   inboundFileDirectory: z.string().default(DEFAULT_WECOM_INBOUND_FILE_DIRECTORY),
   welcomeText: z.string().default(''),
   startupTimeoutMs: z.number().step(1).min(1).default(30_000),
+  // Turn INACTIVITY limit: a running turn is cancelled only after this much
+  // time with no session events (text deltas, tool calls, step boundaries).
+  // A long turn that keeps producing events is never killed, no matter how
+  // long it runs in total.
   responseTimeoutMs: z.number().step(1).min(1).default(300_000),
+  // Streaming-bubble heartbeat: when nothing streams for this long, re-send a
+  // frame with animated dots and elapsed time so the bubble visibly stays
+  // alive during silent phases (long tool executions, model thinking). 0 disables.
+  streamHeartbeatMs: z.number().step(1).min(0).max(300_000).default(5_000),
   mediaDownloadTimeoutMs: z.number().step(1).min(1).default(30_000),
   sendTimeoutMs: z.number().step(1).min(1).default(30_000),
   reconnectIntervalMs: z.number().step(1).min(100).default(1_000),

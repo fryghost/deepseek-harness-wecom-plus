@@ -13,6 +13,7 @@
 - **ask_user_question 卡片桥接**：模型在企微会话里调用 `ask_user_question` 提问时，自动呈现为「Markdown 完整说明 + 模板卡片」——Markdown 承载问题与选项全文，卡片只做选择器且不截断任何内容：2~6 个短标签单选（≤6 字）用按钮卡（等权选项统一灰色），多选或 7~20 个选项且标签 ≤11 字用投票卡，标签更长/选项更多/开放问题用文字卡（回复数字 `1` 或 `1,3`、选项名或直接文字作答）；答案回填后模型继续本轮，不再挂起超时。
 - 新增 `/bot-card-test` 自检命令，无需模型即可验证卡片与按钮交互链路。
 - 新增 `cardMode`、`cardTaskIdPrefix`、`cardClickAckTitle`、`cardClickAckSubtitle`、`questionTimeoutMs` 配置项。
+- **长任务不误杀、不装死**：回合超时改为空闲看门狗——只要持续产出事件（文本增量、工具调用、step 边界）就永不打断，仅当 `responseTimeoutMs` 内毫无进展才取消；静默期每 `streamHeartbeatMs`（默认 5 秒，0 关闭）发送心跳帧，点动画 `.`/`..`/`...` 循环并显示已进行时长，气泡肉眼可见地保持活跃。
 
 ## 功能
 

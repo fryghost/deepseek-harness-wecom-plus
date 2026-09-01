@@ -974,6 +974,7 @@ var ConversationManager = class {
     this.disposeSessionEvents = ctx.on("session/event", (session, event) => {
       const active = this.activeStreams.get(String(session.id));
       if (active === void 0) return;
+      active.lastEventAt = Date.now();
       if (event.type === "step/start") {
         active.text = "";
         active.activity = void 0;
@@ -1211,16 +1212,16 @@ var ConversationManager = class {
     await withTimeout(agent.whenIdle(), this.config.responseTimeoutMs, "DeepSeek Harness conversation availability");
     const start = agent.session.events.length;
     this.activeTurns.set(id, chatTarget(message));
-    const stream = { transport, text: "", activity: void 0 };
+    const stream = { transport, text: "", activity: void 0, lastEventAt: Date.now() };
     this.activeStreams.set(id, stream);
     try {
       agent.followup(createUserMessage({ content, source: { kind: "user" } }));
       try {
-        await withTimeout(agent.whenIdle(), this.config.responseTimeoutMs, "DeepSeek Harness response");
+        await this.awaitTurnCompletion(agent, stream);
       } catch (error) {
         agent.cancel({ kind: "user" });
         await agent.whenIdle();
-        await transport.fail("\u5904\u7406\u8D85\u65F6\uFF0C\u5DF2\u53D6\u6D88\u672C\u6B21\u751F\u6210\uFF0C\u8BF7\u91CD\u65B0\u53D1\u9001\u3002");
+        await transport.fail("\u751F\u6210\u8D85\u65F6\uFF08\u957F\u65F6\u95F4\u6CA1\u6709\u4EFB\u4F55\u8FDB\u5C55\uFF09\uFF0C\u5DF2\u53D6\u6D88\u672C\u6B21\u751F\u6210\uFF0C\u8BF7\u91CD\u65B0\u53D1\u9001\u3002");
         throw error;
       }
       const collected = await this.collectReply(agent, agent.session.events.slice(start));
@@ -1234,6 +1235,42 @@ var ConversationManager = class {
       this.activeStreams.delete(id);
       this.activeTurns.delete(id);
     }
+  }
+  /**
+   * Wait for the turn to finish, giving up only after `responseTimeoutMs`
+   * with NO session events for this stream. A long turn that keeps emitting
+   * events (text deltas, tool calls, step boundaries) is healthy no matter
+   * how long it runs in total; only a truly wedged agent — which stops
+   * emitting entirely — is cancelled, so the conversation queue cannot wedge
+   * forever without killing legitimately long work.
+   */
+  awaitTurnCompletion(agent, stream) {
+    return new Promise((resolve2, reject) => {
+      let settled = false;
+      let timer;
+      const settle = (outcome) => {
+        if (settled) return;
+        settled = true;
+        if (timer !== void 0) clearTimeout(timer);
+        if (outcome === true) resolve2();
+        else reject(outcome);
+      };
+      void agent.whenIdle().then(
+        () => settle(true),
+        (error) => settle(error instanceof Error ? error : new Error(String(error)))
+      );
+      const arm = () => {
+        const remaining = stream.lastEventAt + this.config.responseTimeoutMs - Date.now();
+        timer = setTimeout(() => {
+          if (settled) return;
+          if (agent.status === "idle") return settle(true);
+          const idleFor = Date.now() - stream.lastEventAt;
+          if (idleFor < this.config.responseTimeoutMs) return arm();
+          settle(new Error(`DeepSeek Harness response stalled: no session event within ${this.config.responseTimeoutMs}ms`));
+        }, Math.max(remaining, 1));
+      };
+      arm();
+    });
   }
   async processCardEventNow(id, message, selectedLabel, transport) {
     const binding = await this.getOrCreate(id);
@@ -1256,16 +1293,16 @@ var ConversationManager = class {
     await withTimeout(agent.whenIdle(), this.config.responseTimeoutMs, "DeepSeek Harness conversation availability");
     const start = agent.session.events.length;
     this.activeTurns.set(id, chatTarget(message));
-    const stream = { transport, text: "", activity: void 0 };
+    const stream = { transport, text: "", activity: void 0, lastEventAt: Date.now() };
     this.activeStreams.set(id, stream);
     try {
       agent.followup(createUserMessage({ content, source: { kind: "user" } }));
       try {
-        await withTimeout(agent.whenIdle(), this.config.responseTimeoutMs, "DeepSeek Harness response");
+        await this.awaitTurnCompletion(agent, stream);
       } catch (error) {
         agent.cancel({ kind: "user" });
         await agent.whenIdle();
-        await transport.fail("\u5904\u7406\u8D85\u65F6\uFF0C\u5DF2\u53D6\u6D88\u672C\u6B21\u751F\u6210\uFF0C\u8BF7\u91CD\u65B0\u53D1\u9001\u3002");
+        await transport.fail("\u751F\u6210\u8D85\u65F6\uFF08\u957F\u65F6\u95F4\u6CA1\u6709\u4EFB\u4F55\u8FDB\u5C55\uFF09\uFF0C\u5DF2\u53D6\u6D88\u672C\u6B21\u751F\u6210\uFF0C\u8BF7\u91CD\u65B0\u53D1\u9001\u3002");
         throw error;
       }
       const collected = await this.collectReply(agent, agent.session.events.slice(start));
@@ -2218,11 +2255,22 @@ ${outcome.response.text}` : direct;
     let questionMode = false;
     let closedText = "";
     let buffered = "";
-    const content = () => truncateUtf8(
-      activity ?? (text || "\u6B63\u5728\u601D\u8003\u2026"),
-      this.config.maxReplyBytes,
-      ""
-    );
+    let beat = 0;
+    const startedAt = Date.now();
+    const dots = () => ".".repeat(beat % 3 + 1);
+    const elapsed = () => {
+      const total = Math.floor((Date.now() - startedAt) / 1e3);
+      const minutes = Math.floor(total / 60);
+      return minutes > 0 ? `${minutes} \u5206 ${total % 60} \u79D2` : `${total} \u79D2`;
+    };
+    const content = () => {
+      if (activity !== void 0) {
+        const base = activity.replace(/[…‥.]+\s*$/u, "").trimEnd();
+        return truncateUtf8(`${base}${dots()}\uFF08\u5DF2\u8FDB\u884C ${elapsed()}\uFF09`, this.config.maxReplyBytes, "");
+      }
+      if (text.length > 0) return truncateUtf8(text, this.config.maxReplyBytes, "");
+      return truncateUtf8(`\u6B63\u5728\u601D\u8003${dots()}`, this.config.maxReplyBytes, "");
+    };
     const flush = async () => {
       if (settled || questionMode) return;
       try {
@@ -2235,6 +2283,18 @@ ${outcome.response.text}` : direct;
         this.log.warn("WeCom stream update failed: %s", String(error));
       }
     };
+    let heartbeat;
+    const clearTimers = () => {
+      if (timer !== void 0) clearTimeout(timer);
+      if (heartbeat !== void 0) clearInterval(heartbeat);
+    };
+    if (this.config.streamHeartbeatMs > 0) {
+      heartbeat = setInterval(() => {
+        beat += 1;
+        void flush();
+      }, this.config.streamHeartbeatMs);
+      heartbeat.unref?.();
+    }
     const schedule = () => {
       if (pending || settled || questionMode) return;
       pending = true;
@@ -2247,7 +2307,7 @@ ${outcome.response.text}` : direct;
       if (questionMode || settled) return;
       questionMode = true;
       closedText = text;
-      if (timer !== void 0) clearTimeout(timer);
+      clearTimers();
       pending = false;
       const finalContent = truncateUtf8(overrideContent ?? (text || "\u8BF7\u5728\u4E0B\u65B9\u9009\u62E9\uFF1A"), this.config.maxReplyBytes, "");
       try {
@@ -2291,7 +2351,7 @@ ${outcome.response.text}` : direct;
       },
       finish: async (reply) => {
         settled = true;
-        if (timer !== void 0) clearTimeout(timer);
+        clearTimers();
         if (questionMode) {
           const full = reply.text.trim();
           const prefix = closedText.trim();
@@ -2351,7 +2411,7 @@ ${outcome.response.text}` : direct;
       fail: async (message) => {
         if (settled) return;
         settled = true;
-        if (timer !== void 0) clearTimeout(timer);
+        clearTimers();
         if (questionMode) {
           try {
             await this.sendProactive(target, { text: message, images: [], cards: [] });
@@ -2635,7 +2695,15 @@ var Config = z.object({
   inboundFileDirectory: z.string().default(DEFAULT_WECOM_INBOUND_FILE_DIRECTORY),
   welcomeText: z.string().default(""),
   startupTimeoutMs: z.number().step(1).min(1).default(3e4),
+  // Turn INACTIVITY limit: a running turn is cancelled only after this much
+  // time with no session events (text deltas, tool calls, step boundaries).
+  // A long turn that keeps producing events is never killed, no matter how
+  // long it runs in total.
   responseTimeoutMs: z.number().step(1).min(1).default(3e5),
+  // Streaming-bubble heartbeat: when nothing streams for this long, re-send a
+  // frame with animated dots and elapsed time so the bubble visibly stays
+  // alive during silent phases (long tool executions, model thinking). 0 disables.
+  streamHeartbeatMs: z.number().step(1).min(0).max(3e5).default(5e3),
   mediaDownloadTimeoutMs: z.number().step(1).min(1).default(3e4),
   sendTimeoutMs: z.number().step(1).min(1).default(3e4),
   reconnectIntervalMs: z.number().step(1).min(100).default(1e3),
@@ -2658,7 +2726,7 @@ import {
 } from "@deepseek-ai/dsh-settings";
 
 // src/version.ts
-var PLUGIN_VERSION = "0.8.0";
+var PLUGIN_VERSION = "0.8.3";
 
 // src/settings-web.ts
 var SETTINGS_ROUTE = "/_dsh/deepseek-harness-wecom-plus/settings";

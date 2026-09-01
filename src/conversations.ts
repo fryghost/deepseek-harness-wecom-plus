@@ -96,6 +96,8 @@ interface ActiveStream {
   transport: TurnTransport
   text: string
   activity: string | undefined
+  /** Timestamp of the latest session event; drives the inactivity watchdog. */
+  lastEventAt: number
 }
 
 /** Bound on remembered card registries; oldest tasks are evicted first. */
@@ -139,6 +141,9 @@ export class ConversationManager {
     this.disposeSessionEvents = ctx.on('session/event', (session, event) => {
       const active = this.activeStreams.get(String(session.id))
       if (active === undefined) return
+      // EVERY event counts as progress for the inactivity watchdog: a turn
+      // that emits anything at all is healthy no matter how long it runs.
+      active.lastEventAt = Date.now()
       if (event.type === 'step/start') {
         // A new step (possibly after a retried request) restarts the visible text.
         active.text = ''
@@ -391,18 +396,18 @@ export class ConversationManager {
     await withTimeout(agent.whenIdle(), this.config.responseTimeoutMs, 'DeepSeek Harness conversation availability')
     const start = agent.session.events.length
     this.activeTurns.set(id, chatTarget(message))
-    const stream: ActiveStream = { transport, text: '', activity: undefined }
+    const stream: ActiveStream = { transport, text: '', activity: undefined, lastEventAt: Date.now() }
     this.activeStreams.set(id, stream)
     try {
       agent.followup(createUserMessage({ content, source: { kind: 'user' } }))
       try {
-        await withTimeout(agent.whenIdle(), this.config.responseTimeoutMs, 'DeepSeek Harness response')
+        await this.awaitTurnCompletion(agent, stream)
       } catch (error) {
         // A wedged turn blocks the conversation queue forever; cancel it and
         // say so through the live stream instead of a silent error card.
         agent.cancel({ kind: 'user' })
         await agent.whenIdle()
-        await transport.fail('处理超时，已取消本次生成，请重新发送。')
+        await transport.fail('生成超时（长时间没有任何进展），已取消本次生成，请重新发送。')
         throw error
       }
       const collected = await this.collectReply(agent, agent.session.events.slice(start))
@@ -420,6 +425,45 @@ export class ConversationManager {
       this.activeStreams.delete(id)
       this.activeTurns.delete(id)
     }
+  }
+
+  /**
+   * Wait for the turn to finish, giving up only after `responseTimeoutMs`
+   * with NO session events for this stream. A long turn that keeps emitting
+   * events (text deltas, tool calls, step boundaries) is healthy no matter
+   * how long it runs in total; only a truly wedged agent — which stops
+   * emitting entirely — is cancelled, so the conversation queue cannot wedge
+   * forever without killing legitimately long work.
+   */
+  private awaitTurnCompletion(agent: Agent, stream: ActiveStream): Promise<void> {
+    return new Promise((resolve, reject) => {
+      let settled = false
+      let timer: ReturnType<typeof setTimeout> | undefined
+      const settle = (outcome: true | Error): void => {
+        if (settled) return
+        settled = true
+        if (timer !== undefined) clearTimeout(timer)
+        if (outcome === true) resolve()
+        else reject(outcome)
+      }
+      void agent.whenIdle().then(
+        () => settle(true),
+        error => settle(error instanceof Error ? error : new Error(String(error))),
+      )
+      const arm = (): void => {
+        const remaining = stream.lastEventAt + this.config.responseTimeoutMs - Date.now()
+        timer = setTimeout(() => {
+          if (settled) return
+          if (agent.status === 'idle') return settle(true)
+          // Events may have arrived after this timer was armed; re-check and
+          // re-arm for the remaining window instead of trusting the deadline.
+          const idleFor = Date.now() - stream.lastEventAt
+          if (idleFor < this.config.responseTimeoutMs) return arm()
+          settle(new Error(`DeepSeek Harness response stalled: no session event within ${this.config.responseTimeoutMs}ms`))
+        }, Math.max(remaining, 1))
+      }
+      arm()
+    })
   }
 
   private async processCardEventNow(
@@ -449,16 +493,16 @@ export class ConversationManager {
     await withTimeout(agent.whenIdle(), this.config.responseTimeoutMs, 'DeepSeek Harness conversation availability')
     const start = agent.session.events.length
     this.activeTurns.set(id, chatTarget(message))
-    const stream: ActiveStream = { transport, text: '', activity: undefined }
+    const stream: ActiveStream = { transport, text: '', activity: undefined, lastEventAt: Date.now() }
     this.activeStreams.set(id, stream)
     try {
       agent.followup(createUserMessage({ content, source: { kind: 'user' } }))
       try {
-        await withTimeout(agent.whenIdle(), this.config.responseTimeoutMs, 'DeepSeek Harness response')
+        await this.awaitTurnCompletion(agent, stream)
       } catch (error) {
         agent.cancel({ kind: 'user' })
         await agent.whenIdle()
-        await transport.fail('处理超时，已取消本次生成，请重新发送。')
+        await transport.fail('生成超时（长时间没有任何进展），已取消本次生成，请重新发送。')
         throw error
       }
       const collected = await this.collectReply(agent, agent.session.events.slice(start))

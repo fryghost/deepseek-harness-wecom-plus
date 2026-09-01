@@ -12,6 +12,7 @@ import type {
 } from '@wecom/aibot-node-sdk'
 import { EventType } from '@wecom/aibot-node-sdk'
 import { WeComHarnessBridge } from '../src/bridge.js'
+import { sessionIdFor } from '../src/util.js'
 import { testConfig } from './fixtures.js'
 
 interface SentReply {
@@ -268,8 +269,9 @@ describe('WeComHarnessBridge', () => {
     await bridge.start()
     await client.message(textMessage('hello model', 'm-model'))
 
-    // The stream opens with a thinking frame, then finishes with the reply.
-    expect(client.replies[0]?.content).toBe('正在思考…')
+    // The stream opens with a thinking frame (heartbeat dots start at one),
+    // then finishes with the reply.
+    expect(client.replies[0]?.content).toBe('正在思考.')
     expect(client.replies[0]?.finish).toBe(false)
     const final = client.replies.find(reply => reply.finish !== false)
     expect(final?.content).toBe('# Model reply\n\n- first\n- second')
@@ -556,5 +558,105 @@ describe('WeComHarnessBridge', () => {
     await client.message(textMessage('/bot-ping', 'm-denied'))
     expect(client.replies).toEqual([])
     await bridge.stop()
+  })
+
+  it('heartbeats the stream with cycling dots while the turn is silent', async () => {
+    const client = new FakeClient()
+    const events: unknown[] = []
+    let idle = true
+    const waiters: Array<() => void> = []
+    let sessionEvent: ((session: { id: string }, event: unknown) => void) | undefined
+    const config = testConfig({ streamHeartbeatMs: 100 })
+    const message = textMessage('busy work', 'm-heartbeat')
+    const agent = {
+      get status(): string { return idle ? 'idle' : 'running' },
+      options: { provider: 'deepseek', model: 'deepseek-chat' },
+      session: { events },
+      followup: vi.fn(() => {
+        idle = false
+        // A tool call starts streaming, then the tool executes silently.
+        sessionEvent?.({ id: sessionIdFor(config.accountId, message) }, {
+          type: 'assistant/chunk',
+          data: { chunk: { type: 'tool-call-delta', name: 'bash' } },
+        })
+      }),
+      whenIdle: vi.fn(() => idle
+        ? Promise.resolve()
+        : new Promise<void>(resolve => { waiters.push(resolve) })),
+      cancel: vi.fn(() => {
+        idle = true
+        for (const release of waiters.splice(0)) release()
+      }),
+    }
+    const ctx = {
+      logger: vi.fn(() => ({ info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() })),
+      on: vi.fn((event: string, handler: (session: { id: string }, ev: unknown) => void) => {
+        if (event === 'session/event') sessionEvent = handler
+        return vi.fn()
+      }),
+      credentials: { resolve: vi.fn(async () => ({ value: 'resolved-secret', source: 'test' })) },
+      commands: { execute: vi.fn() },
+      sessionPersistence: { list: vi.fn(async () => []) },
+      agentDefaultModel: { currentSelection: vi.fn(() => ({ provider: 'deepseek', model: 'deepseek-chat' })) },
+      agentPresets: { defaultId: 'standard', mount: vi.fn(async () => ({ id: 'standard' })) },
+      llm: { resolveModelInfo: vi.fn(async () => ({ inputModalities: ['text'] })) },
+      agents: {
+        create: vi.fn(async (options: { setup?: (ctx: never) => Promise<void> }) => {
+          await options.setup?.({
+            systemPrompt: { section: vi.fn(() => vi.fn()) },
+            tools: { register: vi.fn(() => vi.fn()) },
+            get: vi.fn(() => undefined),
+            reflect: { provide: vi.fn(() => vi.fn()) },
+            effect: vi.fn(() => () => {}),
+          } as never)
+          return { agent, dispose: vi.fn(async () => undefined) }
+        }),
+        get: vi.fn(),
+      },
+      attachments: {
+        imageLimits: { maxImagesPerMessage: 4, maxMessageImageBytes: 10_000, maxImageBytes: 10_000 },
+        readImage: vi.fn(async () => ({
+          ref: { attachmentId: 'sha256:x', mediaType: 'image/png', bytes: 3, width: 1, height: 1 },
+          data: new Uint8Array([1, 2, 3]),
+        })),
+      },
+    } as never
+    const bridge = new WeComHarnessBridge(ctx, config, () => client as never)
+    await bridge.start()
+
+    vi.useFakeTimers()
+    try {
+      const pending = client.message(message)
+      await vi.advanceTimersByTimeAsync(1)
+      await vi.advanceTimersByTimeAsync(600)
+
+      // The activity line ticks with 1→2→3→1 dots plus elapsed time.
+      const frames = client.replies
+        .filter(reply => reply.content.startsWith('正在执行工具'))
+        .map(reply => reply.content)
+      expect(frames.length).toBeGreaterThanOrEqual(5)
+      expect(frames.some(frame => frame.includes('`bash`.（已进行 0 秒）'))).toBe(true)
+      expect(frames.some(frame => frame.includes('`bash`..（已进行'))).toBe(true)
+      expect(frames.some(frame => frame.includes('`bash`...（已进行'))).toBe(true)
+      const threeDots = frames.findIndex(frame => frame.includes('`bash`...（已进行'))
+      expect(frames.slice(threeDots + 1).some(frame => frame.includes('`bash`.（已进行'))).toBe(true)
+
+      // Finishing the turn stops the heartbeat and delivers the final frame.
+      events.push({
+        type: 'assistant/message',
+        data: { message: { content: [{ type: 'text', text: '终于完成' }] } },
+      })
+      events.push({ type: 'turn/end', data: { reason: { kind: 'stop' } } })
+      idle = true
+      for (const release of waiters.splice(0)) release()
+      await pending
+      const streaming = client.replies.filter(reply => reply.finish === false).length
+      await vi.advanceTimersByTimeAsync(300)
+      expect(client.replies.filter(reply => reply.finish === false)).toHaveLength(streaming)
+      expect(client.replies.find(reply => reply.finish === true)?.content).toBe('终于完成')
+    } finally {
+      vi.useRealTimers()
+      await bridge.stop()
+    }
   })
 })

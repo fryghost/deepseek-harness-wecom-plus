@@ -27,12 +27,20 @@ interface UserSettings {
   welcomeText: string
 }
 
+interface CliInfo {
+  installed: boolean
+  version?: string
+  meetsMin: boolean
+  auth: 'authorized' | 'unauthorized' | 'unknown'
+}
+
 interface Snapshot {
   schemaVersion: 1
   writable: boolean
   settings: { value: UserSettings; revision: number; applies: 'live' }
   credential: { ref: string; configured: boolean; source?: string; writable: boolean }
   channel: ChannelStatus
+  cli?: CliInfo
   release: { pluginVersion: string }
 }
 
@@ -141,6 +149,15 @@ export class WeComSettingsController {
       this.set({ ...this.state, action: undefined, error: error instanceof Error ? error.message : String(error) })
     }
   }
+
+  /** Run one CLI action against the backend; returns the action payload. */
+  async cliAction(action: 'cli-probe' | 'cli-install' | 'cli-authorize' | 'cli-auth-status' | 'cli-cancel-auth'): Promise<unknown> {
+    return apiRequest<unknown>({
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ action }),
+    })
+  }
 }
 
 interface SettingsInjected {
@@ -226,6 +243,138 @@ function SettingsSection(props: SettingsProps) {
     <SectionErrorBoundary>
       <LoadedSettings controller={controller} />
     </SectionErrorBoundary>
+  )
+}
+
+function CliCard({ controller, initial }: { controller: WeComSettingsController; initial: CliInfo | undefined }) {
+  const [cli, setCli] = useState<CliInfo | undefined>(initial)
+  const [busy, setBusy] = useState<'probe' | 'install' | 'auth' | undefined>(undefined)
+  const [installOutput, setInstallOutput] = useState('')
+  const [error, setError] = useState<string | undefined>(undefined)
+  const [qr, setQr] = useState<string | undefined>(undefined)
+
+  const probe = async (): Promise<void> => {
+    setBusy('probe')
+    setError(undefined)
+    try {
+      setCli(await controller.cliAction('cli-probe') as CliInfo)
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : String(cause))
+    } finally {
+      setBusy(undefined)
+    }
+  }
+
+  const install = async (): Promise<void> => {
+    setBusy('install')
+    setError(undefined)
+    setInstallOutput('')
+    try {
+      const result = await controller.cliAction('cli-install') as { outcome: string; output: string; probe: CliInfo }
+      setInstallOutput(result.output)
+      setCli(result.probe)
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : String(cause))
+    } finally {
+      setBusy(undefined)
+    }
+  }
+
+  const authorize = async (): Promise<void> => {
+    setBusy('auth')
+    setError(undefined)
+    try {
+      const result = await controller.cliAction('cli-authorize') as { outcome: string; qrDataUrl?: string }
+      if (result.outcome === 'started' && result.qrDataUrl !== undefined) setQr(result.qrDataUrl)
+      else setError(result.outcome === 'in-progress' ? '已有授权流程在进行中。' : '未能取得授权链接，请重试。')
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : String(cause))
+    } finally {
+      setBusy(undefined)
+    }
+  }
+
+  const cancelAuth = async (): Promise<void> => {
+    setQr(undefined)
+    try { await controller.cliAction('cli-cancel-auth') } catch { /* state refresh below is enough */ }
+  }
+
+  // While the QR is up, poll the backend; a scan flips the card to authorized.
+  useEffect(() => {
+    if (qr === undefined) return
+    const timer = setInterval(async () => {
+      try {
+        const status = await controller.cliAction('cli-auth-status') as { auth: CliInfo['auth']; waiting: boolean }
+        if (status.auth === 'authorized') {
+          setQr(undefined)
+          setCli(current => current === undefined ? current : { ...current, auth: 'authorized' })
+        } else if (!status.waiting) {
+          setQr(undefined)
+        }
+      } catch { /* transient backend hiccup: keep polling */ }
+    }, 2_000)
+    return () => { clearInterval(timer) }
+  }, [qr, controller])
+
+  const dotClass = cli === undefined ? '' : !cli.installed || !cli.meetsMin || cli.auth !== 'authorized' ? 'warn' : 'ok'
+  const statusText = cli === undefined
+    ? '未检测'
+    : !cli.installed
+      ? '未安装'
+      : !cli.meetsMin
+        ? `版本过低 · v${cli.version}（需 ≥1.1.0）`
+        : cli.auth === 'authorized'
+          ? `已授权 · v${cli.version}`
+          : `已安装 · v${cli.version} · 待授权`
+
+  return (
+    <section className="wc-panel">
+      <div className="wc-panel-title">
+        <div>
+          <h3>CLI 集成</h3>
+          <p>检测企业微信官方命令行工具（wecom-cli）的安装与授权状态。安装并授权后，后续版本的插件可让 AI 直接操作企微的文档、日程、待办等。</p>
+        </div>
+        <button type="button" className="wc-button" disabled={busy !== undefined} onClick={() => { void probe() }}>
+          {busy === 'probe' ? '检测中…' : '重新检测'}
+        </button>
+      </div>
+      <div className="wc-cli-status">
+        <span className={`wc-cli-dot ${dotClass}`} />
+        <strong>{statusText}</strong>
+      </div>
+      {error === undefined ? null : <div className="wc-alert error">{error}</div>}
+      {cli !== undefined && (!cli.installed || !cli.meetsMin)
+        ? (
+          <div className="wc-cli-actions">
+            <button type="button" className="wc-button primary" disabled={busy !== undefined} onClick={() => { void install() }}>
+              {busy === 'install' ? '安装中…' : '一键安装 / 升级'}
+            </button>
+            <code>npm install -g @wecom/cli</code>
+          </div>
+        )
+        : null}
+      {installOutput === '' ? null : <pre className="wc-cli-output">{installOutput}</pre>}
+      {cli !== undefined && cli.installed && cli.meetsMin && cli.auth !== 'authorized'
+        ? (
+          <div className="wc-cli-actions">
+            {qr === undefined
+              ? <button type="button" className="wc-button primary" disabled={busy !== undefined} onClick={() => { void authorize() }}>
+                  {busy === 'auth' ? '准备中…' : '发起授权'}
+                </button>
+              : (
+                <div className="wc-cli-qr">
+                  <img src={qr} alt="wecom-cli 授权二维码" width={160} height={160} />
+                  <small>用手机企业微信扫码完成授权。CLI 将以授权真人身份操作企业微信。</small>
+                  <button type="button" className="wc-button" onClick={() => { void cancelAuth() }}>取消</button>
+                </div>
+              )}
+          </div>
+        )
+        : null}
+      {cli !== undefined && cli.installed && cli.meetsMin && cli.auth === 'authorized'
+        ? <small className="wc-cli-note">已就绪。模型操作能力即将上线，届时无需再次授权。</small>
+        : null}
+    </section>
   )
 }
 
@@ -364,6 +513,8 @@ function LoadedSettings({ controller }: SettingsInjected) {
         </div>
       </section>
 
+      <CliCard controller={controller} initial={snapshot.cli} />
+
       <div className="wc-save-row">
         <button type="button" className="wc-button primary" disabled={!snapshot.writable || busy} onClick={() => { void controller.save(draft, snapshot.settings.revision) }}>
           {state.action === 'save' ? '保存中…' : '保存并应用'}
@@ -371,24 +522,28 @@ function LoadedSettings({ controller }: SettingsInjected) {
         <button type="button" className="wc-button" disabled={busy} onClick={() => { void controller.load() }}>重新加载</button>
       </div>
 
-      <section className="wc-panel">
-        <div className="wc-panel-title">
-          <div><h3>企微内自检</h3><p>连接成功后，在企微中向机器人发送以下命令即可验证整条链路。</p></div>
-        </div>
+      <details className="wc-details">
+        <summary>
+          <div>
+            <h3>企微内自检</h3>
+            <p>连接成功后，在企微中向机器人发送以下命令即可验证整条链路。</p>
+          </div>
+        </summary>
         <ul className="wc-checklist">
           <li><code>/bot-ping</code> — 连通性检查</li>
           <li><code>/bot-card-test</code> — 模板卡片与按钮交互检查</li>
           <li><code>/bot-image-test</code> — 图片回复检查</li>
           <li><code>/bot-file-test</code> — 文件发送检查</li>
+          <li><code>/bot-cli</code> — wecom-cli 状态检查与引导</li>
           <li><code>/help</code> — 查看全部命令</li>
         </ul>
-      </section>
+      </details>
     </div>
   )
 }
 
 const CSS = `
-.wc-settings{display:grid;gap:14px;max-width:900px;padding:8px 2px 32px;color:var(--dsw-alias-fg-primary,#26231f)}
+.wc-settings{display:grid;gap:14px;max-width:900px;padding:8px 2px 32px;color:var(--dsw-alias-fg-primary,#26231f);contain:content}
 .wc-settings-header{display:flex;justify-content:space-between;gap:20px;align-items:flex-start;padding:8px 2px}
 .wc-settings-header h2{font-size:25px;letter-spacing:-.025em;margin:3px 0 6px}
 .wc-settings-header p{max-width:620px;margin:0;color:var(--dsw-alias-fg-muted,#77736d);font-size:13px;line-height:1.55}
@@ -421,6 +576,23 @@ const CSS = `
 .wc-checklist{display:grid;gap:6px;margin:0;padding:0;list-style:none;font-size:12px;color:var(--dsw-alias-fg-muted,#77736d)}
 .wc-checklist code{background:var(--dsw-alias-bg-layer-2,#f7f5f1);padding:1px 6px;border-radius:6px;font-size:11px}
 @media(max-width:720px){.wc-settings-header{display:grid}.wc-release{width:auto}.wc-form-grid{grid-template-columns:1fr}.wc-panel-title{flex-direction:column}}
+.wc-details{display:grid;gap:10px;padding:13px 15px;border:1px solid var(--dsw-alias-border-subtle,#dedbd5);border-radius:14px;background:var(--dsw-alias-bg-layer-1,#fff);content-visibility:auto;contain-intrinsic-size:auto 120px}
+.wc-details summary{cursor:pointer;list-style:none;display:flex;justify-content:space-between;align-items:flex-start;gap:12px}
+.wc-details summary::-webkit-details-marker{display:none}
+.wc-details summary h3{font-size:14px;margin:0}
+.wc-details summary p{font-size:11px;line-height:1.45;color:var(--dsw-alias-fg-muted,#77736d);margin:4px 0 0;max-width:620px}
+.wc-details[open] summary{margin-bottom:4px}
+.wc-cli-status{display:flex;align-items:center;gap:9px;font-size:13px}
+.wc-cli-dot{width:9px;height:9px;border-radius:999px;background:#b9b5ae;flex:none}
+.wc-cli-dot.ok{background:#309a64}
+.wc-cli-dot.warn{background:#e0a237}
+.wc-cli-actions{display:flex;gap:10px;align-items:center;flex-wrap:wrap}
+.wc-cli-actions code{background:var(--dsw-alias-bg-layer-2,#f7f5f1);padding:3px 8px;border-radius:7px;font-size:11px}
+.wc-cli-qr{display:grid;gap:8px;justify-items:start}
+.wc-cli-qr img{border:1px solid var(--dsw-alias-border-subtle,#dedbd5);border-radius:10px;background:#fff}
+.wc-cli-qr small{font-size:11px;color:var(--dsw-alias-fg-muted,#77736d);line-height:1.45;max-width:340px}
+.wc-cli-note{font-size:11px;color:var(--dsw-alias-fg-muted,#77736d)}
+.wc-cli-output{margin:0;font-family:ui-monospace,monospace;font-size:11px;line-height:1.5;background:var(--dsw-alias-bg-layer-2,#f7f5f1);border-radius:9px;padding:9px 11px;white-space:pre-wrap;max-height:130px;overflow:auto}
 `
 
 function installStyles(): () => void {

@@ -41,16 +41,18 @@ interface CliChild extends EventEmitter {
     stdout: EventEmitter | null;
     stderr: EventEmitter | null;
     kill(): boolean;
+    pid?: number | undefined;
 }
 type CliSpawn = (command: string, args: string[]) => CliChild;
 type CliQrRenderer = (text: string) => Promise<string>;
 declare class WeComCliService {
     private readonly spawnFn;
+    private readonly platform;
     private authProcess;
     /** Synchronous mutex covering the async probe window inside beginAuth. */
     private authBusy;
     private readonly qrFn;
-    constructor(spawnFn?: CliSpawn, qrFn?: CliQrRenderer);
+    constructor(spawnFn?: CliSpawn, qrFn?: CliQrRenderer, platform?: NodeJS.Platform);
     /** Kill any pending authorization process; safe to call at any time. */
     dispose(): void;
     /**
@@ -61,11 +63,15 @@ declare class WeComCliService {
     probe(): Promise<CliProbeResult>;
     install(): Promise<CliInstallResult>;
     /**
-     * Spawn `auth init --noninteractive`, capture the authorization URL from
-     * stdout, and render it into a QR data URL. The URL never leaves memory
-     * and is never logged. Only one authorization may run at a time.
+     * Spawn `auth init`, capture the authorization URL from stdout, and render
+     * it into a QR data URL. The URL never leaves memory and is never logged.
+     * `--no-browser` keeps the whole flow inside the Settings page (the CLI
+     * otherwise opens the system browser on its own); CLIs too old to know the
+     * flag exit without printing a URL, and we retry once without it.
+     * Only one authorization may run at a time.
      */
     beginAuth(): Promise<CliAuthStart>;
+    private attemptAuth;
     cancelAuth(): void;
     authStatus(): Promise<CliAuthStatus>;
 }

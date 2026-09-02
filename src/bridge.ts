@@ -594,7 +594,7 @@ export class WeComHarnessBridge {
         '请在 DSH 设置页 → 企微插件 → CLI 集成 中扫码授权（授权链接不在聊天中发送，避免被转发扩散）。',
       ].join('\n')
     }
-    return `wecom-cli ${probe.version} 已就绪（模型操作能力即将上线）。`
+    return `wecom-cli ${probe.version} 已就绪。`
   }
 
   private commandReply(name: string, outcome: ConversationCommandReply): ConversationReply {

@@ -22,11 +22,13 @@ function compareVersions(a, b) {
 var AUTH_URL_PATTERN = /https?:\/\/\S+/u;
 var VERSION_PATTERN = /(\d+\.\d+\.\d+(?:[-+][\w.]+)?)/u;
 var WeComCliService = class {
-  constructor(spawnFn = defaultSpawn, qrFn) {
+  constructor(spawnFn = defaultSpawn, qrFn, platform = process.platform) {
     this.spawnFn = spawnFn;
+    this.platform = platform;
     this.qrFn = qrFn ?? defaultQr;
   }
   spawnFn;
+  platform;
   authProcess;
   /** Synchronous mutex covering the async probe window inside beginAuth. */
   authBusy = false;
@@ -110,9 +112,12 @@ ${run.stderr}`.trim().split(/\r?\n/).slice(-8).join("\n");
     return { outcome: "installed", output, probe: after };
   }
   /**
-   * Spawn `auth init --noninteractive`, capture the authorization URL from
-   * stdout, and render it into a QR data URL. The URL never leaves memory
-   * and is never logged. Only one authorization may run at a time.
+   * Spawn `auth init`, capture the authorization URL from stdout, and render
+   * it into a QR data URL. The URL never leaves memory and is never logged.
+   * `--no-browser` keeps the whole flow inside the Settings page (the CLI
+   * otherwise opens the system browser on its own); CLIs too old to know the
+   * flag exit without printing a URL, and we retry once without it.
+   * Only one authorization may run at a time.
    */
   async beginAuth() {
     if (this.authBusy || this.authProcess !== void 0) return { outcome: "in-progress" };
@@ -120,43 +125,55 @@ ${run.stderr}`.trim().split(/\r?\n/).slice(-8).join("\n");
     try {
       const check = await this.probe();
       if (!check.installed) return { outcome: "cli-missing" };
-      const child = this.spawnFn("wecom-cli", ["auth", "init", "--noninteractive"]);
-      this.authProcess = child;
-      let url;
-      let seen = "";
-      child.stdout?.on("data", (chunk) => {
-        if (url !== void 0) return;
-        seen += String(chunk);
-        url = seen.match(AUTH_URL_PATTERN)?.[0];
-      });
-      const clear = () => {
-        if (this.authProcess === child) this.authProcess = void 0;
-      };
-      child.once("error", clear);
-      child.once("close", clear);
-      const startedAt = Date.now();
-      while (url === void 0 && this.authProcess === child && Date.now() - startedAt < 1e4) {
-        await new Promise((resolve2) => setTimeout(resolve2, 100));
-      }
-      if (url === void 0 || this.authProcess !== child) {
-        this.cancelAuth();
-        return { outcome: "no-url" };
-      }
-      try {
-        const qrDataUrl = await this.qrFn(url);
-        return { outcome: "started", authUrl: url, qrDataUrl };
-      } catch (error) {
-        this.cancelAuth();
-        throw error;
-      }
+      const withFlag = await this.attemptAuth(["auth", "init", "--noninteractive", "--no-browser"]);
+      if (withFlag.outcome !== "no-url") return withFlag;
+      return await this.attemptAuth(["auth", "init", "--noninteractive"]);
     } finally {
       this.authBusy = false;
+    }
+  }
+  async attemptAuth(args) {
+    const child = this.spawnFn("wecom-cli", args);
+    this.authProcess = child;
+    let url;
+    let seen = "";
+    child.stdout?.on("data", (chunk) => {
+      if (url !== void 0) return;
+      seen += String(chunk);
+      url = seen.match(AUTH_URL_PATTERN)?.[0];
+    });
+    const clear = () => {
+      if (this.authProcess === child) this.authProcess = void 0;
+    };
+    child.once("error", clear);
+    child.once("close", clear);
+    const startedAt = Date.now();
+    while (url === void 0 && this.authProcess === child && Date.now() - startedAt < 1e4) {
+      await new Promise((resolve2) => setTimeout(resolve2, 100));
+    }
+    if (url === void 0 || this.authProcess !== child) {
+      this.cancelAuth();
+      return { outcome: "no-url" };
+    }
+    try {
+      const qrDataUrl = await this.qrFn(url);
+      return { outcome: "started", authUrl: url, qrDataUrl };
+    } catch (error) {
+      this.cancelAuth();
+      throw error;
     }
   }
   cancelAuth() {
     const child = this.authProcess;
     this.authProcess = void 0;
-    child?.kill();
+    if (child === void 0) return;
+    if (this.platform === "win32" && typeof child.pid === "number") {
+      try {
+        this.spawnFn("taskkill", ["/pid", String(child.pid), "/T", "/F"]);
+      } catch {
+      }
+    }
+    child.kill();
   }
   async authStatus() {
     const probe = await this.probe();
@@ -1955,7 +1972,7 @@ function requireUserQuestions(service) {
 }
 
 // src/version.ts
-var PLUGIN_VERSION = "0.9.0";
+var PLUGIN_VERSION = "0.9.1";
 
 // src/bridge.ts
 var OUTBOUND_TEST_PNG = Buffer.from(
@@ -2408,7 +2425,7 @@ var WeComHarnessBridge = class {
         "\u8BF7\u5728 DSH \u8BBE\u7F6E\u9875 \u2192 \u4F01\u5FAE\u63D2\u4EF6 \u2192 CLI \u96C6\u6210 \u4E2D\u626B\u7801\u6388\u6743\uFF08\u6388\u6743\u94FE\u63A5\u4E0D\u5728\u804A\u5929\u4E2D\u53D1\u9001\uFF0C\u907F\u514D\u88AB\u8F6C\u53D1\u6269\u6563\uFF09\u3002"
       ].join("\n");
     }
-    return `wecom-cli ${probe.version} \u5DF2\u5C31\u7EEA\uFF08\u6A21\u578B\u64CD\u4F5C\u80FD\u529B\u5373\u5C06\u4E0A\u7EBF\uFF09\u3002`;
+    return `wecom-cli ${probe.version} \u5DF2\u5C31\u7EEA\u3002`;
   }
   commandReply(name2, outcome) {
     if (outcome.execution === void 0) {

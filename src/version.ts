@@ -1,2 +1,2 @@
 /** Human-facing plugin version, independent of the npm package version. */
-export const PLUGIN_VERSION = '0.9.0'
+export const PLUGIN_VERSION = '0.9.1'

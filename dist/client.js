@@ -172,6 +172,7 @@ function CliCard({ controller, initial }) {
   const [installOutput, setInstallOutput] = (0, import_react.useState)("");
   const [error, setError] = (0, import_react.useState)(void 0);
   const [qr, setQr] = (0, import_react.useState)(void 0);
+  const [authSuccess, setAuthSuccess] = (0, import_react.useState)(false);
   const probe = async () => {
     setBusy("probe");
     setError(void 0);
@@ -189,7 +190,7 @@ function CliCard({ controller, initial }) {
     setInstallOutput("");
     try {
       const result = await controller.cliAction("cli-install");
-      setInstallOutput(result.output);
+      setInstallOutput(result.outcome === "failed" ? result.output : "");
       setCli(result.probe);
       if (result.outcome === "failed") setError("\u5B89\u88C5\u5931\u8D25\uFF0C\u8BF7\u67E5\u770B\u4E0B\u65B9\u8F93\u51FA\uFF0C\u6216\u590D\u5236\u547D\u4EE4\u624B\u52A8\u5B89\u88C5\u3002");
     } catch (cause) {
@@ -225,9 +226,11 @@ function CliCard({ controller, initial }) {
         const status = await controller.cliAction("cli-auth-status");
         if (status.auth === "authorized") {
           setQr(void 0);
+          setAuthSuccess(true);
           setCli((current) => current === void 0 ? current : { ...current, auth: "authorized" });
         } else if (!status.waiting) {
           setQr(void 0);
+          setError("\u6388\u6743\u6D41\u7A0B\u5DF2\u4E2D\u65AD\uFF08\u4E8C\u7EF4\u7801\u53EF\u80FD\u5DF2\u8FC7\u671F\uFF09\uFF0C\u8BF7\u91CD\u65B0\u53D1\u8D77\u6388\u6743\u3002");
         }
       } catch {
       }
@@ -264,12 +267,20 @@ function CliCard({ controller, initial }) {
       void authorize();
     }, children: busy === "auth" ? "\u51C6\u5907\u4E2D\u2026" : "\u53D1\u8D77\u6388\u6743" }) : /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", { className: "wc-cli-qr", children: [
       /* @__PURE__ */ (0, import_jsx_runtime.jsx)("img", { src: qr, alt: "wecom-cli \u6388\u6743\u4E8C\u7EF4\u7801", width: 160, height: 160 }),
-      /* @__PURE__ */ (0, import_jsx_runtime.jsx)("small", { children: "\u7528\u624B\u673A\u4F01\u4E1A\u5FAE\u4FE1\u626B\u7801\u5B8C\u6210\u6388\u6743\u3002CLI \u5C06\u4EE5\u6388\u6743\u771F\u4EBA\u8EAB\u4EFD\u64CD\u4F5C\u4F01\u4E1A\u5FAE\u4FE1\u3002" }),
-      /* @__PURE__ */ (0, import_jsx_runtime.jsx)("button", { type: "button", className: "wc-button", onClick: () => {
-        void cancelAuth();
-      }, children: "\u53D6\u6D88" })
+      /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", { className: "wc-cli-qr-steps", children: [
+        /* @__PURE__ */ (0, import_jsx_runtime.jsx)("span", { className: "wc-cli-waiting", children: "\u7B49\u5F85\u626B\u7801\u6388\u6743\u2026" }),
+        /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("ol", { children: [
+          /* @__PURE__ */ (0, import_jsx_runtime.jsx)("li", { children: "\u7528\u624B\u673A\u4F01\u4E1A\u5FAE\u4FE1\u626B\u63CF\u5DE6\u4FA7\u4E8C\u7EF4\u7801" }),
+          /* @__PURE__ */ (0, import_jsx_runtime.jsx)("li", { children: "\u5728\u624B\u673A\u4E0A\u786E\u8BA4\u6388\u6743" }),
+          /* @__PURE__ */ (0, import_jsx_runtime.jsx)("li", { children: "\u5B8C\u6210\u540E\u672C\u9875\u81EA\u52A8\u66F4\u65B0\u4E3A\u300C\u5DF2\u6388\u6743\u300D" })
+        ] }),
+        /* @__PURE__ */ (0, import_jsx_runtime.jsx)("small", { children: "CLI \u5C06\u4EE5\u6388\u6743\u771F\u4EBA\u8EAB\u4EFD\u64CD\u4F5C\u4F01\u4E1A\u5FAE\u4FE1\uFF1B\u6388\u6743\u8FC7\u7A0B\u5168\u90E8\u5728\u672C\u9875\u5B8C\u6210\uFF0C\u65E0\u9700\u6253\u5F00\u6D4F\u89C8\u5668\u3002" }),
+        /* @__PURE__ */ (0, import_jsx_runtime.jsx)("button", { type: "button", className: "wc-button", onClick: () => {
+          void cancelAuth();
+        }, children: "\u53D6\u6D88\u6388\u6743" })
+      ] })
     ] }) }) : null,
-    cli !== void 0 && cli.installed && cli.meetsMin && cli.auth === "authorized" ? /* @__PURE__ */ (0, import_jsx_runtime.jsx)("small", { className: "wc-cli-note", children: "\u5DF2\u5C31\u7EEA\u3002\u6A21\u578B\u64CD\u4F5C\u80FD\u529B\u5373\u5C06\u4E0A\u7EBF\uFF0C\u5C4A\u65F6\u65E0\u9700\u518D\u6B21\u6388\u6743\u3002" }) : null
+    cli !== void 0 && cli.installed && cli.meetsMin && cli.auth === "authorized" && authSuccess ? /* @__PURE__ */ (0, import_jsx_runtime.jsx)("div", { className: "wc-alert success", children: "\u6388\u6743\u6210\u529F\uFF0Cwecom-cli \u5DF2\u5C31\u7EEA\u3002" }) : null
   ] });
 }
 function LoadedSettings({ controller }) {
@@ -434,56 +445,65 @@ function LoadedSettings({ controller }) {
   ] });
 }
 var CSS = `
-.wc-settings{display:grid;gap:14px;max-width:900px;padding:8px 2px 32px;color:var(--dsw-alias-fg-primary,#26231f);contain:content}
+/* Type scale: the only five font sizes allowed in this section. */
+.wc-settings{--wc-fs-xs:11px;--wc-fs-sm:12px;--wc-fs-md:13px;--wc-fs-lg:14px;--wc-fs-xl:20px;display:grid;gap:14px;max-width:900px;padding:8px 2px 32px;color:var(--dsw-alias-fg-primary,#26231f);font-size:var(--wc-fs-sm);contain:content}
 .wc-settings-header{display:flex;justify-content:space-between;gap:20px;align-items:flex-start;padding:8px 2px}
-.wc-settings-header h2{font-size:25px;letter-spacing:-.025em;margin:3px 0 6px}
-.wc-settings-header p{max-width:620px;margin:0;color:var(--dsw-alias-fg-muted,#77736d);font-size:13px;line-height:1.55}
-.wc-kicker{font-size:10px;text-transform:uppercase;letter-spacing:.1em;color:#6758d4;font-weight:700}
-.wc-release{display:grid;gap:4px;min-width:190px;padding:9px 11px;border-radius:10px;background:var(--dsw-alias-bg-layer-2,#f7f5f1);font-size:10px;color:var(--dsw-alias-fg-muted,#77736d)}
-.wc-release span{display:flex;justify-content:space-between;gap:12px}
-.wc-release strong{color:var(--dsw-alias-fg-primary,#26231f)}
-.wc-alert{padding:10px 12px;border-radius:10px;font-size:12px;line-height:1.5}
+.wc-settings-header h2{font-size:var(--wc-fs-xl);letter-spacing:-.02em;margin:3px 0 6px}
+.wc-settings-header p{max-width:620px;margin:0;color:var(--dsw-alias-fg-muted,#77736d);font-size:var(--wc-fs-md);line-height:1.55}
+.wc-kicker{font-size:var(--wc-fs-xs);text-transform:uppercase;letter-spacing:.1em;color:#6758d4;font-weight:700}
+.wc-release{display:grid;gap:4px;min-width:220px;padding:9px 11px;border-radius:10px;background:var(--dsw-alias-bg-layer-2,#f7f5f1);font-size:var(--wc-fs-xs);color:var(--dsw-alias-fg-muted,#77736d)}
+.wc-release span{display:flex;justify-content:space-between;gap:12px;white-space:nowrap}
+.wc-release strong{color:var(--dsw-alias-fg-primary,#26231f);white-space:normal;word-break:break-word;text-align:right}
+.wc-alert{padding:10px 12px;border-radius:10px;font-size:var(--wc-fs-sm);line-height:1.5}
 .wc-alert.warning{background:rgba(224,162,55,.12);color:#986818}
 .wc-alert.error{background:rgba(205,72,72,.1);color:#aa3939}
 .wc-alert.success{background:rgba(48,154,100,.1);color:#267d52}
 .wc-panel{display:grid;gap:12px;padding:15px;border:1px solid var(--dsw-alias-border-subtle,#dedbd5);border-radius:14px;background:var(--dsw-alias-bg-layer-1,#fff);box-shadow:0 1px 1px rgba(0,0,0,.02)}
 .wc-panel-title{display:flex;align-items:flex-start;justify-content:space-between;gap:12px}
-.wc-panel-title h3{font-size:14px;margin:0}
-.wc-panel-title p{font-size:11px;line-height:1.45;color:var(--dsw-alias-fg-muted,#77736d);margin:4px 0 0;max-width:620px}
-.wc-badge{font-size:10px;padding:3px 7px;border-radius:999px;font-weight:650}
+.wc-panel-title h3{font-size:var(--wc-fs-lg);margin:0}
+.wc-panel-title p{font-size:var(--wc-fs-xs);line-height:1.45;color:var(--dsw-alias-fg-muted,#77736d);margin:4px 0 0;max-width:620px}
+.wc-badge{font-size:var(--wc-fs-xs);padding:3px 8px;border-radius:999px;font-weight:600}
 .wc-badge.ok{background:rgba(48,154,100,.12);color:#267d52}
 .wc-badge.error{background:rgba(205,72,72,.1);color:#aa3939}
 .wc-form-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px}
 .wc-field{display:grid;gap:6px;align-content:start}
-.wc-field>span{font-size:11px;font-weight:600;color:var(--dsw-alias-fg-muted,#77736d)}
-.wc-field small{font-size:10px;line-height:1.4;color:var(--dsw-alias-fg-muted,#99958e)}
-.wc-input{width:100%;box-sizing:border-box;padding:8px 10px;border:1px solid var(--dsw-alias-border-subtle,#dedbd5);border-radius:9px;background:var(--dsw-alias-bg-layer-1,#fff);color:inherit;font:inherit;font-size:12px}
+.wc-field>span{font-size:var(--wc-fs-md);font-weight:600;color:var(--dsw-alias-fg-primary,#26231f)}
+.wc-field small{font-size:var(--wc-fs-xs);line-height:1.4;color:var(--dsw-alias-fg-muted,#99958e)}
+.wc-input{width:100%;box-sizing:border-box;padding:8px 10px;border:1px solid var(--dsw-alias-border-subtle,#dedbd5);border-radius:9px;background:var(--dsw-alias-bg-layer-1,#fff);color:inherit;font:inherit;font-size:var(--wc-fs-sm)}
 .wc-input:focus-visible{outline:2px solid #7c6ff0;outline-offset:-1px}
 .wc-save-row{display:flex;gap:8px;align-items:center}
-.wc-button{display:inline-flex;align-items:center;height:30px;padding:0 14px;border:1px solid var(--dsw-alias-border-subtle,#dedbd5);border-radius:999px;background:var(--dsw-alias-bg-layer-1,#fff);color:inherit;font:inherit;font-size:12px;font-weight:600;cursor:pointer}
+.wc-button{display:inline-flex;align-items:center;height:30px;padding:0 14px;border:1px solid var(--dsw-alias-border-subtle,#dedbd5);border-radius:999px;background:var(--dsw-alias-bg-layer-1,#fff);color:inherit;font:inherit;font-size:var(--wc-fs-sm);font-weight:600;cursor:pointer;white-space:nowrap}
 .wc-button:disabled{opacity:.55;cursor:not-allowed}
 .wc-button.primary{background:#6758d4;border-color:#6758d4;color:#fff}
-.wc-loading{padding:24px;border-radius:12px;background:var(--dsw-alias-bg-layer-2,#f7f5f1);font-size:12px;color:var(--dsw-alias-fg-muted,#77736d)}
-.wc-checklist{display:grid;gap:6px;margin:0;padding:0;list-style:none;font-size:12px;color:var(--dsw-alias-fg-muted,#77736d)}
-.wc-checklist code{background:var(--dsw-alias-bg-layer-2,#f7f5f1);padding:1px 6px;border-radius:6px;font-size:11px}
-@media(max-width:720px){.wc-settings-header{display:grid}.wc-release{width:auto}.wc-form-grid{grid-template-columns:1fr}.wc-panel-title{flex-direction:column}}
+.wc-loading{padding:24px;border-radius:12px;background:var(--dsw-alias-bg-layer-2,#f7f5f1);font-size:var(--wc-fs-sm);color:var(--dsw-alias-fg-muted,#77736d)}
+.wc-checklist{display:grid;gap:6px;margin:0;padding:0 0 0 2px;list-style:none;font-size:var(--wc-fs-sm);color:var(--dsw-alias-fg-muted,#77736d)}
+.wc-checklist code{background:var(--dsw-alias-bg-layer-2,#f7f5f1);padding:1px 6px;border-radius:6px;font-size:var(--wc-fs-xs)}
+@media(max-width:720px){.wc-settings-header{display:grid}.wc-release{width:auto;min-width:0}.wc-form-grid{grid-template-columns:1fr}.wc-panel-title{flex-direction:column}.wc-release span{white-space:normal;flex-wrap:wrap}}
 .wc-details{display:grid;gap:10px;padding:13px 15px;border:1px solid var(--dsw-alias-border-subtle,#dedbd5);border-radius:14px;background:var(--dsw-alias-bg-layer-1,#fff);content-visibility:auto;contain-intrinsic-size:auto 120px}
-.wc-details summary{cursor:pointer;list-style:none;display:flex;justify-content:space-between;align-items:flex-start;gap:12px}
+.wc-details summary{cursor:pointer;list-style:none;display:flex;justify-content:space-between;align-items:flex-start;gap:12px;padding:2px 4px;margin:-2px -4px;border-radius:8px;transition:background .15s}
+.wc-details summary:hover{background:rgba(0,0,0,.035)}
+.wc-details summary:focus-visible{outline:2px solid #7c6ff0;outline-offset:0}
 .wc-details summary::-webkit-details-marker{display:none}
-.wc-details summary h3{font-size:14px;margin:0}
-.wc-details summary p{font-size:11px;line-height:1.45;color:var(--dsw-alias-fg-muted,#77736d);margin:4px 0 0;max-width:620px}
+.wc-details summary::after{content:'';flex:none;width:7px;height:7px;margin-top:5px;border-right:2px solid #b9b5ae;border-bottom:2px solid #b9b5ae;transform:rotate(-45deg);transition:transform .15s}
+.wc-details[open] summary::after{transform:rotate(45deg)}
+.wc-details summary h3{font-size:var(--wc-fs-lg);margin:0}
+.wc-details summary p{font-size:var(--wc-fs-xs);line-height:1.45;color:var(--dsw-alias-fg-muted,#77736d);margin:4px 0 0;max-width:620px}
 .wc-details[open] summary{margin-bottom:4px}
-.wc-cli-status{display:flex;align-items:center;gap:9px;font-size:13px}
+.wc-cli-status{display:flex;align-items:center;gap:9px;font-size:var(--wc-fs-md)}
 .wc-cli-dot{width:9px;height:9px;border-radius:999px;background:#b9b5ae;flex:none}
 .wc-cli-dot.ok{background:#309a64}
 .wc-cli-dot.warn{background:#e0a237}
 .wc-cli-actions{display:flex;gap:10px;align-items:center;flex-wrap:wrap}
-.wc-cli-actions code{background:var(--dsw-alias-bg-layer-2,#f7f5f1);padding:3px 8px;border-radius:7px;font-size:11px}
-.wc-cli-qr{display:grid;gap:8px;justify-items:start}
-.wc-cli-qr img{border:1px solid var(--dsw-alias-border-subtle,#dedbd5);border-radius:10px;background:#fff}
-.wc-cli-qr small{font-size:11px;color:var(--dsw-alias-fg-muted,#77736d);line-height:1.45;max-width:340px}
-.wc-cli-note{font-size:11px;color:var(--dsw-alias-fg-muted,#77736d)}
-.wc-cli-output{margin:0;font-family:ui-monospace,monospace;font-size:11px;line-height:1.5;background:var(--dsw-alias-bg-layer-2,#f7f5f1);border-radius:9px;padding:9px 11px;white-space:pre-wrap;max-height:130px;overflow:auto}
+.wc-cli-actions code{background:var(--dsw-alias-bg-layer-2,#f7f5f1);padding:3px 8px;border-radius:7px;font-size:var(--wc-fs-xs)}
+.wc-cli-qr{display:flex;gap:16px;align-items:flex-start;flex-wrap:wrap}
+.wc-cli-qr img{border:1px solid var(--dsw-alias-border-subtle,#dedbd5);border-radius:10px;background:#fff;flex:none}
+.wc-cli-qr-steps{display:grid;gap:7px;justify-items:start;font-size:var(--wc-fs-xs);color:var(--dsw-alias-fg-muted,#77736d);max-width:340px;line-height:1.5}
+.wc-cli-qr-steps ol{margin:0;padding-left:18px;display:grid;gap:2px}
+.wc-cli-qr-steps small{color:var(--dsw-alias-fg-muted,#99958e)}
+.wc-cli-waiting{display:flex;align-items:center;gap:7px;font-size:var(--wc-fs-md);font-weight:600;color:var(--dsw-alias-fg-primary,#26231f)}
+.wc-cli-waiting::before{content:'';width:8px;height:8px;border-radius:999px;background:#e0a237;animation:wc-pulse 1.2s ease-in-out infinite}
+@keyframes wc-pulse{0%,100%{opacity:.3}50%{opacity:1}}
+.wc-cli-output{margin:0;font-family:ui-monospace,monospace;font-size:var(--wc-fs-xs);line-height:1.5;background:var(--dsw-alias-bg-layer-2,#f7f5f1);border-radius:9px;padding:9px 11px;white-space:pre-wrap;max-height:130px;overflow:auto}
 `;
 function installStyles() {
   const id = "deepseek-harness-wecom-plus/client";

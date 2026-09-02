@@ -42,6 +42,7 @@ export interface CliChild extends EventEmitter {
   stdout: EventEmitter | null
   stderr: EventEmitter | null
   kill(): boolean
+  pid?: number | undefined
 }
 
 export type CliSpawn = (command: string, args: string[]) => CliChild
@@ -87,6 +88,7 @@ export class WeComCliService {
   constructor(
     private readonly spawnFn: CliSpawn = defaultSpawn,
     qrFn?: CliQrRenderer,
+    private readonly platform: NodeJS.Platform = process.platform,
   ) {
     this.qrFn = qrFn ?? defaultQr
   }
@@ -174,9 +176,12 @@ export class WeComCliService {
   }
 
   /**
-   * Spawn `auth init --noninteractive`, capture the authorization URL from
-   * stdout, and render it into a QR data URL. The URL never leaves memory
-   * and is never logged. Only one authorization may run at a time.
+   * Spawn `auth init`, capture the authorization URL from stdout, and render
+   * it into a QR data URL. The URL never leaves memory and is never logged.
+   * `--no-browser` keeps the whole flow inside the Settings page (the CLI
+   * otherwise opens the system browser on its own); CLIs too old to know the
+   * flag exit without printing a URL, and we retry once without it.
+   * Only one authorization may run at a time.
    */
   async beginAuth(): Promise<CliAuthStart> {
     if (this.authBusy || this.authProcess !== undefined) return { outcome: 'in-progress' }
@@ -184,48 +189,65 @@ export class WeComCliService {
     try {
       const check = await this.probe()
       if (!check.installed) return { outcome: 'cli-missing' }
-      const child = this.spawnFn('wecom-cli', ['auth', 'init', '--noninteractive'])
-      this.authProcess = child
-      let url: string | undefined
-      let seen = ''
-      child.stdout?.on('data', (chunk: Buffer | string) => {
-        if (url !== undefined) return
-        seen += String(chunk)
-        url = seen.match(AUTH_URL_PATTERN)?.[0]
-      })
-      const clear = (): void => {
-        if (this.authProcess === child) this.authProcess = undefined
-      }
-      child.once('error', clear)
-      child.once('close', clear)
-      const startedAt = Date.now()
-      while (url === undefined && this.authProcess === child && Date.now() - startedAt < 10_000) {
-        await new Promise(resolve => setTimeout(resolve, 100))
-      }
-      if (url === undefined || this.authProcess !== child) {
-        // Deliberate choice: a URL captured before the child exited is
-        // discarded — the process died before the authorization flow
-        // completed, so the URL is stale and must not reach the caller.
-        this.cancelAuth()
-        return { outcome: 'no-url' }
-      }
-      try {
-        const qrDataUrl = await this.qrFn(url)
-        return { outcome: 'started', authUrl: url, qrDataUrl }
-      } catch (error) {
-        // A QR render failure must not leave the auth process pending.
-        this.cancelAuth()
-        throw error
-      }
+      const withFlag = await this.attemptAuth(['auth', 'init', '--noninteractive', '--no-browser'])
+      if (withFlag.outcome !== 'no-url') return withFlag
+      // Fallback for CLIs that reject the unknown flag: they exit fast with
+      // no URL, the attempt above cleaned up, so a bare retry is safe.
+      return await this.attemptAuth(['auth', 'init', '--noninteractive'])
     } finally {
       this.authBusy = false
+    }
+  }
+
+  private async attemptAuth(args: string[]): Promise<CliAuthStart> {
+    const child = this.spawnFn('wecom-cli', args)
+    this.authProcess = child
+    let url: string | undefined
+    let seen = ''
+    child.stdout?.on('data', (chunk: Buffer | string) => {
+      if (url !== undefined) return
+      seen += String(chunk)
+      url = seen.match(AUTH_URL_PATTERN)?.[0]
+    })
+    const clear = (): void => {
+      if (this.authProcess === child) this.authProcess = undefined
+    }
+    child.once('error', clear)
+    child.once('close', clear)
+    const startedAt = Date.now()
+    while (url === undefined && this.authProcess === child && Date.now() - startedAt < 10_000) {
+      await new Promise(resolve => setTimeout(resolve, 100))
+    }
+    if (url === undefined || this.authProcess !== child) {
+      // Deliberate choice: a URL captured before the child exited is
+      // discarded — the process died before the authorization flow
+      // completed, so the URL is stale and must not reach the caller.
+      this.cancelAuth()
+      return { outcome: 'no-url' }
+    }
+    try {
+      const qrDataUrl = await this.qrFn(url)
+      return { outcome: 'started', authUrl: url, qrDataUrl }
+    } catch (error) {
+      // A QR render failure must not leave the auth process pending.
+      this.cancelAuth()
+      throw error
     }
   }
 
   cancelAuth(): void {
     const child = this.authProcess
     this.authProcess = undefined
-    child?.kill()
+    if (child === undefined) return
+    if (this.platform === 'win32' && typeof child.pid === 'number') {
+      // The shell spawn makes wecom-cli a grandchild: a plain kill() would
+      // leave it alive to finish the scan authorization behind the user's
+      // back. Take down the whole tree instead.
+      try {
+        this.spawnFn('taskkill', ['/pid', String(child.pid), '/T', '/F'])
+      } catch { /* fall through to the plain kill below */ }
+    }
+    child.kill()
   }
 
   async authStatus(): Promise<CliAuthStatus> {

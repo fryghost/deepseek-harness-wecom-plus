@@ -2020,7 +2020,7 @@ function requireUserQuestions(service) {
 }
 
 // src/version.ts
-var PLUGIN_VERSION = "0.9.2";
+var PLUGIN_VERSION = "0.9.3";
 
 // src/bridge.ts
 var OUTBOUND_TEST_PNG = Buffer.from(

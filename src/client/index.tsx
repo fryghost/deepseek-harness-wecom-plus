@@ -212,9 +212,16 @@ class SectionErrorBoundary extends Component<{ children: ReactNode }, { error?: 
 }
 
 const CHANNEL_LABEL: Record<ChannelStatus['state'], string> = {
-  inactive: '未激活（缺 Bot ID / Secret 或未配置）',
+  inactive: '未激活',
   connecting: '连接中…',
-  connected: '已连接（WeCom AI Bot authenticated）',
+  connected: '已连接',
+}
+
+/** Reuses the CLI status dot colours: grey/amber/green. */
+const CHANNEL_DOT: Record<ChannelStatus['state'], string> = {
+  inactive: '',
+  connecting: 'warn',
+  connected: 'ok',
 }
 
 const POLICY_OPTIONS = [
@@ -430,7 +437,7 @@ function LoadedSettings({ controller }: SettingsInjected) {
         </div>
         <div className="wc-release">
           <span>插件版本 <strong>{snapshot.release.pluginVersion}</strong></span>
-          <span>连接状态 <strong>{CHANNEL_LABEL[channel.state]}</strong></span>
+          <span>连接状态 <strong className="wc-state-value"><i className={`wc-cli-dot ${CHANNEL_DOT[channel.state]}`} />{CHANNEL_LABEL[channel.state]}</strong></span>
         </div>
       </header>
 
@@ -566,6 +573,7 @@ const CSS = `
 .wc-release{display:grid;gap:4px;min-width:220px;padding:9px 11px;border-radius:10px;background:var(--dsw-alias-bg-layer-2,#f7f5f1);font-size:var(--wc-fs-xs);color:var(--dsw-alias-fg-muted,#77736d)}
 .wc-release span{display:flex;justify-content:space-between;gap:12px;white-space:nowrap}
 .wc-release strong{color:var(--dsw-alias-fg-primary,#26231f);white-space:normal;word-break:break-word;text-align:right}
+.wc-state-value{display:inline-flex;align-items:center;justify-content:flex-end;gap:6px;white-space:nowrap}
 .wc-alert{padding:10px 12px;border-radius:10px;font-size:var(--wc-fs-sm);line-height:1.5}
 .wc-alert.warning{background:rgba(224,162,55,.12);color:#986818}
 .wc-alert.error{background:rgba(205,72,72,.1);color:#aa3939}

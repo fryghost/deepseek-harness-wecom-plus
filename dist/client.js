@@ -146,9 +146,14 @@ var SectionErrorBoundary = class extends import_react.Component {
   }
 };
 var CHANNEL_LABEL = {
-  inactive: "\u672A\u6FC0\u6D3B\uFF08\u7F3A Bot ID / Secret \u6216\u672A\u914D\u7F6E\uFF09",
+  inactive: "\u672A\u6FC0\u6D3B",
   connecting: "\u8FDE\u63A5\u4E2D\u2026",
-  connected: "\u5DF2\u8FDE\u63A5\uFF08WeCom AI Bot authenticated\uFF09"
+  connected: "\u5DF2\u8FDE\u63A5"
+};
+var CHANNEL_DOT = {
+  inactive: "",
+  connecting: "warn",
+  connected: "ok"
 };
 var POLICY_OPTIONS = [
   { value: "open", label: "\u5F00\u653E\uFF08open\uFF09" },
@@ -322,7 +327,10 @@ function LoadedSettings({ controller }) {
         ] }),
         /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("span", { children: [
           "\u8FDE\u63A5\u72B6\u6001 ",
-          /* @__PURE__ */ (0, import_jsx_runtime.jsx)("strong", { children: CHANNEL_LABEL[channel.state] })
+          /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("strong", { className: "wc-state-value", children: [
+            /* @__PURE__ */ (0, import_jsx_runtime.jsx)("i", { className: `wc-cli-dot ${CHANNEL_DOT[channel.state]}` }),
+            CHANNEL_LABEL[channel.state]
+          ] })
         ] })
       ] })
     ] }),
@@ -454,6 +462,7 @@ var CSS = `
 .wc-release{display:grid;gap:4px;min-width:220px;padding:9px 11px;border-radius:10px;background:var(--dsw-alias-bg-layer-2,#f7f5f1);font-size:var(--wc-fs-xs);color:var(--dsw-alias-fg-muted,#77736d)}
 .wc-release span{display:flex;justify-content:space-between;gap:12px;white-space:nowrap}
 .wc-release strong{color:var(--dsw-alias-fg-primary,#26231f);white-space:normal;word-break:break-word;text-align:right}
+.wc-state-value{display:inline-flex;align-items:center;justify-content:flex-end;gap:6px;white-space:nowrap}
 .wc-alert{padding:10px 12px;border-radius:10px;font-size:var(--wc-fs-sm);line-height:1.5}
 .wc-alert.warning{background:rgba(224,162,55,.12);color:#986818}
 .wc-alert.error{background:rgba(205,72,72,.1);color:#aa3939}

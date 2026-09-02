@@ -45,14 +45,16 @@ interface CliChild extends EventEmitter {
 }
 type CliSpawn = (command: string, args: string[]) => CliChild;
 type CliQrRenderer = (text: string) => Promise<string>;
+type CliQrFileReader = (path: string) => Promise<string | undefined>;
 declare class WeComCliService {
     private readonly spawnFn;
     private readonly platform;
+    private readonly qrFileFn;
     private authProcess;
     /** Synchronous mutex covering the async probe window inside beginAuth. */
     private authBusy;
     private readonly qrFn;
-    constructor(spawnFn?: CliSpawn, qrFn?: CliQrRenderer, platform?: NodeJS.Platform);
+    constructor(spawnFn?: CliSpawn, qrFn?: CliQrRenderer, platform?: NodeJS.Platform, qrFileFn?: CliQrFileReader);
     /** Kill any pending authorization process; safe to call at any time. */
     dispose(): void;
     /**
@@ -63,15 +65,19 @@ declare class WeComCliService {
     probe(): Promise<CliProbeResult>;
     install(): Promise<CliInstallResult>;
     /**
-     * Spawn `auth init`, capture the authorization URL from stdout, and render
-     * it into a QR data URL. The URL never leaves memory and is never logged.
-     * `--no-browser` keeps the whole flow inside the Settings page (the CLI
-     * otherwise opens the system browser on its own); CLIs too old to know the
-     * flag exit without printing a URL, and we retry once without it.
+     * Spawn `auth init` and surface the scan QR inside the Settings page.
+     * The stdout URL is only a login PAGE that itself renders the real QR —
+     * QR-encoding it just opens that page inside WeCom's webview where it
+     * cannot be scanned. Preferred path is therefore `--output-qrcode`: the
+     * CLI writes the actual scannable QR as a PNG we embed directly.
+     * `--no-browser` stops the CLI from opening that login page itself; CLIs
+     * too old to know the flag fall back to the URL mode, then bare.
      * Only one authorization may run at a time.
      */
     beginAuth(): Promise<CliAuthStart>;
     private attemptAuth;
+    /** Best-effort removal of a leftover QR PNG (cancel paths, unreadable file). */
+    private cleanupQrFile;
     cancelAuth(): void;
     authStatus(): Promise<CliAuthStatus>;
 }

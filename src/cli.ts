@@ -47,6 +47,7 @@ export interface CliChild extends EventEmitter {
 
 export type CliSpawn = (command: string, args: string[]) => CliChild
 export type CliQrRenderer = (text: string) => Promise<string>
+export type CliQrFileReader = (path: string) => Promise<string | undefined>
 
 interface RunResult {
   code: number | null
@@ -64,6 +65,25 @@ const defaultSpawn: CliSpawn = (command, args) => spawn(command, args, {
 const defaultQr: CliQrRenderer = async (text) => {
   const { default: QRCode } = await import('qrcode')
   return QRCode.toDataURL(text, { margin: 1, width: 240 })
+}
+
+/** Relative filename required by `auth init --output-qrcode` (cwd-relative only). */
+export const QR_FILE_NAME = 'wecom-cli-auth-qr.png'
+
+/** Reads the CLI-written QR PNG and returns it as a data URL; undefined until the file exists. */
+const defaultQrFromFile = async (path: string): Promise<string | undefined> => {
+  try {
+    const { readFile, stat, unlink } = await import('node:fs/promises')
+    const info = await stat(path).catch(() => undefined)
+    if (info === undefined || info.size === 0) return undefined
+    const bytes = await readFile(path)
+    // Too small means the CLI is still writing it; pick it up next poll.
+    if (bytes.length < 100) return undefined
+    await unlink(path).catch(() => { /* best effort */ })
+    return `data:image/png;base64,${bytes.toString('base64')}`
+  } catch {
+    return undefined
+  }
 }
 
 function compareVersions(a: string, b: string): number {
@@ -89,6 +109,7 @@ export class WeComCliService {
     private readonly spawnFn: CliSpawn = defaultSpawn,
     qrFn?: CliQrRenderer,
     private readonly platform: NodeJS.Platform = process.platform,
+    private readonly qrFileFn: CliQrFileReader = defaultQrFromFile,
   ) {
     this.qrFn = qrFn ?? defaultQr
   }
@@ -176,11 +197,13 @@ export class WeComCliService {
   }
 
   /**
-   * Spawn `auth init`, capture the authorization URL from stdout, and render
-   * it into a QR data URL. The URL never leaves memory and is never logged.
-   * `--no-browser` keeps the whole flow inside the Settings page (the CLI
-   * otherwise opens the system browser on its own); CLIs too old to know the
-   * flag exit without printing a URL, and we retry once without it.
+   * Spawn `auth init` and surface the scan QR inside the Settings page.
+   * The stdout URL is only a login PAGE that itself renders the real QR —
+   * QR-encoding it just opens that page inside WeCom's webview where it
+   * cannot be scanned. Preferred path is therefore `--output-qrcode`: the
+   * CLI writes the actual scannable QR as a PNG we embed directly.
+   * `--no-browser` stops the CLI from opening that login page itself; CLIs
+   * too old to know the flag fall back to the URL mode, then bare.
    * Only one authorization may run at a time.
    */
   async beginAuth(): Promise<CliAuthStart> {
@@ -189,20 +212,24 @@ export class WeComCliService {
     try {
       const check = await this.probe()
       if (!check.installed) return { outcome: 'cli-missing' }
-      const withFlag = await this.attemptAuth(['auth', 'init', '--noninteractive', '--no-browser'])
+      const withFile = await this.attemptAuth(
+        ['auth', 'init', '--noninteractive', '--no-browser', '--output-qrcode', QR_FILE_NAME], 'qr-file')
+      if (withFile.outcome !== 'no-url') return withFile
+      const withFlag = await this.attemptAuth(['auth', 'init', '--noninteractive', '--no-browser'], 'url')
       if (withFlag.outcome !== 'no-url') return withFlag
-      // Fallback for CLIs that reject the unknown flag: they exit fast with
-      // no URL, the attempt above cleaned up, so a bare retry is safe.
-      return await this.attemptAuth(['auth', 'init', '--noninteractive'])
+      // Fallback for CLIs that reject the unknown flags: they exit fast with
+      // no URL, the attempts above cleaned up, so a bare retry is safe.
+      return await this.attemptAuth(['auth', 'init', '--noninteractive'], 'url')
     } finally {
       this.authBusy = false
     }
   }
 
-  private async attemptAuth(args: string[]): Promise<CliAuthStart> {
+  private async attemptAuth(args: string[], mode: 'qr-file' | 'url'): Promise<CliAuthStart> {
     const child = this.spawnFn('wecom-cli', args)
     this.authProcess = child
     let url: string | undefined
+    let qrDataUrl: string | undefined
     let seen = ''
     child.stdout?.on('data', (chunk: Buffer | string) => {
       if (url !== undefined) return
@@ -215,24 +242,50 @@ export class WeComCliService {
     child.once('error', clear)
     child.once('close', clear)
     const startedAt = Date.now()
-    while (url === undefined && this.authProcess === child && Date.now() - startedAt < 10_000) {
+    while (this.authProcess === child && Date.now() - startedAt < 10_000) {
+      if (mode === 'qr-file') {
+        qrDataUrl = await this.qrFileFn(QR_FILE_NAME)
+        if (qrDataUrl !== undefined) break
+      } else if (url !== undefined) {
+        break
+      }
       await new Promise(resolve => setTimeout(resolve, 100))
     }
-    if (url === undefined || this.authProcess !== child) {
+    if (mode === 'url') {
       // Deliberate choice: a URL captured before the child exited is
       // discarded — the process died before the authorization flow
       // completed, so the URL is stale and must not reach the caller.
+      if (url === undefined || this.authProcess !== child) {
+        this.cancelAuth()
+        return { outcome: 'no-url' }
+      }
+      try {
+        const rendered = await this.qrFn(url)
+        return { outcome: 'started', authUrl: url, qrDataUrl: rendered }
+      } catch (error) {
+        // A QR render failure must not leave the auth process pending.
+        this.cancelAuth()
+        throw error
+      }
+    }
+    if (qrDataUrl === undefined) {
       this.cancelAuth()
+      await this.cleanupQrFile()
       return { outcome: 'no-url' }
     }
+    // The stdout URL may be absent in this mode; omit it entirely
+    // (exactOptionalPropertyTypes forbids an explicit undefined).
+    return url === undefined
+      ? { outcome: 'started', qrDataUrl }
+      : { outcome: 'started', authUrl: url, qrDataUrl }
+  }
+
+  /** Best-effort removal of a leftover QR PNG (cancel paths, unreadable file). */
+  private async cleanupQrFile(): Promise<void> {
     try {
-      const qrDataUrl = await this.qrFn(url)
-      return { outcome: 'started', authUrl: url, qrDataUrl }
-    } catch (error) {
-      // A QR render failure must not leave the auth process pending.
-      this.cancelAuth()
-      throw error
-    }
+      const { unlink } = await import('node:fs/promises')
+      await unlink(QR_FILE_NAME)
+    } catch { /* nothing to clean up */ }
   }
 
   cancelAuth(): void {
@@ -248,6 +301,7 @@ export class WeComCliService {
       } catch { /* fall through to the plain kill below */ }
     }
     child.kill()
+    void this.cleanupQrFile()
   }
 
   async authStatus(): Promise<CliAuthStatus> {

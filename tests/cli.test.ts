@@ -6,6 +6,7 @@ class FakeChild extends EventEmitter {
   stdout = new EventEmitter()
   stderr = new EventEmitter()
   killed = false
+  pid?: number | undefined
   kill(): boolean {
     this.killed = true
     queueMicrotask(() => this.emit('close', null))
@@ -36,6 +37,29 @@ function fakeSpawn(handlers: Record<string, () => FakeChild>) {
 }
 
 const qrFn = vi.fn(async (text: string) => `data:image/png;base64,${Buffer.from(text).toString('base64')}`)
+const noQrFile = vi.fn(async (_path: string) => undefined)
+
+const QR_FILE = 'wecom-cli-auth-qr.png'
+const FILE_MODE = `wecom-cli auth init --noninteractive --no-browser --output-qrcode ${QR_FILE}`
+const FLAG_MODE = 'wecom-cli auth init --noninteractive --no-browser'
+const BARE_MODE = 'wecom-cli auth init --noninteractive'
+
+/** A child that exits immediately with a usage error: simulates a CLI rejecting unknown flags. */
+function rejectFlags(): FakeChild {
+  return emit(new FakeChild(), "error: unexpected argument '--no-browser' found", '', 2)
+}
+
+/** Handler that emits the auth URL once, only after this child is actually spawned. */
+function emitUrlOnSpawn(child: FakeChild, url: string): () => FakeChild {
+  let emitted = false
+  return () => {
+    if (!emitted) {
+      emitted = true
+      setTimeout(() => child.stdout.emit('data', Buffer.from(url)), 150)
+    }
+    return child
+  }
+}
 
 describe('WeComCliService', () => {
   it('probes an installed, authorized CLI', async () => {
@@ -141,15 +165,33 @@ describe('WeComCliService', () => {
     expect(result.output).toContain('npm ERR! network')
   })
 
+  it('embeds the CLI-written QR PNG directly via --output-qrcode', async () => {
+    const child = new FakeChild()
+    const qrFileFn = vi.fn(async () => 'data:image/png;base64,QUJD')
+    const { spawnFn, calls } = fakeSpawn({
+      'wecom-cli --version': () => emit(new FakeChild(), '1.2.3'),
+      'wecom-cli auth show --status': () => emit(new FakeChild(), 'unauthorized'),
+      [FILE_MODE]: () => child,
+    })
+    const cli = new WeComCliService(spawnFn, qrFn, 'linux', qrFileFn)
+    const result = await cli.beginAuth()
+    expect(result.outcome).toBe('started')
+    expect(result.qrDataUrl).toBe('data:image/png;base64,QUJD')
+    expect(qrFileFn).toHaveBeenCalledWith(QR_FILE)
+    expect(calls[2].args).toContain('--output-qrcode')
+    // The auth process is still waiting for the scan.
+    await expect(cli.authStatus()).resolves.toMatchObject({ waiting: true })
+  })
+
   it('starts authorization, captures the URL, and renders a QR data URL', async () => {
     const child = new FakeChild()
     const { spawnFn } = fakeSpawn({
       'wecom-cli --version': () => emit(new FakeChild(), '1.2.3'),
       'wecom-cli auth show --status': () => emit(new FakeChild(), 'unauthorized'),
-      'wecom-cli auth init --noninteractive --no-browser': () => child,
+      [FILE_MODE]: rejectFlags,
+      [FLAG_MODE]: emitUrlOnSpawn(child, 'visit https://login.work.weixin.qq.com/qr/ABC to authorize\n'),
     })
-    const cli = new WeComCliService(spawnFn, qrFn)
-    setTimeout(() => child.stdout.emit('data', Buffer.from('visit https://login.work.weixin.qq.com/qr/ABC to authorize\n')), 150)
+    const cli = new WeComCliService(spawnFn, qrFn, 'linux', noQrFile)
     const result = await cli.beginAuth()
     expect(result.outcome).toBe('started')
     expect(result.authUrl).toContain('https://login.work.weixin.qq.com/qr/ABC')
@@ -163,10 +205,10 @@ describe('WeComCliService', () => {
     const { spawnFn } = fakeSpawn({
       'wecom-cli --version': () => emit(new FakeChild(), '1.2.3'),
       'wecom-cli auth show --status': () => emit(new FakeChild(), 'unauthorized'),
-      'wecom-cli auth init --noninteractive --no-browser': () => child,
+      [FILE_MODE]: rejectFlags,
+      [FLAG_MODE]: emitUrlOnSpawn(child, 'https://login.work.weixin.qq.com/qr/XYZ'),
     })
-    const cli = new WeComCliService(spawnFn, qrFn)
-    setTimeout(() => child.stdout.emit('data', Buffer.from('https://login.work.weixin.qq.com/qr/XYZ')), 150)
+    const cli = new WeComCliService(spawnFn, qrFn, 'linux', noQrFile)
     await cli.beginAuth()
     await expect(cli.beginAuth()).resolves.toEqual({ outcome: 'in-progress' })
   })
@@ -176,33 +218,32 @@ describe('WeComCliService', () => {
     const { spawnFn } = fakeSpawn({
       'wecom-cli --version': () => emit(new FakeChild(), '1.2.3'),
       'wecom-cli auth show --status': () => emit(new FakeChild(), 'unauthorized'),
-      'wecom-cli auth init --noninteractive --no-browser': () => child,
+      [FILE_MODE]: rejectFlags,
+      [FLAG_MODE]: emitUrlOnSpawn(child, 'https://login.work.weixin.qq.com/qr/XYZ'),
     })
-    const cli = new WeComCliService(spawnFn, qrFn)
-    setTimeout(() => child.stdout.emit('data', Buffer.from('https://login.work.weixin.qq.com/qr/XYZ')), 150)
+    const cli = new WeComCliService(spawnFn, qrFn, 'linux', noQrFile)
     await cli.beginAuth()
     cli.cancelAuth()
     expect(child.killed).toBe(true)
     await expect(cli.authStatus()).resolves.toMatchObject({ waiting: false })
   })
 
-  it('falls back to the bare auth init when the CLI rejects --no-browser', async () => {
+  it('falls back through qr-file, no-browser, and bare auth init', async () => {
     const child = new FakeChild()
     const { spawnFn, calls } = fakeSpawn({
       'wecom-cli --version': () => emit(new FakeChild(), '1.2.3'),
       'wecom-cli auth show --status': () => emit(new FakeChild(), 'unauthorized'),
-      // Old CLIs exit fast with a usage error and never print a URL.
-      'wecom-cli auth init --noninteractive --no-browser': () =>
-        emit(new FakeChild(), "error: unexpected argument '--no-browser' found", '', 2),
-      'wecom-cli auth init --noninteractive': () => child,
+      // Old CLIs exit fast with a usage error and never produce a QR or URL.
+      [FILE_MODE]: rejectFlags,
+      [FLAG_MODE]: rejectFlags,
+      [BARE_MODE]: emitUrlOnSpawn(child, 'https://login.work.weixin.qq.com/qr/FB'),
     })
-    const cli = new WeComCliService(spawnFn, qrFn)
-    setTimeout(() => child.stdout.emit('data', Buffer.from('https://login.work.weixin.qq.com/qr/FB')), 150)
+    const cli = new WeComCliService(spawnFn, qrFn, 'linux', noQrFile)
     const result = await cli.beginAuth()
     expect(result.outcome).toBe('started')
     expect(result.authUrl).toContain('https://login.work.weixin.qq.com/qr/FB')
     expect(calls.filter(call => call.args[0] === 'auth' && call.args[1] === 'init').map(call => call.args.join(' ')))
-      .toEqual(['auth init --noninteractive --no-browser', 'auth init --noninteractive'])
+      .toEqual([FILE_MODE.replace('wecom-cli ', ''), FLAG_MODE.replace('wecom-cli ', ''), BARE_MODE.replace('wecom-cli ', '')])
   })
 
   it('tree-kills the auth process via taskkill on Windows', async () => {
@@ -211,10 +252,10 @@ describe('WeComCliService', () => {
     const { spawnFn, calls } = fakeSpawn({
       'wecom-cli --version': () => emit(new FakeChild(), '1.2.3'),
       'wecom-cli auth show --status': () => emit(new FakeChild(), 'unauthorized'),
-      'wecom-cli auth init --noninteractive --no-browser': () => child,
+      [FILE_MODE]: rejectFlags,
+      [FLAG_MODE]: emitUrlOnSpawn(child, 'https://login.work.weixin.qq.com/qr/TK'),
     })
-    const cli = new WeComCliService(spawnFn, qrFn, 'win32')
-    setTimeout(() => child.stdout.emit('data', Buffer.from('https://login.work.weixin.qq.com/qr/TK')), 150)
+    const cli = new WeComCliService(spawnFn, qrFn, 'win32', noQrFile)
     await cli.beginAuth()
     cli.cancelAuth()
     expect(calls.some(call => call.command === 'taskkill'
@@ -228,13 +269,13 @@ describe('WeComCliService', () => {
     const { spawnFn } = fakeSpawn({
       'wecom-cli --version': () => emit(new FakeChild(), '1.2.3'),
       'wecom-cli auth show --status': () => emit(new FakeChild(), 'unauthorized'),
-      'wecom-cli auth init --noninteractive --no-browser': () => child,
+      [FILE_MODE]: rejectFlags,
+      [FLAG_MODE]: emitUrlOnSpawn(child, 'https://login.work.weixin.qq.com/qr/XYZ'),
       // The fallback after a QR failure must not add another 10s wait.
-      'wecom-cli auth init --noninteractive': () => emit(new FakeChild(), '', '', 2),
+      [BARE_MODE]: () => emit(new FakeChild(), '', '', 2),
     })
     const failingQr = vi.fn(async () => { throw new Error('qr failed') })
-    const cli = new WeComCliService(spawnFn, failingQr)
-    setTimeout(() => child.stdout.emit('data', Buffer.from('https://login.work.weixin.qq.com/qr/XYZ')), 150)
+    const cli = new WeComCliService(spawnFn, failingQr, 'linux', noQrFile)
     await expect(cli.beginAuth()).rejects.toThrow('qr failed')
     expect(child.killed).toBe(true)
     // The mutex is released: the retry reaches the 10s no-url wait instead of
@@ -244,25 +285,20 @@ describe('WeComCliService', () => {
   }, 12_000)
 
   it('fails beginAuth when no URL appears', async () => {
-    vi.useFakeTimers()
-    try {
-      const child = new FakeChild()
-      const { spawnFn } = fakeSpawn({
-        'wecom-cli --version': () => emit(new FakeChild(), '1.2.3'),
-        'wecom-cli auth show --status': () => emit(new FakeChild(), 'unauthorized'),
-        'wecom-cli auth init --noninteractive --no-browser': () => child,
-        // The bare fallback exits fast: no URL there either.
-        'wecom-cli auth init --noninteractive': () => emit(new FakeChild(), '', '', 2),
-      })
-      const cli = new WeComCliService(spawnFn, qrFn)
-      const pending = cli.beginAuth()
-      await vi.advanceTimersByTimeAsync(10_500)
-      await expect(pending).resolves.toEqual({ outcome: 'no-url' })
-      expect(child.killed).toBe(true)
-    } finally {
-      vi.useRealTimers()
-    }
-  })
+    const child = new FakeChild()
+    const { spawnFn } = fakeSpawn({
+      'wecom-cli --version': () => emit(new FakeChild(), '1.2.3'),
+      'wecom-cli auth show --status': () => emit(new FakeChild(), 'unauthorized'),
+      [FILE_MODE]: rejectFlags,
+      [FLAG_MODE]: () => child,
+      // The bare fallback exits fast: no URL there either.
+      [BARE_MODE]: () => emit(new FakeChild(), '', '', 2),
+    })
+    const cli = new WeComCliService(spawnFn, qrFn, 'linux', noQrFile)
+    // Real timers: the 10s window plus two fast-fail attempts.
+    await expect(cli.beginAuth()).resolves.toEqual({ outcome: 'no-url' })
+    expect(child.killed).toBe(true)
+  }, 12_000)
 
   it('does not invoke taskkill off Windows', async () => {
     const child = new FakeChild()
@@ -270,10 +306,10 @@ describe('WeComCliService', () => {
     const { spawnFn, calls } = fakeSpawn({
       'wecom-cli --version': () => emit(new FakeChild(), '1.2.3'),
       'wecom-cli auth show --status': () => emit(new FakeChild(), 'unauthorized'),
-      'wecom-cli auth init --noninteractive --no-browser': () => child,
+      [FILE_MODE]: rejectFlags,
+      [FLAG_MODE]: emitUrlOnSpawn(child, 'https://login.work.weixin.qq.com/qr/UN'),
     })
-    const cli = new WeComCliService(spawnFn, qrFn, 'linux')
-    setTimeout(() => child.stdout.emit('data', Buffer.from('https://login.work.weixin.qq.com/qr/UN')), 150)
+    const cli = new WeComCliService(spawnFn, qrFn, 'linux', noQrFile)
     await cli.beginAuth()
     cli.cancelAuth()
     expect(calls.some(call => call.command === 'taskkill')).toBe(false)

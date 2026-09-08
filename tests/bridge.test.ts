@@ -1,4 +1,7 @@
 import { describe, expect, it, vi } from 'vitest'
+import { mkdtemp } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 import type {
   BaseMessage,
   EventMessageWith,
@@ -12,6 +15,7 @@ import type {
 } from '@wecom/aibot-node-sdk'
 import { EventType } from '@wecom/aibot-node-sdk'
 import { WeComHarnessBridge } from '../src/bridge.js'
+import { SETTINGS_NS } from '../src/settings-web.js'
 import { sessionIdFor } from '../src/util.js'
 import { testConfig } from './fixtures.js'
 
@@ -131,6 +135,7 @@ function agentContext(
     commandId: 'test-command',
     result: { kind: 'success' as const, text: 'Harness command completed' },
   })),
+  onCreate?: (options: { sessionId?: unknown; meta?: { cwd?: string; agentPreset?: string } }) => void,
 ): never {
   const logger = { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() }
   const events: unknown[] = []
@@ -165,7 +170,8 @@ function agentContext(
     agentPresets: { defaultId: 'standard', mount: vi.fn(async () => ({ id: 'standard' })) },
     llm: { resolveModelInfo: vi.fn(async () => ({ inputModalities: ['text'] })) },
     agents: {
-      create: vi.fn(async (options: { setup?: (ctx: never) => Promise<void> }) => {
+      create: vi.fn(async (options: { sessionId?: unknown; meta?: { cwd?: string; agentPreset?: string }; setup?: (ctx: never) => Promise<void> }) => {
+        onCreate?.(options)
         await options.setup?.({
           systemPrompt: { section: vi.fn(() => vi.fn()) },
           tools: { register: vi.fn(() => vi.fn()) }, get: vi.fn(() => undefined), reflect: { provide: vi.fn(() => vi.fn()) }, effect: vi.fn((callback: unknown) => { if (typeof callback !== "function") return () => {}; const generator = (callback as () => Generator)(); const first = generator.next(); return typeof first.value === "function" ? first.value as () => void : () => {} }),
@@ -383,6 +389,167 @@ describe('WeComHarnessBridge', () => {
     expect(client.cardUpdates).toHaveLength(1)
     expect(client.sent.filter(entry => entry.msgtype === 'markdown')).toHaveLength(1)
     await bridge.stop()
+  })
+
+  function cardClick(
+    msgid: string,
+    taskId: string | undefined,
+    eventKey: string,
+    createTime = 1,
+  ): EventMessageWith<TemplateCardEventData> {
+    return {
+      msgid,
+      aibotid: 'test-bot',
+      chattype: 'single',
+      from: { userid: 'u1' },
+      msgtype: 'event',
+      create_time: createTime,
+      event: { eventtype: EventType.TemplateCardEvent, task_id: taskId, event_key: eventKey },
+    } as never
+  }
+
+  it('lists workspace candidates via /ws and validates switch numbers', async () => {
+    const client = new FakeClient()
+    const config = testConfig({ workspaces: ['/tmp/ws-a', '/tmp/ws-b'] })
+    const bridge = new WeComHarnessBridge(commandContext('resolved-secret'), config, () => client as never)
+    await bridge.start()
+    await client.message(textMessage('/ws', 'm-ws'))
+
+    expect(client.replies[0]?.content).toContain('/tmp/wecom-test')
+    expect(client.replies[0]?.content).toContain('/tmp/ws-b')
+    expect(client.replies[0]?.content).toContain('✓ 当前')
+    expect(client.sent.some(entry =>
+      entry.msgtype === 'template_card' && entry.template_card?.card_type === 'text_notice')).toBe(true)
+
+    await client.message(textMessage('/ws 9', 'm-ws-bad'))
+    expect(client.replies[1]?.content).toContain('编号超出范围')
+    await bridge.stop()
+  })
+
+  it('switches workspaces only after the confirm card click, never starting a model turn', async () => {
+    const client = new FakeClient()
+    const created: Array<{ sessionId: string; cwd: string | undefined }> = []
+    const ctx = agentContext(undefined, options => created.push({
+      sessionId: String(options.sessionId),
+      cwd: options.meta?.cwd,
+    }))
+    const config = testConfig({ workspaces: ['/tmp/ws-a', '/tmp/ws-b'] })
+    const bridge = new WeComHarnessBridge(ctx, config, () => client as never)
+    await bridge.start()
+    await client.message(textMessage('/ws 3', 'm-ws2'))
+
+    const card = client.sent.find(entry => entry.msgtype === 'template_card')
+    expect(card?.template_card).toEqual(expect.objectContaining({
+      card_type: 'button_interaction',
+      main_title: expect.objectContaining({ title: '切换工作区' }),
+      button_list: [
+        expect.objectContaining({ text: '切换', key: 'ws-confirm' }),
+        expect.objectContaining({ text: '取消', key: 'ws-cancel' }),
+      ],
+    }))
+    const taskId = card?.template_card?.task_id
+    if (taskId === undefined) throw new Error('/ws 2 did not send a confirm card')
+
+    await client.cardEvent(cardClick('ev-ws-ok', taskId, 'ws-confirm'))
+
+    // Same-type in-place ack, no model turn, and the switch confirmation.
+    expect(client.cardUpdates).toHaveLength(1)
+    expect(client.cardUpdates[0]?.templateCard).toEqual(expect.objectContaining({
+      card_type: 'button_interaction',
+      task_id: taskId,
+    }))
+    expect(client.sent.filter(entry => entry.msgtype === 'markdown').map(entry => entry.markdown?.content))
+      .toEqual(['已切换工作区到 `/tmp/ws-b`，并开启新对话；旧历史保留在网页端。'])
+    expect(created.at(-1)).toEqual({ sessionId: expect.stringMatching(/-n1$/u), cwd: '/tmp/ws-b' })
+
+    // A re-click on the consumed confirm card is ignored entirely.
+    await client.cardEvent(cardClick('ev-ws-again', taskId, 'ws-cancel', 2))
+    expect(client.cardUpdates).toHaveLength(1)
+    expect(client.sent.filter(entry => entry.msgtype === 'markdown')).toHaveLength(1)
+    await bridge.stop()
+  })
+
+  it('settles a pending workspace switch from text: cancel button, plain text cancels, 1 confirms', async () => {
+    const client = new FakeClient()
+    const created: Array<{ sessionId: string; cwd: string | undefined }> = []
+    const ctx = agentContext(undefined, options => created.push({
+      sessionId: String(options.sessionId),
+      cwd: options.meta?.cwd,
+    }))
+    const config = testConfig({ workspaces: ['/tmp/ws-a'] })
+    const bridge = new WeComHarnessBridge(ctx, config, () => client as never)
+    await bridge.start()
+    await client.message(textMessage('/ws 2', 'm-ws'))
+    const taskId = client.sent.find(entry => entry.msgtype === 'template_card')?.template_card?.task_id
+
+    // The cancel button settles the pending without switching.
+    await client.cardEvent(cardClick('ev-ws-no', taskId, 'ws-cancel'))
+    expect(client.sent.at(-1)?.markdown?.content).toContain('已取消工作区操作')
+
+    // A new /ws request, then plain text: anything but the confirm words cancels.
+    await client.message(textMessage('/ws 2', 'm-ws-2'))
+    await client.message(textMessage('再看看', 'm-other'))
+    expect(client.replies.at(-1)?.content).toContain('已取消工作区操作')
+
+    // Confirm words apply the switch.
+    await client.message(textMessage('/ws 2', 'm-ws-3'))
+    await client.message(textMessage('1', 'm-confirm'))
+    expect(client.replies.at(-1)?.content).toContain('已切换工作区到 `/tmp/ws-a`')
+    expect(created.at(-1)).toEqual({ sessionId: expect.stringMatching(/-n1$/u), cwd: '/tmp/ws-a' })
+    await bridge.stop()
+  })
+
+  it('adds a workspace after confirmation and persists it through the settings service', async () => {
+    const workspace = await mkdtemp(join(tmpdir(), 'dsh-wecom-ws-add-'))
+    const client = new FakeClient()
+    const update = vi.fn(async () => undefined)
+    const describe = vi.fn(() => [{ ns: SETTINGS_NS, revision: 7, value: { botId: 'test-bot' } }])
+    const settings = { writable: true, describe, update }
+    const base = commandContext('resolved-secret') as unknown as Record<string, unknown>
+    const ctx = {
+      ...base,
+      settings,
+      get: vi.fn((name: string) => name === 'settings' ? settings : undefined),
+    } as never
+    const bridge = new WeComHarnessBridge(ctx, testConfig(), () => client as never)
+    await bridge.start()
+
+    await client.message(textMessage('/ws add relative/path', 'm-bad'))
+    expect(client.replies[0]?.content).toContain('绝对路径')
+
+    await client.message(textMessage(`/ws add ${workspace}`, 'm-add'))
+    expect(client.replies[1]?.content).toContain('将新增工作区')
+    expect(client.sent.some(entry => entry.msgtype === 'template_card')).toBe(true)
+
+    await client.message(textMessage('1', 'm-add-ok'))
+    expect(client.replies[2]?.content).toContain(`已新增工作区 \`${workspace}\``)
+    expect(update).toHaveBeenCalledWith(SETTINGS_NS, expect.objectContaining({ workspaces: [workspace] }), 7)
+
+    // A second add of the same path is rejected without another pending.
+    await client.message(textMessage(`/ws add ${workspace}`, 'm-add-2'))
+    expect(client.replies[3]?.content).toContain('已在候选列表中')
+    await bridge.stop()
+  })
+
+  it('drops a pending workspace confirmation after two minutes', async () => {
+    vi.useFakeTimers()
+    try {
+      const client = new FakeClient()
+      const config = testConfig({ workspaces: ['/tmp/ws-a'] })
+      const bridge = new WeComHarnessBridge(agentContext(), config, () => client as never)
+      await bridge.start()
+      await client.message(textMessage('/ws 2', 'm-ws'))
+      expect(client.replies[0]?.content).toContain('将切换工作区')
+
+      await vi.advanceTimersByTimeAsync(120_001)
+      await client.message(textMessage('1', 'm-late'))
+      // The expired pending is dropped: the plain text reaches the model.
+      const finished = client.replies.filter(reply => reply.finish !== false)
+      expect(finished.at(-1)?.content).toBe('# Model reply\n\n- first\n- second')
+      await bridge.stop()
+    } finally {
+      vi.useRealTimers()
+    }
   })
 
   it('keeps chat order when a question interrupts a streaming turn: text, then question, then post-answer reply', async () => {

@@ -178,7 +178,7 @@ describe('WeComCliService', () => {
     expect(result.outcome).toBe('started')
     expect(result.qrDataUrl).toBe('data:image/png;base64,QUJD')
     expect(qrFileFn).toHaveBeenCalledWith(QR_FILE)
-    expect(calls[2].args).toContain('--output-qrcode')
+    expect(calls[2]?.args).toContain('--output-qrcode')
     // The auth process is still waiting for the scan.
     await expect(cli.authStatus()).resolves.toMatchObject({ waiting: true })
   })

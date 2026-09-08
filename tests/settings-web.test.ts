@@ -114,6 +114,7 @@ describe('WeCom settings web backend', () => {
         singlePolicy: 'allowlist',
         groupPolicy: 'disabled',
         welcomeText: '你好',
+        workspaces: ['/tmp/ws-a', ' /tmp/ws-a ', ''],
       },
     }), res)
 
@@ -123,6 +124,7 @@ describe('WeCom settings web backend', () => {
       singlePolicy: 'allowlist',
       groupPolicy: 'disabled',
       welcomeText: '你好',
+      workspaces: ['/tmp/ws-a'],
     }, 3)
     expect(captured.status).toBe(200)
     expect(captured.body.ok).toBe(true)
@@ -149,7 +151,7 @@ describe('WeCom settings web backend', () => {
     await instance.handle(mockRequest('POST', {
       action: 'save',
       expectedRevision: 2,
-      value: { botId: 'x', cardMode: 'off', singlePolicy: 'open', groupPolicy: 'open', welcomeText: '' },
+      value: { botId: 'x', cardMode: 'off', singlePolicy: 'open', groupPolicy: 'open', welcomeText: '', workspaces: [] },
     }), res)
 
     expect(captured.status).toBe(400)
@@ -175,9 +177,47 @@ describe('WeCom settings web backend', () => {
     expect(() => parseRequest({})).toThrow('action is required')
     expect(() => parseRequest({ action: 'save', expectedRevision: -1, value: {} })).toThrow('non-negative')
     expect(() => parseRequest({ action: 'save', expectedRevision: 0, value: { botId: 1 } })).toThrow('must be a string')
+    expect(() => parseRequest({
+      action: 'save',
+      expectedRevision: 0,
+      value: { botId: 'x', cardMode: 'off', singlePolicy: 'open', groupPolicy: 'open', welcomeText: '', workspaces: ['/tmp/a', 5] },
+    })).toThrow('array of strings')
     expect(() => parseRequest({ action: 'set-key', value: '  ' })).toThrow('non-empty')
     expect(() => parseRequest({ action: 'unknown' })).toThrow('unsupported action')
     expect(parseRequest({ action: 'clear-key' })).toEqual({ action: 'clear-key' })
+  })
+
+  it('exposes the default workspace and normalized workspace candidates in the snapshot', async () => {
+    const { instance } = backend(testConfig({ workspaces: [' /tmp/ws-a ', '/tmp/ws-a', '  '] }))
+    const { res, captured } = mockResponse()
+
+    await instance.handle(mockRequest('GET'), res)
+
+    const value = captured.body.value as { defaultWorkspace?: string; settings?: { value?: { workspaces?: string[] } } }
+    expect(value.defaultWorkspace).toBe('/tmp/wecom-test')
+    expect(value.settings?.value?.workspaces).toEqual(['/tmp/ws-a'])
+  })
+
+  it('rejects a save whose workspaces are not absolute paths', async () => {
+    const { instance, update } = backend()
+    const { res, captured } = mockResponse()
+
+    await instance.handle(mockRequest('POST', {
+      action: 'save',
+      expectedRevision: 3,
+      value: {
+        botId: 'test-bot',
+        cardMode: 'tool',
+        singlePolicy: 'open',
+        groupPolicy: 'open',
+        welcomeText: '',
+        workspaces: ['relative/path'],
+      },
+    }), res)
+
+    expect(update).not.toHaveBeenCalled()
+    expect(captured.status).toBe(400)
+    expect(captured.body.error?.message).toContain('绝对路径')
   })
 
   it('parses the five cli actions', () => {

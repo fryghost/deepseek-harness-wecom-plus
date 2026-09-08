@@ -1,8 +1,9 @@
 import { createHash } from 'node:crypto'
-import { readFile } from 'node:fs/promises'
+import { readFile, stat } from 'node:fs/promises'
 import { isAbsolute } from 'node:path'
 import type { Context } from '@deepseek-ai/cordis'
 import { credentialRef } from '@deepseek-ai/dsh-credentials'
+import { SettingsConflictError, type SettingsProvider } from '@deepseek-ai/dsh-settings'
 import {
   generateReqId,
   WSAuthFailureError,
@@ -22,9 +23,9 @@ import {
   type WsFrame,
   type WsFrameHeaders,
 } from '@wecom/aibot-node-sdk'
-import { buildClickAckCard, buildTemplateCard, buildTextNoticeAckCard, repairCardForResend } from './card.js'
+import { buildClickAckCard, buildTemplateCard, buildTextNoticeAckCard, generateTaskId, repairCardForResend } from './card.js'
 import type { WeComCliService } from './cli.js'
-import type { Config } from './config.js'
+import { isWorkspacePath, workspaceCandidates, type Config } from './config.js'
 import {
   ConversationManager,
   type ConversationCommandReply,
@@ -34,7 +35,8 @@ import {
 import type { WeComDownloadPort } from './inbound.js'
 import type { OutboundFile } from './outbound-file.js'
 import { cardEventFacts, selectedOptionIds } from './questions.js'
-import { chatTarget, SeenMessageIds, truncateUtf8, withTimeout } from './util.js'
+import { SETTINGS_NS } from './settings-web.js'
+import { chatTarget, SeenMessageIds, sessionIdFor, truncateUtf8, withTimeout } from './util.js'
 import { PLUGIN_VERSION } from './version.js'
 
 const OUTBOUND_TEST_PNG = Buffer.from(
@@ -101,6 +103,34 @@ interface WeComSlashCommand {
 
 export type WeComClientFactory = (options: WSClientOptions) => WeComClientPort
 
+/**
+ * The minimal peer facts every inbound shape carries: both `BaseMessage` and
+ * event frames (`EventMessageWith<...>`) are assignable to it.
+ */
+type WeComPeer = {
+  chattype?: 'single' | 'group'
+  chatid?: string
+  from: { userid: string }
+}
+
+/**
+ * Pending `/ws` confirmation: a workspace switch or add that waits for a
+ * card click on its confirm card, or for the next plain text (1/确认/是
+ * applies it, anything else cancels it). One per conversation, 2 minutes.
+ */
+interface WorkspacePending {
+  kind: 'workspace-switch' | 'workspace-add'
+  payload: string
+  taskId: string
+  card: TemplateCard
+  expiresAt: number
+}
+
+const WORKSPACE_CONFIRM_TEXTS = new Set(['1', '确认', '是', 'yes'])
+const WORKSPACE_CONFIRM_KEY = 'ws-confirm'
+const WORKSPACE_CANCEL_KEY = 'ws-cancel'
+const WORKSPACE_CONFIRM_TTL_MS = 120_000
+
 /** Live WeCom WebSocket ↔ DeepSeek Harness bridge. */
 export class WeComHarnessBridge {
   private readonly log
@@ -112,6 +142,14 @@ export class WeComHarnessBridge {
   private lastError: string | undefined
   /** Task ids whose click was already processed; re-clicks are dropped. */
   private readonly consumedCardTasks = new Set<string>()
+  /** Per-conversation pending workspace confirmation (switch/add). */
+  private readonly workspaceConfirms = new Map<string, WorkspacePending>()
+  /**
+   * Workspaces added in this bridge's lifetime. Persisting a new candidate
+   * restarts the channel, but until the replacement bridge is live this
+   * overlay keeps the new candidate visible and keeps dedupe honest.
+   */
+  private readonly workspaceOverlay = new Set<string>()
 
   constructor(
     private readonly ctx: Context,
@@ -120,6 +158,12 @@ export class WeComHarnessBridge {
     private readonly cli?: WeComCliService | undefined,
   ) {
     if (!isAbsolute(config.cwd)) throw new Error(`wecom-channel: cwd must be absolute, got ${JSON.stringify(config.cwd)}`)
+    const invalidWorkspaces = config.workspaces.filter(entry => !isWorkspacePath(entry))
+    if (invalidWorkspaces.length > 0) {
+      throw new Error(
+        `wecom-channel: workspaces entries must be absolute paths, got ${JSON.stringify(invalidWorkspaces)}`,
+      )
+    }
     if (!isAbsolute(config.inboundFileDirectory)) {
       throw new Error(
         `wecom-channel: inboundFileDirectory must be absolute, got ${JSON.stringify(config.inboundFileDirectory)}`,
@@ -286,6 +330,15 @@ export class WeComHarnessBridge {
       // neither update the card again nor start another model turn.
       this.log.info('WeCom card %s re-click on consumed task %s ignored', body.msgid, taskId)
       return
+    }
+    // A pending /ws confirmation card is handled here — before any question
+    // settlement or model turn — so confirming a workspace never starts one.
+    if (taskId !== undefined && taskId.length > 0) {
+      const pending = this.takeWorkspaceConfirm(this.baseIdOf(body), taskId)
+      if (pending !== undefined) {
+        await this.acknowledgeWorkspaceConfirm(frame, body, pending, taskId, eventKey ?? '')
+        return
+      }
     }
     // Read the pending-question facts BEFORE settling: settling removes the
     // pending entry, and the question card snapshot is needed to acknowledge
@@ -485,6 +538,21 @@ export class WeComHarnessBridge {
         await this.sendReply(frame, { text: await this.cliStatusText(), images: [], cards: [] })
         return
       }
+      if (command?.name === 'ws') {
+        await this.handleWorkspaceCommand(frame, message, command)
+        return
+      }
+      // A pending workspace confirmation turns the next plain text into the
+      // decision: 1/确认/是 applies it, anything else cancels it. Slash
+      // commands keep their own meaning and never settle a confirmation; an
+      // expired pending is dropped here so the message reaches the model.
+      const workspacePending = command === undefined
+        ? this.takeWorkspaceConfirm(this.baseIdOf(message))
+        : undefined
+      if (workspacePending !== undefined) {
+        await this.settleWorkspaceTextConfirm(frame, message, workspacePending)
+        return
+      }
       // While an ask_user_question is open, the user's reply IS the answer:
       // settle the question, acknowledge the answer immediately, and let the
       // running turn continue instead of starting a new one.
@@ -549,6 +617,306 @@ export class WeComHarnessBridge {
     }
   }
 
+  private baseIdOf(message: WeComPeer): string {
+    return sessionIdFor(this.config.accountId, message)
+  }
+
+  /** Expired entries are dropped; a mismatching taskId leaves the pending intact. */
+  private takeWorkspaceConfirm(baseId: string, taskId?: string): WorkspacePending | undefined {
+    const pending = this.workspaceConfirms.get(baseId)
+    if (pending === undefined) return undefined
+    if (Date.now() > pending.expiresAt) {
+      this.workspaceConfirms.delete(baseId)
+      return undefined
+    }
+    if (taskId !== undefined && pending.taskId !== taskId) return undefined
+    return pending
+  }
+
+  /** `/ws` entry point: list workspaces, or request a confirmed switch/add. */
+  private async handleWorkspaceCommand(
+    frame: WsFrame<BaseMessage>,
+    message: BaseMessage,
+    command: WeComSlashCommand,
+  ): Promise<void> {
+    const baseId = this.baseIdOf(message)
+    // A fresh /ws replaces any earlier pending confirmation.
+    this.workspaceConfirms.delete(baseId)
+    const rest = command.line.slice('/ws'.length).trim()
+    if (rest.length === 0) {
+      await this.sendWorkspaceList(frame, message)
+      return
+    }
+    const addMatch = /^add\s+(.+)$/is.exec(rest)
+    if (addMatch !== null) {
+      await this.requestWorkspaceAdd(frame, message, baseId, (addMatch[1] ?? '').trim().replace(/^["']|["']$/gu, ''))
+      return
+    }
+    if (/^\d+$/u.test(rest)) {
+      await this.requestWorkspaceSwitch(frame, message, baseId, Number.parseInt(rest, 10))
+      return
+    }
+    await this.sendReply(frame, {
+      text: [
+        '用法：',
+        '/ws — 查看候选工作区',
+        '/ws <编号> — 切换到候选工作区（开启新对话）',
+        '/ws add <绝对路径> — 新增候选工作区',
+      ].join('\n'),
+      images: [],
+      cards: [],
+    })
+  }
+
+  /** Current candidates: configured workspaces plus anything added this lifetime. */
+  private workspaceList(): string[] {
+    return workspaceCandidates({
+      cwd: this.config.cwd,
+      workspaces: [...this.config.workspaces, ...this.workspaceOverlay],
+    })
+  }
+
+  private async sendWorkspaceList(frame: WsFrame<BaseMessage>, message: BaseMessage): Promise<void> {
+    const candidates = this.workspaceList()
+    const current = await this.conversations.workspaceOf(message)
+    const lines = candidates.map((candidate, index) => {
+      const marks: string[] = []
+      if (index === 0) marks.push('默认')
+      if (workspaceSamePath(candidate, current)) marks.push('✓ 当前')
+      return `${index + 1}. \`${candidate}\`${marks.length > 0 ? `（${marks.join('，')}）` : ''}`
+    })
+    const card = buildTemplateCard({
+      cardType: 'text_notice',
+      title: '切换工作区',
+      desc: '请直接回复编号',
+    }, this.config.cardTaskIdPrefix)
+    await this.sendReply(frame, {
+      text: [
+        '候选工作区：',
+        ...lines,
+        '',
+        '回复 /ws <编号> 切换（会开启新对话，上下文不延续）；/ws add <绝对路径> 新增候选。',
+      ].join('\n'),
+      images: [],
+      cards: [card],
+    })
+  }
+
+  private async requestWorkspaceSwitch(
+    frame: WsFrame<BaseMessage>,
+    message: BaseMessage,
+    baseId: string,
+    index: number,
+  ): Promise<void> {
+    const candidates = this.workspaceList()
+    const target = candidates[index - 1]
+    if (target === undefined) {
+      await this.sendReply(frame, {
+        text: `编号超出范围（1-${candidates.length}）。发送 /ws 查看候选列表。`,
+        images: [],
+        cards: [],
+      })
+      return
+    }
+    const current = await this.conversations.workspaceOf(message)
+    if (workspaceSamePath(target, current)) {
+      await this.sendReply(frame, { text: `当前已是工作区 \`${target}\`，无需切换。`, images: [], cards: [] })
+      return
+    }
+    const taskId = generateTaskId(this.config.cardTaskIdPrefix)
+    const card = buildTemplateCard({
+      cardType: 'button_interaction',
+      title: '切换工作区',
+      desc: `将切换到 ${target}`,
+      taskId,
+      buttons: [
+        { text: '切换', key: WORKSPACE_CONFIRM_KEY, style: 2 },
+        { text: '取消', key: WORKSPACE_CANCEL_KEY, style: 2 },
+      ],
+    }, this.config.cardTaskIdPrefix)
+    this.workspaceConfirms.set(baseId, {
+      kind: 'workspace-switch',
+      payload: target,
+      taskId,
+      card,
+      expiresAt: Date.now() + WORKSPACE_CONFIRM_TTL_MS,
+    })
+    await this.sendReply(frame, {
+      text: `将切换工作区到 \`${target}\`。\n回复 1 或点击卡片确认；切换会开启新对话（上下文不延续）。回复其他内容取消。`,
+      images: [],
+      cards: [card],
+    })
+  }
+
+  private async requestWorkspaceAdd(
+    frame: WsFrame<BaseMessage>,
+    message: BaseMessage,
+    baseId: string,
+    rawPath: string,
+  ): Promise<void> {
+    const path = rawPath
+    if (path.length === 0 || !isWorkspacePath(path)) {
+      await this.sendReply(frame, {
+        text: '请提供本机绝对路径，例如 /ws add D:\\projects\\demo。',
+        images: [],
+        cards: [],
+      })
+      return
+    }
+    if (this.workspaceList().some(candidate => workspaceSamePath(candidate, path))) {
+      await this.sendReply(frame, { text: `该路径已在候选列表中：\`${path}\`。发送 /ws 查看候选列表。`, images: [], cards: [] })
+      return
+    }
+    let info
+    try {
+      info = await stat(path)
+    } catch {
+      await this.sendReply(frame, { text: `该路径不存在或无法访问：\`${path}\``, images: [], cards: [] })
+      return
+    }
+    if (!info.isDirectory()) {
+      await this.sendReply(frame, { text: `该路径不是目录：\`${path}\``, images: [], cards: [] })
+      return
+    }
+    const taskId = generateTaskId(this.config.cardTaskIdPrefix)
+    const card = buildTemplateCard({
+      cardType: 'button_interaction',
+      title: '新增工作区',
+      desc: `将新增 ${path}`,
+      taskId,
+      buttons: [
+        { text: '确认', key: WORKSPACE_CONFIRM_KEY, style: 2 },
+        { text: '取消', key: WORKSPACE_CANCEL_KEY, style: 2 },
+      ],
+    }, this.config.cardTaskIdPrefix)
+    this.workspaceConfirms.set(baseId, {
+      kind: 'workspace-add',
+      payload: path,
+      taskId,
+      card,
+      expiresAt: Date.now() + WORKSPACE_CONFIRM_TTL_MS,
+    })
+    await this.sendReply(frame, {
+      text: `将新增工作区 \`${path}\`。\n回复 1 或点击卡片确认；回复其他内容取消。`,
+      images: [],
+      cards: [card],
+    })
+  }
+
+  /** Settle a pending workspace confirmation from the user's plain text reply. */
+  private async settleWorkspaceTextConfirm(
+    frame: WsFrame<BaseMessage>,
+    message: BaseMessage,
+    pending: WorkspacePending,
+  ): Promise<void> {
+    this.workspaceConfirms.delete(this.baseIdOf(message))
+    if (!WORKSPACE_CONFIRM_TEXTS.has(extractTextContent(message).trim().toLowerCase())) {
+      await this.sendReply(frame, { text: '已取消工作区操作，当前设置保持不变。', images: [], cards: [] })
+      return
+    }
+    await this.applyWorkspaceDecision(message, pending, frame)
+  }
+
+  /** Settle a pending workspace confirmation from its card's button click. */
+  private async acknowledgeWorkspaceConfirm(
+    frame: WsFrame<EventMessageWith<TemplateCardEventData>>,
+    body: EventMessageWith<TemplateCardEventData>,
+    pending: WorkspacePending,
+    taskId: string,
+    eventKey: string,
+  ): Promise<void> {
+    this.workspaceConfirms.delete(this.baseIdOf(body))
+    this.rememberConsumedTask(taskId)
+    const label = pending.card.button_list?.find(button => button.key === eventKey)?.text
+    const ackCard = buildClickAckCard({
+      original: pending.card,
+      taskId,
+      eventKey,
+      ...(label === undefined ? {} : { selectedLabel: label }),
+      ackTitle: this.config.cardClickAckTitle,
+      ackSubtitle: this.config.cardClickAckSubtitle,
+    })
+    await this.acknowledgeCardClick(frame, taskId, ackCard, true)
+    if (eventKey !== WORKSPACE_CONFIRM_KEY) {
+      await this.replyTo(body, undefined, '已取消工作区操作，当前设置保持不变。')
+      return
+    }
+    await this.applyWorkspaceDecision(body, pending, undefined)
+  }
+
+  private async applyWorkspaceDecision(
+    message: WeComPeer,
+    pending: WorkspacePending,
+    frame: WsFrame<BaseMessage> | undefined,
+  ): Promise<void> {
+    if (pending.kind === 'workspace-switch') {
+      try {
+        await this.conversations.reset(message, pending.payload)
+      } catch (error) {
+        this.log.error('WeCom workspace switch failed: %s', String(error))
+        await this.replyTo(message, frame, '切换工作区失败，请稍后重试。')
+        return
+      }
+      await this.replyTo(message, frame, `已切换工作区到 \`${pending.payload}\`，并开启新对话；旧历史保留在网页端。`)
+      return
+    }
+    // Workspace add: validate once more (the path may have vanished while the
+    // confirmation was pending), reply first, then persist — saving restarts
+    // the channel live, and the reply must not race that restart.
+    let info
+    try {
+      info = await stat(pending.payload)
+    } catch {
+      await this.replyTo(message, frame, `该路径已不存在或无法访问：\`${pending.payload}\``)
+      return
+    }
+    if (!info.isDirectory()) {
+      await this.replyTo(message, frame, `该路径不是目录：\`${pending.payload}\``)
+      return
+    }
+    await this.replyTo(message, frame, `已新增工作区 \`${pending.payload}\`。发送 /ws 查看候选，回复 /ws <编号> 切换。`)
+    const next = [...new Set([
+      ...this.config.workspaces.map(entry => entry.trim()).filter(entry => entry.length > 0),
+      ...this.workspaceOverlay,
+      pending.payload,
+    ])]
+    try {
+      await this.persistWorkspaces(next)
+      this.workspaceOverlay.add(pending.payload)
+    } catch (error) {
+      this.log.error('WeCom workspace persist failed: %s', String(error))
+      await this.replyTo(message, frame, `工作区保存失败：${error instanceof Error ? error.message : String(error)}`)
+    }
+  }
+
+  private async replyTo(message: WeComPeer, frame: WsFrame<BaseMessage> | undefined, text: string): Promise<void> {
+    if (frame !== undefined) {
+      await this.sendReply(frame, { text, images: [], cards: [] })
+      return
+    }
+    await this.sendProactive(chatTarget(message), { text, images: [], cards: [] })
+  }
+
+  /** Persist the workspace candidate list through the settings service. */
+  private async persistWorkspaces(next: readonly string[]): Promise<void> {
+    const settings = this.ctx.get('settings') as SettingsProvider | undefined
+    if (settings === undefined) throw new Error('settings service is not available')
+    if (!settings.writable) throw new Error('settings provider is read-only')
+    const apply = async (): Promise<void> => {
+      const descriptor = settings.describe().find(row => row.ns === SETTINGS_NS)
+      if (descriptor === undefined) throw new Error('WeCom settings namespace is not registered')
+      const current = (descriptor.value ?? {}) as Record<string, unknown>
+      await settings.update(SETTINGS_NS, { ...current, workspaces: [...next] }, descriptor.revision)
+    }
+    try {
+      await apply()
+    } catch (error) {
+      // A concurrent save moved the revision: retry once on a fresh snapshot.
+      if (!(error instanceof SettingsConflictError)) throw error
+      await apply()
+    }
+  }
+
   private helpText(): string {
     const harnessCommands = [...this.allowedHarnessCommands].map(name => `/${name}`).join('、') || '（未开放）'
     return [
@@ -563,6 +931,7 @@ export class WeComHarnessBridge {
       '/bot-status — 查看当前会话状态',
       '/bot-cli — wecom-cli 状态检查与安装/授权引导',
       '/bot-cancel — 取消当前生成',
+      '/ws — 查看/切换/新增会话工作区（切换会开启新对话）',
       `已开放的 Harness 命令：${harnessCommands}（仅在当前 preset 注册后可用）`,
       '其他斜杠命令会被插件拒绝，不会送给模型；普通消息会交给当前 Harness 默认模型处理。',
     ].join('\n')
@@ -1038,22 +1407,24 @@ export class WeComHarnessBridge {
   }
 }
 
-function slashCommand(message: BaseMessage): WeComSlashCommand | undefined {
-  let line: string
-  if (message.msgtype === 'text') {
-    line = message.text?.content?.trim() ?? ''
-  } else if (message.msgtype === 'mixed') {
+/** Concatenated text content of a text or mixed message (empty otherwise). */
+function extractTextContent(message: BaseMessage): string {
+  if (message.msgtype === 'text') return message.text?.content ?? ''
+  if (message.msgtype === 'mixed') {
     const mixed = message.mixed as {
       msg_item?: Array<{ msgtype?: string; text?: { content?: string } }>
     } | undefined
-    line = (mixed?.msg_item ?? [])
+    return (mixed?.msg_item ?? [])
       .filter(item => item.msgtype === 'text')
       .map(item => item.text?.content ?? '')
       .join('')
-      .trim()
-  } else {
-    return undefined
   }
+  return ''
+}
+
+function slashCommand(message: BaseMessage): WeComSlashCommand | undefined {
+  const line = extractTextContent(message).trim()
+  if (line.length === 0) return undefined
   const match = /^\/([a-z][a-z0-9_-]*)(?=$|[\t\n\r ])/iu.exec(line)
   if (match === null) return undefined
   const rawName = match[1]
@@ -1120,4 +1491,14 @@ function chatTargetOf(frame: WsFrameHeaders): string {
   const body = (frame as { body?: BaseMessage }).body
   if (body === undefined) throw new Error('WeCom stream frame has no message body')
   return chatTarget(body)
+}
+
+/** Path equality for workspace candidates: trimmed, trailing-separator-free, case-insensitive on Windows. */
+function workspaceSamePath(a: string, b: string): boolean {
+  const normalize = (value: string): string => value.trim().replace(/[\\/]+$/u, '')
+  const left = normalize(a)
+  const right = normalize(b)
+  return process.platform === 'win32'
+    ? left.toLowerCase() === right.toLowerCase()
+    : left === right
 }

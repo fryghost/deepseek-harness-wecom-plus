@@ -32,12 +32,40 @@ export type CardMode = 'auto' | 'tool' | 'off'
 
 const COMMAND_NAME_PATTERN = /^[a-z][a-z0-9_-]*$/u
 
+/** Absolute-path check that works for both Windows and POSIX strings. */
+export function isWorkspacePath(value: string): boolean {
+  return /^(?:[A-Za-z]:[\\/]|\\\\|\/)/u.test(value.trim())
+}
+
+/**
+ * Candidate workspaces for the `/ws` command: the default cwd first, then the
+ * configured extras, trimmed and deduped (trailing separators and, on Windows,
+ * case folded into the same key).
+ */
+export function workspaceCandidates(config: Pick<Config, 'cwd' | 'workspaces'>): string[] {
+  const seen = new Set<string>()
+  const result: string[] = []
+  for (const raw of [config.cwd, ...config.workspaces]) {
+    const candidate = raw.trim()
+    if (candidate.length === 0) continue
+    const normalized = candidate.replace(/[\\/]+$/u, '')
+    const key = process.platform === 'win32' ? normalized.toLowerCase() : normalized
+    if (seen.has(key)) continue
+    seen.add(key)
+    result.push(candidate)
+  }
+  return result
+}
+
 /** WeCom AI Bot channel configuration. */
 export interface Config {
   botId: string
   secretRef: string
   accountId: string
+  /** Default workspace: the first candidate offered by the `/ws` command. */
   cwd: string
+  /** Extra workspace candidates selectable per conversation via `/ws`. */
+  workspaces: string[]
   agentPreset?: string
   websocketUrl: string
   scene: number
@@ -78,6 +106,7 @@ export const Config: z<Config> = z.object({
   secretRef: z.string().default('WECOM_BOT_SECRET'),
   accountId: z.string().default('default'),
   cwd: z.string().required(),
+  workspaces: z.array(z.string()).default([]),
   agentPreset: z.string(),
   websocketUrl: z.string().default('wss://openws.work.weixin.qq.com'),
   scene: z.number().step(1).min(0).default(1),

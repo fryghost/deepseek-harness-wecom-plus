@@ -1,4 +1,4 @@
-# WeCom 插件交互逻辑（v0.7.3）
+# WeCom 插件交互逻辑（v0.10.0）
 
 > 本文档描述 `deepseek-harness-wecom-plus` 在运行时的完整交互行为，与代码同步维护。
 
@@ -24,7 +24,7 @@
 2. **策略过滤**：单聊/群聊各自的 `open / allowlist / disabled`；
 3. **`/bot-cancel`**：取消当前模型回合（同时中止挂起的提问）；
 4. **提问消费**：`tryAnswerFromText` —— 若该会话有挂起的 `ask_user_question`，本次文字就是**答案**（数字 → 选项标签；精确标签 → 匹配；其他 → custom 自由文本），结算后立即回执「已收到你的回答，正在处理…」，**不再开启新回合**；
-5. **内置命令**：`/bot-ping` `/help` `/new` `/reset` `/bot-image-test` `/bot-card-test` `/bot-file-test` `/bot-status` `/bot-cli`，`/export` 明确拒绝；
+5. **内置命令**：`/bot-ping` `/help` `/new` `/reset` `/ws` `/bot-image-test` `/bot-card-test` `/bot-file-test` `/bot-status` `/bot-cli`，`/export` 明确拒绝；
 6. **Harness 命令**：`allowedHarnessCommands`（默认 `/compact` `/goal` `/plan`）转发给命令服务；
 7. **普通消息**：进入模型回合（见下）。
 
@@ -90,12 +90,13 @@
 
 - `wecom-v2-` 持久会话，重启恢复；同会话消息**串行队列**；
 - 网页已打开同一会话 → **借用活体 agent**（不产生第二个 writer），回合结束释放；
-- `/new` / `/reset`：取消当前生成 → 换代新会话（`-n1`、`-n2`…），旧历史保留；
-- 每会话注入：系统提示词 + `wecom_send_file`（工作区校验）+ `wecom_send_card` + `ask_user_question`（覆盖版）。
+- `/new` / `/reset`：取消当前生成 → 换代新会话（`-n1`、`-n2`…），旧历史保留；`/new` **沿用当前会话工作区**；
+- **工作区**：每个会话独立持有工作区（会话 header 的 `meta.cwd` 创建后不可变，切换必然换代）。`/ws` 列出候选（标注默认/当前）；`/ws <编号>` → 「切换 / 取消」双按钮卡二次确认后换代切换；`/ws add <绝对路径>` → 回显二次确认后经 settings 服务持久化（与设置页等效，会触发通道热重连）。pending 确认也可用文字结算：`1`/`确认`/`是` 执行，其他文字取消；pending 2 分钟过期；
+- 每会话注入：系统提示词（含当前工作区）+ `wecom_send_file`（按会话工作区校验）+ `wecom_send_card` + `ask_user_question`（覆盖版）。
 
 ## 8. 配置与设置页
 
-- 设置面板「WeCom 企微」：Bot ID、Secret（凭据服务**只写不读**）、cardMode、单聊/群聊策略、欢迎语；
+- 设置面板「WeCom 企微」：Bot ID、Secret（凭据服务**只写不读**）、cardMode、单聊/群聊策略、欢迎语、候选工作区列表（默认工作区来自 `cwd`，只读展示）；
 - 保存 → 写入 `settings.yaml`（重启保留）并**热重连**，页面实时显示连接状态与最近错误；
 - `~/.dsh/profiles/web/cordis.patch.yml` 中的行配置作为**基线**，界面保存值覆盖基线；
 - 未配置凭据/鉴权失败/配置非法 → 通道休眠并记录日志，**永不拖垮 DSH 启动**。
@@ -113,6 +114,7 @@
 | `/bot-ping` | `pong — …已连接` |
 | `/bot-card-test` | 按钮卡 → 点击 → 卡片原位仍是按钮卡（选项保留、选中打 ✓、辅助文案「已选择…正在处理…」）→ 模型回复；重复点击无反应 |
 | `/bot-cli` | wecom-cli 状态检查与安装/授权引导（未安装给安装指引，未授权引导到设置页扫码，已授权显示就绪与版本） |
+| `/ws` | 编号候选工作区列表（标注默认/当前）；`/ws <编号>` → 确认卡 → 换代切换；`/ws add <绝对路径>` → 确认后持久化 |
 | 长文本问题 | 文字流式逐段出现，工具执行时显示「正在执行工具 xxx…」 |
 | ask 短选项问题 | Markdown + 按钮卡 → 点击 → 卡片原位保留选项并标记「已选择「xx」」→ 模型继续 |
 | ask 长选项问题 | Markdown 编号列表 + 文字卡 → 回数字 → 模型继续 |

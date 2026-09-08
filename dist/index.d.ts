@@ -102,7 +102,10 @@ interface Config {
     botId: string;
     secretRef: string;
     accountId: string;
+    /** Default workspace: the first candidate offered by the `/ws` command. */
     cwd: string;
+    /** Extra workspace candidates selectable per conversation via `/ws`. */
+    workspaces: string[];
     agentPreset?: string;
     websocketUrl: string;
     scene: number;
@@ -204,6 +207,14 @@ declare class WeComHarnessBridge {
     private lastError;
     /** Task ids whose click was already processed; re-clicks are dropped. */
     private readonly consumedCardTasks;
+    /** Per-conversation pending workspace confirmation (switch/add). */
+    private readonly workspaceConfirms;
+    /**
+     * Workspaces added in this bridge's lifetime. Persisting a new candidate
+     * restarts the channel, but until the replacement bridge is live this
+     * overlay keeps the new candidate visible and keeps dedupe honest.
+     */
+    private readonly workspaceOverlay;
     constructor(ctx: Context, config: Config, clientFactory?: WeComClientFactory, cli?: WeComCliService | undefined);
     /** Latest channel fact for configuration surfaces. */
     status(): {
@@ -235,6 +246,24 @@ declare class WeComHarnessBridge {
     /** Bound the consumed-task memory; oldest entries are evicted first. */
     private rememberConsumedTask;
     private handleMessage;
+    private baseIdOf;
+    /** Expired entries are dropped; a mismatching taskId leaves the pending intact. */
+    private takeWorkspaceConfirm;
+    /** `/ws` entry point: list workspaces, or request a confirmed switch/add. */
+    private handleWorkspaceCommand;
+    /** Current candidates: configured workspaces plus anything added this lifetime. */
+    private workspaceList;
+    private sendWorkspaceList;
+    private requestWorkspaceSwitch;
+    private requestWorkspaceAdd;
+    /** Settle a pending workspace confirmation from the user's plain text reply. */
+    private settleWorkspaceTextConfirm;
+    /** Settle a pending workspace confirmation from its card's button click. */
+    private acknowledgeWorkspaceConfirm;
+    private applyWorkspaceDecision;
+    private replyTo;
+    /** Persist the workspace candidate list through the settings service. */
+    private persistWorkspaces;
     private helpText;
     /** Human guidance for the three CLI states; probing errors stay soft. */
     private cliStatusText;
@@ -270,22 +299,21 @@ declare class WeComHarnessBridge {
     private requireClient;
 }
 
+/**
+ * The minimal peer facts every inbound shape carries: both `BaseMessage` and
+ * event frames (`EventMessageWith<...>`) are assignable to it.
+ */
+type WeComPeer = {
+    chattype?: 'single' | 'group';
+    chatid?: string;
+    from: {
+        userid: string;
+    };
+};
 /** Deterministic, non-identifying DSH session id for one WeCom conversation. */
-declare function sessionIdFor(accountId: string, message: {
-    chattype?: 'single' | 'group';
-    chatid?: string;
-    from: {
-        userid: string;
-    };
-}): string;
+declare function sessionIdFor(accountId: string, message: WeComPeer): string;
 /** Target id accepted by WeCom proactive-send APIs. */
-declare function chatTarget(message: {
-    chattype?: 'single' | 'group';
-    chatid?: string;
-    from: {
-        userid: string;
-    };
-}): string;
+declare function chatTarget(message: WeComPeer): string;
 /** Bound UTF-8 text to a WeCom byte limit without splitting a code point. */
 declare function truncateUtf8(text: string, maxBytes: number, suffix?: string): string;
 /** Bounded insertion-ordered duplicate detector. */
@@ -324,6 +352,8 @@ interface WeComUserSettings {
     singlePolicy: Config['singlePolicy'];
     groupPolicy: Config['groupPolicy'];
     welcomeText: string;
+    /** Extra workspace candidates selectable per conversation via `/ws`. */
+    workspaces: string[];
 }
 /** Public Settings snapshot; credential values are deliberately impossible here. */
 interface WeComSettingsSnapshot {
@@ -342,6 +372,8 @@ interface WeComSettingsSnapshot {
     };
     channel: WeComChannelStatus;
     cli?: CliProbeResult;
+    /** Default workspace (config cwd); display-only, not user-editable here. */
+    defaultWorkspace: string;
     release: {
         pluginVersion: string;
     };

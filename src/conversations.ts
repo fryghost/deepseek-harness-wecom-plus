@@ -24,7 +24,7 @@ import type { Config } from './config.js'
 import { inboundContent, type WeComDownloadPort } from './inbound.js'
 import { resolveOutboundFile, type OutboundFile } from './outbound-file.js'
 import { WeComQuestionBridge, cardEventFacts, type QuestionCardSender, type QuestionTextSender } from './questions.js'
-import { chatTarget, sessionIdFor, withTimeout } from './util.js'
+import { chatTarget, sessionIdFor, withTimeout, type WeComPeer } from './util.js'
 
 /**
  * dsh 0.1.2-alpha.x turned session preset resolution into a session
@@ -126,6 +126,8 @@ export class ConversationManager {
   private readonly cardRegistry = new Map<string, CardRegistryEntry>()
   private readonly questions: WeComQuestionBridge
   private readonly generations = new Map<string, number>()
+  /** Durable per-session workspace: session meta.cwd is immutable, so switching goes through a new generation. */
+  private readonly sessionCwds = new Map<string, string>()
   private persistedIds = new Set<string>()
   private readonly disposeSessionEvents: () => void
 
@@ -269,8 +271,14 @@ export class ConversationManager {
     return this.questions.tryAnswerFromText(message)
   }
 
-  /** End the current WeCom conversation session while retaining its history. */
-  async reset(message: BaseMessage): Promise<void> {
+  /**
+   * End the current WeCom conversation session while retaining its history.
+   * An explicit `cwd` switches the NEXT generation's workspace (meta.cwd is
+   * immutable per session, so a workspace switch must rotate the session);
+   * without one the current session's workspace is carried over, so a plain
+   * `/new` never resets the workspace choice.
+   */
+  async reset(message: WeComPeer, cwd?: string): Promise<void> {
     const baseId = sessionIdFor(this.config.accountId, message)
     this.cancel(message)
     await this.enqueue(baseId, async () => {
@@ -281,10 +289,11 @@ export class ConversationManager {
         this.bindings.delete(id)
         await binding.release()
       }
+      const nextCwd = cwd ?? await this.resolveWorkspace(id)
       const generation = this.generationFor(baseId)
       if (!Number.isSafeInteger(generation + 1)) throw new Error('WeCom conversation generation is exhausted')
       this.generations.set(baseId, generation + 1)
-      await this.getOrCreate(this.currentSessionId(baseId))
+      await this.getOrCreate(this.currentSessionId(baseId), nextCwd)
     })
   }
 
@@ -326,7 +335,7 @@ export class ConversationManager {
   }
 
   /** Cancel active work for one WeCom conversation. */
-  cancel(message: BaseMessage): boolean {
+  cancel(message: WeComPeer): boolean {
     const baseId = sessionIdFor(this.config.accountId, message)
     const id = this.currentSessionId(baseId)
     const agent = this.bindings.get(id)?.agent ?? this.ctx.agents.get(SessionId(id))
@@ -346,6 +355,7 @@ export class ConversationManager {
     this.activeStreams.clear()
     this.pendingCards.clear()
     this.cardRegistry.clear()
+    this.sessionCwds.clear()
   }
 
   private enqueue<T>(baseId: string, operation: () => Promise<T>): Promise<T> {
@@ -548,7 +558,31 @@ export class ConversationManager {
     return info.inputModalities?.includes('image') ?? false
   }
 
-  private async getOrCreate(id: string): Promise<ConversationAgentBinding> {
+  /** Current workspace of one WeCom conversation (cache → persistence → default). */
+  async workspaceOf(message: WeComPeer): Promise<string> {
+    const baseId = sessionIdFor(this.config.accountId, message)
+    return this.resolveWorkspace(this.currentSessionId(baseId))
+  }
+
+  private async resolveWorkspace(id: string): Promise<string> {
+    const cached = this.sessionCwds.get(id)
+    if (cached !== undefined) return cached
+    if (this.persistedIds.has(id)) {
+      try {
+        const inspected = await this.ctx.sessionPersistence.inspect(SessionId(id))
+        const cwd = inspected.meta.cwd
+        if (typeof cwd === 'string' && cwd.length > 0) {
+          this.sessionCwds.set(id, cwd)
+          return cwd
+        }
+      } catch {
+        // An unreadable session falls back to the default workspace below.
+      }
+    }
+    return this.config.cwd
+  }
+
+  private async getOrCreate(id: string, cwd?: string): Promise<ConversationAgentBinding> {
     const sessionId = SessionId(id)
     const existing = this.bindings.get(id)
     if (existing !== undefined && this.ctx.agents.get(sessionId) === existing.agent) return existing
@@ -559,14 +593,14 @@ export class ConversationManager {
     const pending = this.creations.get(id)
     if (pending !== undefined) return pending
 
-    const creation = this.createOrResume(id).finally(() => this.creations.delete(id))
+    const creation = this.createOrResume(id, cwd).finally(() => this.creations.delete(id))
     this.creations.set(id, creation)
     const binding = await creation
     this.bindings.set(id, binding)
     return binding
   }
 
-  private async createOrResume(id: string): Promise<ConversationAgentBinding> {
+  private async createOrResume(id: string, cwd?: string): Promise<ConversationAgentBinding> {
     const sessionId = SessionId(id)
     const live = this.ctx.agents.get(sessionId)
     if (live !== undefined) return this.borrowAgent(live, id)
@@ -577,6 +611,9 @@ export class ConversationManager {
       const inspected = await this.ctx.sessionPersistence.inspect(sessionId)
       const agentPreset = resolveSessionPreset(inspected.meta, inspected.events)
         ?? this.resolveAgentPreset()
+      // The session's durable cwd is the workspace of record for resumes.
+      const resumedCwd = inspected.meta.cwd
+      if (typeof resumedCwd === 'string' && resumedCwd.length > 0) this.sessionCwds.set(id, resumedCwd)
       try {
         return this.ownAgent(await this.ctx.agents.resume({
           resumeSessionId: sessionId,
@@ -591,11 +628,14 @@ export class ConversationManager {
     }
 
     const agentPreset = this.resolveAgentPreset()
+    // An explicit cwd comes from a `/ws` workspace switch; new sessions
+    // otherwise start in the configured default workspace.
+    const createdCwd = cwd ?? this.config.cwd
     let handle: AgentHandle
     try {
       handle = await this.ctx.agents.create({
         sessionId,
-        meta: { cwd: this.config.cwd, agentPreset },
+        meta: { cwd: createdCwd, agentPreset },
         agentOptions,
         setup: agentCtx => this.setupAgent(agentCtx, agentPreset, id),
       })
@@ -604,6 +644,7 @@ export class ConversationManager {
       if (raced !== undefined) return this.borrowAgent(raced, id)
       throw error
     }
+    this.sessionCwds.set(id, createdCwd)
     this.persistedIds.add(id)
     return this.ownAgent(handle)
   }
@@ -763,7 +804,15 @@ export class ConversationManager {
     return agentCtx.systemPrompt.section({
       name: 'channel:wecom',
       order: 190,
-      text: () => this.activeTurns.has(id) ? this.config.systemPrompt : '',
+      text: () => {
+        if (!this.activeTurns.has(id)) return ''
+        // The workspace follows the session (it may have been switched via
+        // /ws and survives restarts through the session header).
+        const cwd = this.sessionCwds.get(id)
+        return cwd === undefined
+          ? this.config.systemPrompt
+          : `${this.config.systemPrompt}\nThe workspace of this conversation is ${cwd}.`
+      },
     })
   }
 
@@ -800,7 +849,7 @@ export class ConversationManager {
           throw new Error('wecom_send_file: no active WeCom turn; this tool cannot send files from another channel')
         }
         exec.signal.throwIfAborted()
-        const file = await resolveOutboundFile(this.config.cwd, args.path, this.config.maxOutboundFileBytes)
+        const file = await resolveOutboundFile(await this.resolveWorkspace(id), args.path, this.config.maxOutboundFileBytes)
         exec.signal.throwIfAborted()
         await this.sendFile(target, file)
         return { name: file.name, bytes: file.bytes }

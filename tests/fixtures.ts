@@ -7,6 +7,7 @@ export function testConfig(overrides: Partial<Config> = {}): Config {
     secretRef: 'WECOM_BOT_SECRET',
     accountId: 'default',
     cwd: '/tmp/wecom-test',
+    workspaces: [],
     websocketUrl: 'wss://openws.work.weixin.qq.com',
     scene: 1,
     singlePolicy: 'open',

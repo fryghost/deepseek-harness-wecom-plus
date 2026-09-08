@@ -1,3 +1,6 @@
+import { mkdtemp, writeFile } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 import { describe, expect, it, vi } from 'vitest'
 import { EventType } from '@wecom/aibot-node-sdk'
 import type { TemplateCard } from '@wecom/aibot-node-sdk'
@@ -154,7 +157,7 @@ describe('ConversationManager', () => {
     expect(mount).toHaveBeenCalledWith(expect.anything(), 'standard')
     expect(section).toHaveBeenCalledWith(expect.objectContaining({ name: 'channel:wecom', order: 190 }))
     expect(register).toHaveBeenCalledWith(expect.objectContaining({ name: 'wecom_send_file' }))
-    expect(promptDuringTurn).toBe(config.systemPrompt)
+    expect(promptDuringTurn).toBe(`${config.systemPrompt}\nThe workspace of this conversation is ${config.cwd}.`)
     expect(promptText?.()).toBe('')
     expect(agent.followup).toHaveBeenCalledOnce()
     expect(reply).toEqual({ text: 'Harness reply', images: [], cards: [] })
@@ -415,6 +418,192 @@ describe('ConversationManager', () => {
 
     expect(create.mock.calls.map(([options]) => String(options.sessionId))).toEqual([baseId, `${baseId}-n1`])
     expect(disposed).toEqual([baseId])
+    await manager.dispose()
+  })
+
+  /** Rotating-session harness that records every create/resume and their meta.cwd. */
+  function rotatingHarness(config: ReturnType<typeof testConfig>, options: {
+    persisted?: Array<{ id: string }>
+    inspectResult?: () => { meta: Record<string, unknown>; events: unknown[] }
+  } = {}) {
+    const created: Array<{ sessionId: string; cwd: string | undefined }> = []
+    const resumed: string[] = []
+    const live = new Map<string, object>()
+    const buildAgent = (id: string): object => {
+      const events: unknown[] = []
+      return {
+        status: 'idle',
+        options: { provider: 'deepseek', model: 'deepseek-chat' },
+        session: { events },
+        followup: vi.fn(() => {
+          events.push({
+            type: 'assistant/message',
+            data: { message: { content: [{ type: 'text', text: `reply from ${id}` }] } },
+          })
+          events.push({ type: 'turn/end', data: { reason: { kind: 'stop' } } })
+        }),
+        whenIdle: vi.fn(async () => undefined),
+      }
+    }
+    const runSetup = async (setup?: (ctx: never) => Promise<void>): Promise<void> => {
+      await setup?.({
+        systemPrompt: { section: vi.fn(() => vi.fn()) },
+        tools: { register: vi.fn(() => vi.fn()) }, get: vi.fn(() => undefined), reflect: { provide: vi.fn(() => vi.fn()) }, effect: vi.fn((callback: unknown) => { if (typeof callback !== "function") return () => {}; const generator = (callback as () => Generator)(); const first = generator.next(); return typeof first.value === "function" ? first.value as () => void : () => {} }),
+      } as never)
+    }
+    const ctx = {
+      on: vi.fn(() => vi.fn()),
+      sessionPersistence: {
+        list: vi.fn(async () => options.persisted ?? []),
+        inspect: vi.fn(async () => options.inspectResult?.() ?? { meta: {}, events: [] }),
+      },
+      agentDefaultModel: { currentSelection: vi.fn(() => ({ provider: 'deepseek', model: 'deepseek-chat' })) },
+      agentPresets: { defaultId: 'standard', mount: vi.fn(async () => ({ id: 'standard' })) },
+      llm: { resolveModelInfo: vi.fn(async () => ({ inputModalities: ['text'] })) },
+      agents: {
+        create: vi.fn(async (createOptions: {
+          sessionId: string
+          meta?: { cwd?: string; agentPreset?: string }
+          setup?: (ctx: never) => Promise<void>
+        }) => {
+          const id = String(createOptions.sessionId)
+          created.push({ sessionId: id, cwd: createOptions.meta?.cwd })
+          await runSetup(createOptions.setup)
+          const agent = buildAgent(id)
+          live.set(id, agent)
+          return {
+            agent,
+            dispose: vi.fn(async () => { live.delete(id) }),
+          }
+        }),
+        resume: vi.fn(async (resumeOptions: {
+          resumeSessionId: string
+          setup?: (ctx: never) => Promise<void>
+        }) => {
+          const id = String(resumeOptions.resumeSessionId)
+          resumed.push(id)
+          await runSetup(resumeOptions.setup)
+          return { agent: buildAgent(id), dispose: vi.fn(async () => undefined) }
+        }),
+        get: vi.fn((id: unknown) => live.get(String(id)) as never),
+      },
+      attachments: {
+        imageLimits: { maxImagesPerMessage: 4, maxMessageImageBytes: 10_000, maxImageBytes: 10_000 },
+      },
+    } as never
+    return { ctx, created, resumed }
+  }
+
+  it('switches the workspace through a new generation and carries it across /new', async () => {
+    const config = testConfig()
+    const baseId = sessionIdFor(config.accountId, textMessage('u-ws', 'm-ws'))
+    const { ctx, created } = rotatingHarness(config)
+    const manager = new ConversationManager(ctx, config, vi.fn(async () => undefined), vi.fn(async () => undefined), vi.fn(async () => undefined))
+    await manager.initialize()
+
+    await expect(manager.process(textMessage('u-ws', 'm-ws'), downloadPort, noopTransport()))
+      .resolves.toEqual({ text: `reply from ${baseId}`, images: [], cards: [] })
+
+    await manager.reset(textMessage('u-ws', 'm-switch', '/ws 2'), '/tmp/ws-other')
+    await expect(manager.process(textMessage('u-ws', 'm-after'), downloadPort, noopTransport()))
+      .resolves.toEqual({ text: `reply from ${baseId}-n1`, images: [], cards: [] })
+
+    // A plain /new keeps the switched workspace instead of falling back.
+    await manager.reset(textMessage('u-ws', 'm-new', '/new'))
+    await expect(manager.process(textMessage('u-ws', 'm-final'), downloadPort, noopTransport()))
+      .resolves.toEqual({ text: `reply from ${baseId}-n2`, images: [], cards: [] })
+
+    expect(created.map(entry => [entry.sessionId, entry.cwd])).toEqual([
+      [baseId, '/tmp/wecom-test'],
+      [`${baseId}-n1`, '/tmp/ws-other'],
+      [`${baseId}-n2`, '/tmp/ws-other'],
+    ])
+    await manager.dispose()
+  })
+
+  it('resolves the workspace from persistence for resumed sessions and reuses it on /new', async () => {
+    const config = testConfig()
+    const baseId = sessionIdFor(config.accountId, textMessage('u-persist', 'm-p'))
+    const { ctx, created, resumed } = rotatingHarness(config, {
+      persisted: [{ id: baseId }],
+      inspectResult: () => ({ meta: { cwd: '/tmp/ws-persisted', agentPreset: 'standard' }, events: [] }),
+    })
+    const manager = new ConversationManager(ctx, config, vi.fn(async () => undefined), vi.fn(async () => undefined), vi.fn(async () => undefined))
+    await manager.initialize()
+
+    await expect(await manager.workspaceOf(textMessage('u-persist', 'm-probe'))).toBe('/tmp/ws-persisted')
+
+    await expect(manager.process(textMessage('u-persist', 'm-p'), downloadPort, noopTransport()))
+      .resolves.toEqual({ text: `reply from ${baseId}`, images: [], cards: [] })
+    expect(resumed).toEqual([baseId])
+
+    await manager.reset(textMessage('u-persist', 'm-new', '/new'))
+    expect(created).toEqual([{ sessionId: `${baseId}-n1`, cwd: '/tmp/ws-persisted' }])
+    await manager.dispose()
+  })
+
+  it('resolves wecom_send_file against the session workspace after a switch', async () => {
+    const workspace = await mkdtemp(join(tmpdir(), 'dsh-wecom-wsfile-'))
+    const outside = await mkdtemp(join(tmpdir(), 'dsh-wecom-wsfile-out-'))
+    await writeFile(join(workspace, 'hello.txt'), 'workspace file')
+    await writeFile(join(outside, 'secret.txt'), 'outside file')
+    const config = testConfig()
+    let fileTool: ToolDefinition | undefined
+    let runningUpload: Promise<unknown> | undefined
+    let outsideOutcome: Promise<string> | undefined
+    const events: unknown[] = []
+    const sendFile = vi.fn(async () => undefined)
+    const agent = {
+      status: 'idle',
+      options: { provider: 'deepseek', model: 'deepseek-chat' },
+      session: { events },
+      followup: vi.fn(() => {
+        if (fileTool === undefined) throw new Error('wecom_send_file was not registered')
+        runningUpload = fileTool.execute({ path: 'hello.txt' }, { signal: new AbortController().signal } as never)
+        outsideOutcome = fileTool.execute({ path: join(outside, 'secret.txt') }, { signal: new AbortController().signal } as never)
+          .then(() => 'sent', (error: unknown) => String(error))
+        events.push({
+          type: 'assistant/message',
+          data: { message: { content: [{ type: 'text', text: '文件已发送。' }] } },
+        })
+        events.push({ type: 'turn/end', data: { reason: { kind: 'stop' } } })
+      }),
+      whenIdle: vi.fn(async () => runningUpload),
+    }
+    const register = vi.fn((definition: ToolDefinition) => {
+      if (definition.name === 'wecom_send_file') fileTool = definition
+      return vi.fn()
+    })
+    let live: object | undefined
+    const ctx = {
+      on: vi.fn(() => vi.fn()),
+      sessionPersistence: { list: vi.fn(async () => []) },
+      agentDefaultModel: { currentSelection: vi.fn(() => ({ provider: 'deepseek', model: 'deepseek-chat' })) },
+      agentPresets: { defaultId: 'standard', mount: vi.fn(async () => ({ id: 'standard' })) },
+      llm: { resolveModelInfo: vi.fn(async () => ({ inputModalities: ['text'] })) },
+      agents: {
+        create: vi.fn(async (options: { setup?: (ctx: never) => Promise<void> }) => {
+          await options.setup?.({
+            systemPrompt: { section: vi.fn(() => vi.fn()) },
+            tools: { register }, get: vi.fn(() => undefined), reflect: { provide: vi.fn(() => vi.fn()) }, effect: vi.fn((callback: unknown) => { if (typeof callback !== "function") return () => {}; const generator = (callback as () => Generator)(); const first = generator.next(); return typeof first.value === "function" ? first.value as () => void : () => {} }),
+          } as never)
+          live = agent
+          return { agent, dispose: vi.fn(async () => { live = undefined }) }
+        }),
+        get: vi.fn(() => live),
+      },
+      attachments: {
+        imageLimits: { maxImagesPerMessage: 4, maxMessageImageBytes: 10_000, maxImageBytes: 10_000 },
+      },
+    } as never
+    const manager = new ConversationManager(ctx, config, sendFile, vi.fn(async () => undefined), vi.fn(async () => undefined))
+    await manager.initialize()
+
+    await manager.reset(textMessage('u-wsf', 'm-switch'), workspace)
+    await expect(manager.process(textMessage('u-wsf', 'm-wsf'), downloadPort, noopTransport()))
+      .resolves.toEqual({ text: '文件已发送。', images: [], cards: [] })
+    expect(sendFile).toHaveBeenCalledWith('u-wsf', expect.objectContaining({ name: 'hello.txt' }))
+    await expect(outsideOutcome).resolves.toContain('outside configured cwd')
     await manager.dispose()
   })
 

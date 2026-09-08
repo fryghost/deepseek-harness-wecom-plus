@@ -73,6 +73,7 @@ pnpm dsh plugin --profile web add /absolute/path/to/deepseek-harness-wecom-plus
 - **Bot ID**：企微管理后台「智能机器人」页面提供，粘贴进输入框；
 - **Secret**：粘贴进凭据输入框点「保存 Secret」——值经 DSH 凭据服务只写不读，不会回传浏览器；
 - **卡片模式 / 单聊策略 / 群聊策略 / 欢迎语**：下拉选择，保存后**立即生效**（通道自动重连，无需重启 DSH）；
+- **工作区**：维护候选工作区列表（默认工作区来自配置 `cwd`，只读展示）。在企微里发送 `/ws` 可查看、用编号切换（切换会开启新对话），`/ws add <绝对路径>` 也可新增；
 - 页面实时显示连接状态（未激活 / 连接中 / 已连接）与最近错误。
 
 保存的动作写入 DSH 设置文件（settings.yaml），重启后依然生效。也可以在 `~/.dsh/profiles/web/cordis.patch.yml` 里以组合配置作为**基线**覆盖（界面保存的值优先于基线）：
@@ -84,6 +85,7 @@ pnpm dsh plugin --profile web add /absolute/path/to/deepseek-harness-wecom-plus
     botId: !!js process.env.WECOM_BOT_ID
     secretRef: WECOM_BOT_SECRET
     cwd: !!js process.env.DSH_WECOM_CWD ?? process.cwd()
+    workspaces: []
     agentPreset: standard
     scene: 1
     singlePolicy: allowlist
@@ -141,9 +143,11 @@ pnpm dsh plugin --profile web add /absolute/path/to/deepseek-harness-wecom-plus
 
 `agentPreset` 默认使用当前 Harness 部署选择的默认 preset（通常是 `standard`）。插件会把 preset 写入 session header，并在恢复时重新挂载，使模型工具调用交给 Harness Agent Loop 处理，而不是把原始 DSML 文本暴露给用户。修复前创建的会话使用 `wecom-v1-` 命名空间；正确组合后的会话使用 `wecom-v2-`，旧历史保留不动。如果网页已经打开同一个修复后会话，企微 bridge 会借用该 Agent、等待当前活动结束，不会再启动第二个 session writer。
 
-`/new` 和 `/reset` 由企微插件直接处理：当前生成会先被请求取消，然后插件创建带递增后缀的新持久 session；旧 session 不删除，服务重启后也不会回到旧上下文。其他斜杠命令不会作为普通文本送进模型。`allowedHarnessCommands` 控制允许转发给 Harness 命令服务的名称，默认只开放 `/compact`、`/goal`、`/plan`；命令还必须由当前 agent preset 注册才可执行。`/permission` 可以显著扩大 agent 权限，只有同时严格限制 `singleAllowFrom` 和 `groupAllowFrom` 时才应显式加入。依赖网页下载界面的 `/export` 在企微中不可用。发送 `/help` 或 `/bot-help` 可查看企微侧可用命令。
+`/new` 和 `/reset` 由企微插件直接处理：当前生成会先被请求取消，然后插件创建带递增后缀的新持久 session；旧 session 不删除，服务重启后也不会回到旧上下文。`/new` 会**沿用当前会话的工作区**，不会重置工作区选择。其他斜杠命令不会作为普通文本送进模型。`allowedHarnessCommands` 控制允许转发给 Harness 命令服务的名称，默认只开放 `/compact`、`/goal`、`/plan`；命令还必须由当前 agent preset 注册才可执行。`/permission` 可以显著扩大 agent 权限，只有同时严格限制 `singleAllowFrom` 和 `groupAllowFrom` 时才应显式加入。依赖网页下载界面的 `/export` 在企微中不可用。发送 `/help` 或 `/bot-help` 可查看企微侧可用命令。
 
-当前企微用户要求接收或下载文件时，agent 可以调用会话范围内的 `wecom_send_file` 工具。相对路径从 `cwd` 解析，绝对路径也必须位于 `cwd` 内。插件会先解析符号链接，只接受普通文件，并拒绝超过 `maxOutboundFileBytes` 的文件；默认值也是企微协议上限 20,971,520 字节（20 MiB）。该工具仅在当前企微回合生效，因此从网页继续同一会话时，不能向上一次企微目标发送文件。配置的工作目录包含非公开数据时，应使用白名单策略。
+每个企微单聊/群聊会话都可以有**独立的工作区**。发送 `/ws` 查看候选工作区列表（标注默认与当前）；`/ws <编号>` 请求切换——机器人会先回一张「切换 / 取消」确认卡，确认后才换代新会话（session 的 `meta.cwd` 在宿主创建后不可变，所以切换必然开启新对话，旧历史保留在网页端）；`/ws add <绝对路径>` 在二次确认后把新候选持久化到设置（与设置页等效）。工作区选择随会话持久化，重启不丢；普通文本回复 `1`/`确认`/`是` 也能代替点击确认卡，回复其他内容视为取消。
+
+当前企微用户要求接收或下载文件时，agent 可以调用会话范围内的 `wecom_send_file` 工具。相对路径从**当前会话的工作区**解析（可用 `/ws` 切换），绝对路径也必须位于该工作区内。插件会先解析符号链接，只接受普通文件，并拒绝超过 `maxOutboundFileBytes` 的文件；默认值也是企微协议上限 20,971,520 字节（20 MiB）。该工具仅在当前企微回合生效，因此从网页继续同一会话时，不能向上一次企微目标发送文件。配置的工作目录包含非公开数据时，应使用白名单策略。
 
 默认长连接地址为 `wss://openws.work.weixin.qq.com`，`scene` 默认为企微智能机器人长连接所需的 `1`。私有部署企业可以按企微管理后台显示的值覆盖这些配置。
 
@@ -164,6 +168,8 @@ pong — DeepSeek Harness 企微机器人已连接。
 然后发送普通文本、图片或图文混排消息。插件会把消息追加到对应的 Harness 持久会话，并把当前默认模型的回复发回企微。让模型做选择题（例如"给我两个方案：继续发布/回滚，说明各自影响，并用 wecom_send_card 给我按钮"）——回复应呈现为「Markdown 消息 + 带选项按钮的卡片」两条消息；点击按钮后卡片先原位保留选项并标记选中，随后收到模型对所选选项的回复。普通的陈述性问题（如"今天是什么日期"）不应配卡。
 
 发送 `/new` 后，机器人应确认已经开启新对话；随后询问旧对话中的细节，Agent 不应继续使用旧上下文。发送 `/compact`、`/goal` 或 `/plan` 时，插件应直接显示 Harness 命令结果，回复中不应出现模型对斜杠命令的解释。未知或未开放的斜杠命令应被明确拒绝，不能送入模型。
+
+验证工作区时，先在设置页配置一个候选工作区（或发送 `/ws add <绝对路径>` 并确认），然后发送 `/ws`：机器人应返回带编号的候选列表并标注默认与当前项。发送 `/ws <编号>`：机器人应先回「切换 / 取消」确认卡，点击「切换」（或回复 `1`）后应确认已切换并开启新对话；再次 `/ws` 应看到新的「✓ 当前」标注。切换后让 agent 发送新工作区内的文件，应能成功；要求发送工作区外的文件应被拒绝。
 
 验证入站文件时，可以发送一个较小的文本或文档文件，并让机器人总结其内容。Agent 应使用下载后的本地路径调用相应文件或 shell 工具，不能再回复“插件只支持文本和图片”；引用文件也走同一条链路。
 

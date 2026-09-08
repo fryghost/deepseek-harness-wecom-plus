@@ -1,10 +1,20 @@
 import { createHash } from 'node:crypto'
 import type { BaseMessage } from '@wecom/aibot-node-sdk'
 
+/**
+ * The minimal peer facts every inbound shape carries: both `BaseMessage` and
+ * event frames (`EventMessageWith<...>`) are assignable to it.
+ */
+export type WeComPeer = {
+  chattype?: 'single' | 'group'
+  chatid?: string
+  from: { userid: string }
+}
+
 /** Deterministic, non-identifying DSH session id for one WeCom conversation. */
 export function sessionIdFor(
   accountId: string,
-  message: { chattype?: 'single' | 'group'; chatid?: string; from: { userid: string } },
+  message: WeComPeer,
 ): string {
   const scope = message.chattype === 'group' ? 'group' : 'single'
   const peer = scope === 'group' ? message.chatid : message.from.userid
@@ -14,7 +24,7 @@ export function sessionIdFor(
 }
 
 /** Target id accepted by WeCom proactive-send APIs. */
-export function chatTarget(message: { chattype?: 'single' | 'group'; chatid?: string; from: { userid: string } }): string {
+export function chatTarget(message: WeComPeer): string {
   const target = message.chattype === 'group' ? message.chatid : message.from.userid
   if (target === undefined || target.length === 0) throw new Error('WeCom message has no outbound chat target')
   return target

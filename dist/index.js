@@ -13,8 +13,8 @@ var defaultQr = async (text) => {
 var QR_FILE_NAME = "wecom-cli-auth-qr.png";
 var defaultQrFromFile = async (path) => {
   try {
-    const { readFile: readFile3, stat: stat2, unlink } = await import("fs/promises");
-    const info = await stat2(path).catch(() => void 0);
+    const { readFile: readFile3, stat: stat3, unlink } = await import("fs/promises");
+    const info = await stat3(path).catch(() => void 0);
     if (info === void 0 || info.size === 0) return void 0;
     const bytes = await readFile3(path);
     if (bytes.length < 100) return void 0;
@@ -231,9 +231,10 @@ ${run.stderr}`.trim().split(/\r?\n/).slice(-8).join("\n");
 
 // src/bridge.ts
 import { createHash as createHash3 } from "crypto";
-import { readFile as readFile2 } from "fs/promises";
+import { readFile as readFile2, stat as stat2 } from "fs/promises";
 import { isAbsolute as isAbsolute3 } from "path";
-import { credentialRef } from "@deepseek-ai/dsh-credentials";
+import { credentialRef as credentialRef2 } from "@deepseek-ai/dsh-credentials";
+import { SettingsConflictError as SettingsConflictError2 } from "@deepseek-ai/dsh-settings";
 import {
   generateReqId,
   WSAuthFailureError,
@@ -595,6 +596,81 @@ function repairCardForResend(card, errcode) {
   return { ...card, card_action: { type: 1, url: "https://work.weixin.qq.com/" } };
 }
 
+// src/config.ts
+import { tmpdir } from "os";
+import { join } from "path";
+import z from "@deepseek-ai/schemastery";
+var WECOM_FILE_MAX_BYTES = 20 * 1024 * 1024;
+var DEFAULT_WECOM_INBOUND_FILE_DIRECTORY = join(
+  tmpdir(),
+  `deepseek-harness-wecom-plus-${typeof process.getuid === "function" ? process.getuid() : "current-user"}`,
+  "inbound"
+);
+var COMMAND_NAME_PATTERN = /^[a-z][a-z0-9_-]*$/u;
+function isWorkspacePath(value) {
+  return /^(?:[A-Za-z]:[\\/]|\\\\|\/)/u.test(value.trim());
+}
+function workspaceCandidates(config) {
+  const seen = /* @__PURE__ */ new Set();
+  const result = [];
+  for (const raw of [config.cwd, ...config.workspaces]) {
+    const candidate = raw.trim();
+    if (candidate.length === 0) continue;
+    const normalized = candidate.replace(/[\\/]+$/u, "");
+    const key = process.platform === "win32" ? normalized.toLowerCase() : normalized;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    result.push(candidate);
+  }
+  return result;
+}
+var Config = z.object({
+  botId: z.string().default(""),
+  secretRef: z.string().default("WECOM_BOT_SECRET"),
+  accountId: z.string().default("default"),
+  cwd: z.string().required(),
+  workspaces: z.array(z.string()).default([]),
+  agentPreset: z.string(),
+  websocketUrl: z.string().default("wss://openws.work.weixin.qq.com"),
+  scene: z.number().step(1).min(0).default(1),
+  singlePolicy: z.union(["open", "allowlist", "disabled"]).default("open"),
+  singleAllowFrom: z.array(z.string()).default([]),
+  groupPolicy: z.union(["open", "allowlist", "disabled"]).default("open"),
+  groupAllowFrom: z.array(z.string()).default([]),
+  allowedHarnessCommands: z.array(z.string().pattern(COMMAND_NAME_PATTERN)).default(["compact", "goal", "plan"]),
+  imageInputMode: z.union(["auto", "always", "never"]).default("auto"),
+  cardMode: z.union(["auto", "tool", "off"]).default("tool"),
+  cardTaskIdPrefix: z.string().default("dshp"),
+  cardClickAckTitle: z.string().default("\u6B63\u5728\u5904\u7406\u2026"),
+  cardClickAckSubtitle: z.string().default("\u5DF2\u6536\u5230\u6309\u94AE\u70B9\u51FB\uFF0C\u6B63\u5728\u5904\u7406\uFF0C\u8BF7\u7A0D\u5019\u3002"),
+  questionTimeoutMs: z.number().step(1).min(1e4).max(36e5).default(3e5),
+  inboundFileDirectory: z.string().default(DEFAULT_WECOM_INBOUND_FILE_DIRECTORY),
+  welcomeText: z.string().default(""),
+  startupTimeoutMs: z.number().step(1).min(1).default(3e4),
+  // Turn INACTIVITY limit: a running turn is cancelled only after this much
+  // time with no session events (text deltas, tool calls, step boundaries).
+  // A long turn that keeps producing events is never killed, no matter how
+  // long it runs in total.
+  responseTimeoutMs: z.number().step(1).min(1).default(3e5),
+  // Streaming-bubble heartbeat: when nothing streams for this long, re-send a
+  // frame with animated dots and elapsed time so the bubble visibly stays
+  // alive during silent phases (long tool executions, model thinking). 0 disables.
+  streamHeartbeatMs: z.number().step(1).min(0).max(3e5).default(5e3),
+  mediaDownloadTimeoutMs: z.number().step(1).min(1).default(3e4),
+  sendTimeoutMs: z.number().step(1).min(1).default(3e4),
+  reconnectIntervalMs: z.number().step(1).min(100).default(1e3),
+  maxReconnectAttempts: z.number().step(1).min(-1).default(10),
+  maxAuthFailureAttempts: z.number().step(1).min(1).default(2),
+  sendRetries: z.number().step(1).min(0).max(5).default(2),
+  maxReplyBytes: z.number().step(1).min(100).max(20480).default(2e4),
+  maxSeenMessageIds: z.number().step(1).min(100).max(1e5).default(5e3),
+  maxInboundFileBytes: z.number().step(1).min(1).max(WECOM_FILE_MAX_BYTES).default(WECOM_FILE_MAX_BYTES),
+  maxOutboundFileBytes: z.number().step(1).min(1).max(WECOM_FILE_MAX_BYTES).default(WECOM_FILE_MAX_BYTES),
+  systemPrompt: z.string().default(
+    "You are replying through WeCom. Keep replies clear and suitable for enterprise chat. Use WeCom-compatible Markdown for headings, lists, links, emphasis, quotes, and code when structure helps. When the WeCom user asks to receive an existing workspace file, use wecom_send_file instead of claiming that file attachments are unavailable or pasting the whole file. When you need the user to decide something, call ask_user_question: the channel renders it as a Markdown message plus a WeCom template card, and the user answers by clicking a button or replying with a number. Keep option labels SHORT (at most 6 characters, or the WeCom client visually truncates them) and put the full explanation of each choice in the question detail instead. When the user must choose among options or confirm/cancel an action, pair your reply with a card: put the FULL option details (what each choice does) in your Markdown reply, then call wecom_send_card with button_interaction whose buttons carry SHORT labels (at most 6 characters, or the WeCom client truncates them). One turn therefore renders as one Markdown message + one card. For lists of choices you may use vote_interaction (checkbox) or multiple_interaction (dropdowns) instead; keep every label within its cap and never duplicate the whole reply inside the card. When a user clicks a card button or submits a selection, the click arrives as a WeCom message carrying task_id and event_key (plus the selected label when known); answer that click in your reply. Inbound WeCom files are already downloaded and decrypted; their absolute local paths appear in the user message. Use the available file or shell tools to inspect those paths when the user asks you to process an attachment. Do not reveal credentials or internal system data. When a request needs an interactive approval that WeCom cannot provide, explain what approval is needed instead of waiting indefinitely."
+  )
+});
+
 // src/conversations.ts
 import { createUserMessage } from "@deepseek-ai/dsh-llm";
 import { SessionId } from "@deepseek-ai/dsh-session";
@@ -606,7 +682,7 @@ import {
 // src/inbound-file.ts
 import { createHash } from "crypto";
 import { chmod, mkdir, readFile, realpath, writeFile } from "fs/promises";
-import { isAbsolute, join, relative, sep } from "path";
+import { isAbsolute, join as join2, relative, sep } from "path";
 var MAX_STORED_FILENAME_BYTES = 180;
 function isExists(error) {
   return typeof error === "object" && error !== null && "code" in error && error.code === "EEXIST";
@@ -637,7 +713,7 @@ async function saveInboundFile(root, conversationId, data, filename, maxBytes) {
   await chmod(canonicalRoot, 448);
   const conversationKey = createHash("sha256").update(conversationId).digest("hex").slice(0, 32);
   const digest = createHash("sha256").update(data).digest("hex");
-  const directory = join(canonicalRoot, conversationKey, digest);
+  const directory = join2(canonicalRoot, conversationKey, digest);
   await mkdir(directory, { recursive: true, mode: 448 });
   const canonicalDirectory = await realpath(directory);
   if (isOutside(canonicalRoot, canonicalDirectory)) {
@@ -645,7 +721,7 @@ async function saveInboundFile(root, conversationId, data, filename, maxBytes) {
   }
   await chmod(canonicalDirectory, 448);
   const name2 = safeFilename(filename, digest);
-  const path = join(canonicalDirectory, name2);
+  const path = join2(canonicalDirectory, name2);
   try {
     await writeFile(path, data, { flag: "wx", mode: 384 });
   } catch (error) {
@@ -1234,6 +1310,8 @@ var ConversationManager = class {
   cardRegistry = /* @__PURE__ */ new Map();
   questions;
   generations = /* @__PURE__ */ new Map();
+  /** Durable per-session workspace: session meta.cwd is immutable, so switching goes through a new generation. */
+  sessionCwds = /* @__PURE__ */ new Map();
   persistedIds = /* @__PURE__ */ new Set();
   disposeSessionEvents;
   /** Snapshot persisted identities once before accepting traffic. */
@@ -1329,8 +1407,14 @@ var ConversationManager = class {
   tryAnswerFromText(message) {
     return this.questions.tryAnswerFromText(message);
   }
-  /** End the current WeCom conversation session while retaining its history. */
-  async reset(message) {
+  /**
+   * End the current WeCom conversation session while retaining its history.
+   * An explicit `cwd` switches the NEXT generation's workspace (meta.cwd is
+   * immutable per session, so a workspace switch must rotate the session);
+   * without one the current session's workspace is carried over, so a plain
+   * `/new` never resets the workspace choice.
+   */
+  async reset(message, cwd) {
     const baseId = sessionIdFor(this.config.accountId, message);
     this.cancel(message);
     await this.enqueue(baseId, async () => {
@@ -1341,10 +1425,11 @@ var ConversationManager = class {
         this.bindings.delete(id);
         await binding.release();
       }
+      const nextCwd = cwd ?? await this.resolveWorkspace(id);
       const generation = this.generationFor(baseId);
       if (!Number.isSafeInteger(generation + 1)) throw new Error("WeCom conversation generation is exhausted");
       this.generations.set(baseId, generation + 1);
-      await this.getOrCreate(this.currentSessionId(baseId));
+      await this.getOrCreate(this.currentSessionId(baseId), nextCwd);
     });
   }
   /** Execute a registered Harness command against the current WeCom session. */
@@ -1401,6 +1486,7 @@ var ConversationManager = class {
     this.activeStreams.clear();
     this.pendingCards.clear();
     this.cardRegistry.clear();
+    this.sessionCwds.clear();
   }
   enqueue(baseId, operation) {
     const previous = this.queues.get(baseId) ?? Promise.resolve();
@@ -1573,7 +1659,28 @@ var ConversationManager = class {
     const info = await this.ctx.llm.resolveModelInfo(provider, model);
     return info.inputModalities?.includes("image") ?? false;
   }
-  async getOrCreate(id) {
+  /** Current workspace of one WeCom conversation (cache → persistence → default). */
+  async workspaceOf(message) {
+    const baseId = sessionIdFor(this.config.accountId, message);
+    return this.resolveWorkspace(this.currentSessionId(baseId));
+  }
+  async resolveWorkspace(id) {
+    const cached = this.sessionCwds.get(id);
+    if (cached !== void 0) return cached;
+    if (this.persistedIds.has(id)) {
+      try {
+        const inspected = await this.ctx.sessionPersistence.inspect(SessionId(id));
+        const cwd = inspected.meta.cwd;
+        if (typeof cwd === "string" && cwd.length > 0) {
+          this.sessionCwds.set(id, cwd);
+          return cwd;
+        }
+      } catch {
+      }
+    }
+    return this.config.cwd;
+  }
+  async getOrCreate(id, cwd) {
     const sessionId = SessionId(id);
     const existing = this.bindings.get(id);
     if (existing !== void 0 && this.ctx.agents.get(sessionId) === existing.agent) return existing;
@@ -1583,13 +1690,13 @@ var ConversationManager = class {
     }
     const pending = this.creations.get(id);
     if (pending !== void 0) return pending;
-    const creation = this.createOrResume(id).finally(() => this.creations.delete(id));
+    const creation = this.createOrResume(id, cwd).finally(() => this.creations.delete(id));
     this.creations.set(id, creation);
     const binding = await creation;
     this.bindings.set(id, binding);
     return binding;
   }
-  async createOrResume(id) {
+  async createOrResume(id, cwd) {
     const sessionId = SessionId(id);
     const live = this.ctx.agents.get(sessionId);
     if (live !== void 0) return this.borrowAgent(live, id);
@@ -1598,6 +1705,8 @@ var ConversationManager = class {
     if (this.persistedIds.has(id)) {
       const inspected = await this.ctx.sessionPersistence.inspect(sessionId);
       const agentPreset2 = resolveSessionPreset(inspected.meta, inspected.events) ?? this.resolveAgentPreset();
+      const resumedCwd = inspected.meta.cwd;
+      if (typeof resumedCwd === "string" && resumedCwd.length > 0) this.sessionCwds.set(id, resumedCwd);
       try {
         return this.ownAgent(await this.ctx.agents.resume({
           resumeSessionId: sessionId,
@@ -1611,11 +1720,12 @@ var ConversationManager = class {
       }
     }
     const agentPreset = this.resolveAgentPreset();
+    const createdCwd = cwd ?? this.config.cwd;
     let handle;
     try {
       handle = await this.ctx.agents.create({
         sessionId,
-        meta: { cwd: this.config.cwd, agentPreset },
+        meta: { cwd: createdCwd, agentPreset },
         agentOptions,
         setup: (agentCtx) => this.setupAgent(agentCtx, agentPreset, id)
       });
@@ -1624,6 +1734,7 @@ var ConversationManager = class {
       if (raced !== void 0) return this.borrowAgent(raced, id);
       throw error;
     }
+    this.sessionCwds.set(id, createdCwd);
     this.persistedIds.add(id);
     return this.ownAgent(handle);
   }
@@ -1768,7 +1879,12 @@ var ConversationManager = class {
     return agentCtx.systemPrompt.section({
       name: "channel:wecom",
       order: 190,
-      text: () => this.activeTurns.has(id) ? this.config.systemPrompt : ""
+      text: () => {
+        if (!this.activeTurns.has(id)) return "";
+        const cwd = this.sessionCwds.get(id);
+        return cwd === void 0 ? this.config.systemPrompt : `${this.config.systemPrompt}
+The workspace of this conversation is ${cwd}.`;
+      }
     });
   }
   registerFileTool(agentCtx, id) {
@@ -1802,7 +1918,7 @@ var ConversationManager = class {
           throw new Error("wecom_send_file: no active WeCom turn; this tool cannot send files from another channel");
         }
         exec.signal.throwIfAborted();
-        const file = await resolveOutboundFile(this.config.cwd, args.path, this.config.maxOutboundFileBytes);
+        const file = await resolveOutboundFile(await this.resolveWorkspace(id), args.path, this.config.maxOutboundFileBytes);
         exec.signal.throwIfAborted();
         await this.sendFile(target, file);
         return { name: file.name, bytes: file.bytes };
@@ -2019,8 +2135,310 @@ function requireUserQuestions(service) {
   return service;
 }
 
+// src/settings-web.ts
+import { credentialRef } from "@deepseek-ai/dsh-credentials";
+import {
+  SettingsConflictError
+} from "@deepseek-ai/dsh-settings";
+
 // src/version.ts
-var PLUGIN_VERSION = "0.9.3";
+var PLUGIN_VERSION = "0.10.0";
+
+// src/settings-web.ts
+var SETTINGS_ROUTE = "/_dsh/deepseek-harness-wecom-plus/settings";
+var NAMESPACE_PATTERN = /^[a-z][a-z0-9]*(?:-[a-z0-9]+)*$/;
+var SETTINGS_NS = "deepseek-harness-wecom-plus";
+if (!NAMESPACE_PATTERN.test(SETTINGS_NS)) {
+  throw new TypeError(`settings namespace "${SETTINGS_NS}" must match ${String(NAMESPACE_PATTERN)}`);
+}
+var CLI_ACTIONS = ["cli-probe", "cli-install", "cli-authorize", "cli-auth-status", "cli-cancel-auth"];
+var USER_SETTINGS_KEYS = ["botId", "cardMode", "singlePolicy", "groupPolicy", "welcomeText"];
+var USER_SETTINGS_ARRAY_KEYS = ["workspaces"];
+function normalizeWorkspaceList(value) {
+  if (!Array.isArray(value)) return [];
+  const seen = /* @__PURE__ */ new Set();
+  const result = [];
+  for (const entry of value) {
+    if (typeof entry !== "string") continue;
+    const candidate = entry.trim();
+    if (candidate.length === 0) continue;
+    const key = process.platform === "win32" ? candidate.toLowerCase() : candidate;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    result.push(candidate);
+  }
+  return result;
+}
+function isRecord(value) {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+function descriptorOf(ctx) {
+  const settings = ctx.get("settings");
+  if (settings === void 0) throw new Error("settings service is not available");
+  const descriptor = settings.describe().find((row) => row.ns === SETTINGS_NS);
+  if (descriptor === void 0) throw new Error("deepseek-harness-wecom-plus Settings namespace is not registered");
+  return descriptor;
+}
+function requireSettings(ctx) {
+  const settings = ctx.get("settings");
+  if (settings === void 0) throw new Error("settings service is not available");
+  return settings;
+}
+function userSettingsOf(config) {
+  const record = isRecord(config) ? config : {};
+  return {
+    botId: typeof record.botId === "string" ? record.botId : "",
+    // Legacy "auto" settings normalize to "tool": adaptive derivation was
+    // removed, and the UI no longer offers "auto".
+    cardMode: record.cardMode === "off" ? "off" : "tool",
+    singlePolicy: record.singlePolicy === "allowlist" || record.singlePolicy === "disabled" ? record.singlePolicy : "open",
+    groupPolicy: record.groupPolicy === "allowlist" || record.groupPolicy === "disabled" ? record.groupPolicy : "open",
+    welcomeText: typeof record.welcomeText === "string" ? record.welcomeText : "",
+    workspaces: normalizeWorkspaceList(record.workspaces)
+  };
+}
+function responseJson(res, status, body) {
+  const bytes = Buffer.from(JSON.stringify(body));
+  res.setHeader("Content-Type", "application/json; charset=utf-8");
+  res.setHeader("Content-Length", String(bytes.length));
+  res.setHeader("Cache-Control", "no-store");
+  res.setHeader("X-Content-Type-Options", "nosniff");
+  res.setHeader("Content-Security-Policy", "default-src 'none'; frame-ancestors 'none'");
+  res.writeHead(status);
+  res.end(bytes);
+}
+function requestError(res, status, code, message) {
+  responseJson(res, status, { ok: false, error: { code, message } });
+}
+function sameOriginPost(req) {
+  const fetchSite = req.headers["sec-fetch-site"];
+  if (fetchSite === "cross-site") return false;
+  const origin = req.headers.origin;
+  if (origin === void 0) return fetchSite === "same-origin" || fetchSite === "same-site" || fetchSite === "none";
+  const host = req.headers.host;
+  if (host === void 0) return false;
+  try {
+    const parsed = new URL(origin);
+    return (parsed.protocol === "http:" || parsed.protocol === "https:") && parsed.host === host;
+  } catch {
+    return false;
+  }
+}
+async function readJson(req, maxBytes = 64 * 1024) {
+  const contentType = req.headers["content-type"]?.split(";", 1)[0]?.trim().toLowerCase();
+  if (contentType !== "application/json") throw new TypeError("Content-Type must be application/json");
+  const chunks = [];
+  let bytes = 0;
+  for await (const chunk of req) {
+    const part = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+    bytes += part.length;
+    if (bytes > maxBytes) throw new RangeError(`request body exceeds ${maxBytes} bytes`);
+    chunks.push(part);
+  }
+  if (chunks.length === 0) throw new TypeError("request body is empty");
+  return JSON.parse(Buffer.concat(chunks).toString("utf8"));
+}
+function parseRequest(value) {
+  if (!isRecord(value) || typeof value.action !== "string") throw new TypeError("request action is required");
+  if (value.action === "save") {
+    if (!Number.isSafeInteger(value.expectedRevision) || value.expectedRevision < 0) {
+      throw new TypeError("save.expectedRevision must be a non-negative integer");
+    }
+    if (!isRecord(value.value)) throw new TypeError("save.value must be an object");
+    const patch = {};
+    for (const key of USER_SETTINGS_KEYS) {
+      const entry = value.value[key];
+      if (typeof entry !== "string") throw new TypeError(`save.value.${key} must be a string`);
+      patch[key] = entry;
+    }
+    for (const key of USER_SETTINGS_ARRAY_KEYS) {
+      const entry = value.value[key];
+      if (!Array.isArray(entry) || entry.some((item) => typeof item !== "string")) {
+        throw new TypeError(`save.value.${key} must be an array of strings`);
+      }
+      patch[key] = entry;
+    }
+    return {
+      action: "save",
+      expectedRevision: value.expectedRevision,
+      value: patch
+    };
+  }
+  if (value.action === "set-key") {
+    if (typeof value.value !== "string" || value.value.trim().length === 0) {
+      throw new TypeError("set-key.value must be a non-empty string");
+    }
+    return { action: "set-key", value: value.value.trim() };
+  }
+  if (typeof value.action === "string" && CLI_ACTIONS.includes(value.action)) {
+    return { action: value.action };
+  }
+  if (value.action === "clear-key") return { action: "clear-key" };
+  throw new TypeError(`unsupported action: ${String(value.action)}`);
+}
+function publicMessage(error) {
+  if (error instanceof Error) return error.message;
+  return String(error);
+}
+var WeComWebBackend = class {
+  constructor(ctx, status, cli) {
+    this.ctx = ctx;
+    this.status = status;
+    this.cli = cli;
+  }
+  ctx;
+  status;
+  cli;
+  cliProbeCache;
+  async credential(config) {
+    const info = await this.ctx.credentials.describe(credentialRef(config.secretRef));
+    return {
+      configured: info.configured,
+      ...info.source === void 0 ? {} : { source: info.source },
+      writable: info.writable
+    };
+  }
+  /** Build the current settings/credential/channel snapshot without secrets. */
+  async snapshot() {
+    const descriptor = descriptorOf(this.ctx);
+    const config = descriptor.value;
+    const credential = await this.credential(config);
+    return {
+      schemaVersion: 1,
+      writable: requireSettings(this.ctx).writable,
+      settings: {
+        value: userSettingsOf(config),
+        revision: descriptor.revision,
+        applies: "live"
+      },
+      credential: {
+        ref: config.secretRef,
+        configured: credential.configured,
+        ...credential.source === void 0 ? {} : { source: credential.source },
+        writable: credential.writable
+      },
+      channel: this.status(),
+      ...this.cli === void 0 ? {} : { cli: await this.cliSnapshot() },
+      defaultWorkspace: config.cwd,
+      release: { pluginVersion: PLUGIN_VERSION }
+    };
+  }
+  /** Probe with a tiny cache: GET snapshots may arrive in bursts. */
+  async cliSnapshot() {
+    const cached = this.cliProbeCache;
+    if (cached !== void 0 && Date.now() - cached.at < 3e3) return cached.value;
+    const value = await this.cli.probe();
+    this.cliProbeCache = { at: Date.now(), value };
+    return value;
+  }
+  async handleCli(action) {
+    const cli = this.cli;
+    this.cliProbeCache = void 0;
+    switch (action) {
+      case "cli-probe":
+        return cli.probe();
+      case "cli-install":
+        return cli.install();
+      case "cli-authorize":
+        return cli.beginAuth();
+      case "cli-auth-status":
+        return cli.authStatus();
+      case "cli-cancel-auth":
+        cli.cancelAuth();
+        return { cancelled: true };
+    }
+  }
+  /** Merge the UI-editable subset into the namespace's user layer. */
+  async save(request) {
+    const settings = requireSettings(this.ctx);
+    if (!settings.writable) throw new Error("settings provider is read-only");
+    const workspaces = normalizeWorkspaceList(request.value.workspaces);
+    const invalid = workspaces.filter((entry) => !isWorkspacePath(entry));
+    if (invalid.length > 0) {
+      throw new Error(`\u5DE5\u4F5C\u533A\u5FC5\u987B\u662F\u672C\u673A\u7EDD\u5BF9\u8DEF\u5F84\uFF1A${invalid.join("\u3001")}`);
+    }
+    await settings.update(SETTINGS_NS, { ...request.value, workspaces }, request.expectedRevision);
+    return this.snapshot();
+  }
+  /**
+   * Store one pasted Secret under the configured credential reference. The
+   * credentials seam enforces writability and never lets the value back out.
+   */
+  async setKey(value) {
+    const config = descriptorOf(this.ctx).value;
+    await this.ctx.credentials.set(credentialRef(config.secretRef), value);
+    return this.snapshot();
+  }
+  /** Remove the stored Secret; an absent credential is a no-op. */
+  async clearKey() {
+    const config = descriptorOf(this.ctx).value;
+    await this.ctx.credentials.unset(credentialRef(config.secretRef));
+    return this.snapshot();
+  }
+  /** Handle the exact Settings route. */
+  async handle(req, res) {
+    if (req.method === "GET") {
+      try {
+        responseJson(res, 200, { ok: true, value: await this.snapshot() });
+      } catch (error) {
+        this.ctx.logger.warn("deepseek-harness-wecom-plus Settings snapshot failed: %s", publicMessage(error));
+        requestError(res, 503, "settings-unavailable", "WeCom channel Settings are unavailable");
+      }
+      return;
+    }
+    if (req.method !== "POST") {
+      res.setHeader("Allow", "GET, POST");
+      requestError(res, 405, "method-not-allowed", "Use GET or POST");
+      return;
+    }
+    if (!sameOriginPost(req)) {
+      requestError(res, 403, "origin-rejected", "The request must originate from this DSH Web application");
+      return;
+    }
+    let parsed;
+    try {
+      parsed = parseRequest(await readJson(req));
+    } catch (error) {
+      requestError(res, error instanceof RangeError ? 413 : 400, "invalid-request", publicMessage(error));
+      return;
+    }
+    try {
+      if (CLI_ACTIONS.includes(parsed.action)) {
+        if (this.cli === void 0) {
+          requestError(res, 503, "cli-unavailable", "The CLI integration is not wired into this channel");
+          return;
+        }
+        responseJson(res, 200, { ok: true, value: await this.handleCli(parsed.action) });
+      } else if (parsed.action === "set-key") {
+        responseJson(res, 200, { ok: true, value: await this.setKey(parsed.value) });
+      } else if (parsed.action === "clear-key") {
+        responseJson(res, 200, { ok: true, value: await this.clearKey() });
+      } else {
+        responseJson(res, 200, { ok: true, value: await this.save(parsed) });
+      }
+    } catch (error) {
+      const conflict = error instanceof SettingsConflictError;
+      const code = conflict ? "settings-conflict" : parsed.action === "set-key" || parsed.action === "clear-key" ? "key-rejected" : "settings-rejected";
+      const status = conflict ? 409 : 400;
+      this.ctx.logger.warn("deepseek-harness-wecom-plus Web action=%s failed: %s", parsed.action, publicMessage(error));
+      requestError(res, status, code, publicMessage(error));
+    }
+  }
+};
+function installWeComSettingsWeb(ctx, backend) {
+  ctx.inject(["webServer"], (webCtx) => {
+    webCtx.effect(() => {
+      const dispose = webCtx.webServer.register({
+        kind: "exact",
+        path: SETTINGS_ROUTE,
+        handler: (req, res) => backend.handle(req, res)
+      });
+      return () => {
+        dispose();
+      };
+    }, "deepseek-harness-wecom-plus: Web Settings route");
+  });
+}
 
 // src/bridge.ts
 var OUTBOUND_TEST_PNG = Buffer.from(
@@ -2028,6 +2446,10 @@ var OUTBOUND_TEST_PNG = Buffer.from(
   "base64"
 );
 var OUTBOUND_TEST_FILE = Buffer.from("DeepSeek Harness WeCom file upload test\n", "utf8");
+var WORKSPACE_CONFIRM_TEXTS = /* @__PURE__ */ new Set(["1", "\u786E\u8BA4", "\u662F", "yes"]);
+var WORKSPACE_CONFIRM_KEY = "ws-confirm";
+var WORKSPACE_CANCEL_KEY = "ws-cancel";
+var WORKSPACE_CONFIRM_TTL_MS = 12e4;
 var WeComHarnessBridge = class {
   constructor(ctx, config, clientFactory = (options) => new WSClient(options), cli) {
     this.ctx = ctx;
@@ -2035,6 +2457,12 @@ var WeComHarnessBridge = class {
     this.clientFactory = clientFactory;
     this.cli = cli;
     if (!isAbsolute3(config.cwd)) throw new Error(`wecom-channel: cwd must be absolute, got ${JSON.stringify(config.cwd)}`);
+    const invalidWorkspaces = config.workspaces.filter((entry) => !isWorkspacePath(entry));
+    if (invalidWorkspaces.length > 0) {
+      throw new Error(
+        `wecom-channel: workspaces entries must be absolute paths, got ${JSON.stringify(invalidWorkspaces)}`
+      );
+    }
     if (!isAbsolute3(config.inboundFileDirectory)) {
       throw new Error(
         `wecom-channel: inboundFileDirectory must be absolute, got ${JSON.stringify(config.inboundFileDirectory)}`
@@ -2064,6 +2492,14 @@ var WeComHarnessBridge = class {
   lastError;
   /** Task ids whose click was already processed; re-clicks are dropped. */
   consumedCardTasks = /* @__PURE__ */ new Set();
+  /** Per-conversation pending workspace confirmation (switch/add). */
+  workspaceConfirms = /* @__PURE__ */ new Map();
+  /**
+   * Workspaces added in this bridge's lifetime. Persisting a new candidate
+   * restarts the channel, but until the replacement bridge is live this
+   * overlay keeps the new candidate visible and keeps dedupe honest.
+   */
+  workspaceOverlay = /* @__PURE__ */ new Set();
   /** Latest channel fact for configuration surfaces. */
   status() {
     const client = this.client;
@@ -2083,7 +2519,7 @@ var WeComHarnessBridge = class {
       this.log.warn("WeCom channel is inactive: secretRef is empty");
       return;
     }
-    const resolved = await this.ctx.credentials.resolve(credentialRef(this.config.secretRef));
+    const resolved = await this.ctx.credentials.resolve(credentialRef2(this.config.secretRef));
     const secret = resolved?.value.trim();
     if (!secret) {
       this.log.warn(
@@ -2198,6 +2634,13 @@ var WeComHarnessBridge = class {
     if (taskId !== void 0 && taskId.length > 0 && this.consumedCardTasks.has(taskId)) {
       this.log.info("WeCom card %s re-click on consumed task %s ignored", body.msgid, taskId);
       return;
+    }
+    if (taskId !== void 0 && taskId.length > 0) {
+      const pending = this.takeWorkspaceConfirm(this.baseIdOf(body), taskId);
+      if (pending !== void 0) {
+        await this.acknowledgeWorkspaceConfirm(frame, body, pending, taskId, eventKey ?? "");
+        return;
+      }
     }
     const questionCard = this.conversations.pendingQuestionCard(body);
     const questionLabel = this.conversations.pendingQuestionLabel(body);
@@ -2372,6 +2815,15 @@ var WeComHarnessBridge = class {
         await this.sendReply(frame, { text: await this.cliStatusText(), images: [], cards: [] });
         return;
       }
+      if (command?.name === "ws") {
+        await this.handleWorkspaceCommand(frame, message, command);
+        return;
+      }
+      const workspacePending = command === void 0 ? this.takeWorkspaceConfirm(this.baseIdOf(message)) : void 0;
+      if (workspacePending !== void 0) {
+        await this.settleWorkspaceTextConfirm(frame, message, workspacePending);
+        return;
+      }
       if (this.conversations.tryAnswerFromText(message)) {
         try {
           await this.sendProactive(chatTarget(message), {
@@ -2429,6 +2881,263 @@ var WeComHarnessBridge = class {
       }
     }
   }
+  baseIdOf(message) {
+    return sessionIdFor(this.config.accountId, message);
+  }
+  /** Expired entries are dropped; a mismatching taskId leaves the pending intact. */
+  takeWorkspaceConfirm(baseId, taskId) {
+    const pending = this.workspaceConfirms.get(baseId);
+    if (pending === void 0) return void 0;
+    if (Date.now() > pending.expiresAt) {
+      this.workspaceConfirms.delete(baseId);
+      return void 0;
+    }
+    if (taskId !== void 0 && pending.taskId !== taskId) return void 0;
+    return pending;
+  }
+  /** `/ws` entry point: list workspaces, or request a confirmed switch/add. */
+  async handleWorkspaceCommand(frame, message, command) {
+    const baseId = this.baseIdOf(message);
+    this.workspaceConfirms.delete(baseId);
+    const rest = command.line.slice("/ws".length).trim();
+    if (rest.length === 0) {
+      await this.sendWorkspaceList(frame, message);
+      return;
+    }
+    const addMatch = /^add\s+(.+)$/is.exec(rest);
+    if (addMatch !== null) {
+      await this.requestWorkspaceAdd(frame, message, baseId, (addMatch[1] ?? "").trim().replace(/^["']|["']$/gu, ""));
+      return;
+    }
+    if (/^\d+$/u.test(rest)) {
+      await this.requestWorkspaceSwitch(frame, message, baseId, Number.parseInt(rest, 10));
+      return;
+    }
+    await this.sendReply(frame, {
+      text: [
+        "\u7528\u6CD5\uFF1A",
+        "/ws \u2014 \u67E5\u770B\u5019\u9009\u5DE5\u4F5C\u533A",
+        "/ws <\u7F16\u53F7> \u2014 \u5207\u6362\u5230\u5019\u9009\u5DE5\u4F5C\u533A\uFF08\u5F00\u542F\u65B0\u5BF9\u8BDD\uFF09",
+        "/ws add <\u7EDD\u5BF9\u8DEF\u5F84> \u2014 \u65B0\u589E\u5019\u9009\u5DE5\u4F5C\u533A"
+      ].join("\n"),
+      images: [],
+      cards: []
+    });
+  }
+  /** Current candidates: configured workspaces plus anything added this lifetime. */
+  workspaceList() {
+    return workspaceCandidates({
+      cwd: this.config.cwd,
+      workspaces: [...this.config.workspaces, ...this.workspaceOverlay]
+    });
+  }
+  async sendWorkspaceList(frame, message) {
+    const candidates = this.workspaceList();
+    const current = await this.conversations.workspaceOf(message);
+    const lines = candidates.map((candidate, index) => {
+      const marks = [];
+      if (index === 0) marks.push("\u9ED8\u8BA4");
+      if (workspaceSamePath(candidate, current)) marks.push("\u2713 \u5F53\u524D");
+      return `${index + 1}. \`${candidate}\`${marks.length > 0 ? `\uFF08${marks.join("\uFF0C")}\uFF09` : ""}`;
+    });
+    const card = buildTemplateCard({
+      cardType: "text_notice",
+      title: "\u5207\u6362\u5DE5\u4F5C\u533A",
+      desc: "\u8BF7\u76F4\u63A5\u56DE\u590D\u7F16\u53F7"
+    }, this.config.cardTaskIdPrefix);
+    await this.sendReply(frame, {
+      text: [
+        "\u5019\u9009\u5DE5\u4F5C\u533A\uFF1A",
+        ...lines,
+        "",
+        "\u56DE\u590D /ws <\u7F16\u53F7> \u5207\u6362\uFF08\u4F1A\u5F00\u542F\u65B0\u5BF9\u8BDD\uFF0C\u4E0A\u4E0B\u6587\u4E0D\u5EF6\u7EED\uFF09\uFF1B/ws add <\u7EDD\u5BF9\u8DEF\u5F84> \u65B0\u589E\u5019\u9009\u3002"
+      ].join("\n"),
+      images: [],
+      cards: [card]
+    });
+  }
+  async requestWorkspaceSwitch(frame, message, baseId, index) {
+    const candidates = this.workspaceList();
+    const target = candidates[index - 1];
+    if (target === void 0) {
+      await this.sendReply(frame, {
+        text: `\u7F16\u53F7\u8D85\u51FA\u8303\u56F4\uFF081-${candidates.length}\uFF09\u3002\u53D1\u9001 /ws \u67E5\u770B\u5019\u9009\u5217\u8868\u3002`,
+        images: [],
+        cards: []
+      });
+      return;
+    }
+    const current = await this.conversations.workspaceOf(message);
+    if (workspaceSamePath(target, current)) {
+      await this.sendReply(frame, { text: `\u5F53\u524D\u5DF2\u662F\u5DE5\u4F5C\u533A \`${target}\`\uFF0C\u65E0\u9700\u5207\u6362\u3002`, images: [], cards: [] });
+      return;
+    }
+    const taskId = generateTaskId(this.config.cardTaskIdPrefix);
+    const card = buildTemplateCard({
+      cardType: "button_interaction",
+      title: "\u5207\u6362\u5DE5\u4F5C\u533A",
+      desc: `\u5C06\u5207\u6362\u5230 ${target}`,
+      taskId,
+      buttons: [
+        { text: "\u5207\u6362", key: WORKSPACE_CONFIRM_KEY, style: 2 },
+        { text: "\u53D6\u6D88", key: WORKSPACE_CANCEL_KEY, style: 2 }
+      ]
+    }, this.config.cardTaskIdPrefix);
+    this.workspaceConfirms.set(baseId, {
+      kind: "workspace-switch",
+      payload: target,
+      taskId,
+      card,
+      expiresAt: Date.now() + WORKSPACE_CONFIRM_TTL_MS
+    });
+    await this.sendReply(frame, {
+      text: `\u5C06\u5207\u6362\u5DE5\u4F5C\u533A\u5230 \`${target}\`\u3002
+\u56DE\u590D 1 \u6216\u70B9\u51FB\u5361\u7247\u786E\u8BA4\uFF1B\u5207\u6362\u4F1A\u5F00\u542F\u65B0\u5BF9\u8BDD\uFF08\u4E0A\u4E0B\u6587\u4E0D\u5EF6\u7EED\uFF09\u3002\u56DE\u590D\u5176\u4ED6\u5185\u5BB9\u53D6\u6D88\u3002`,
+      images: [],
+      cards: [card]
+    });
+  }
+  async requestWorkspaceAdd(frame, message, baseId, rawPath) {
+    const path = rawPath;
+    if (path.length === 0 || !isWorkspacePath(path)) {
+      await this.sendReply(frame, {
+        text: "\u8BF7\u63D0\u4F9B\u672C\u673A\u7EDD\u5BF9\u8DEF\u5F84\uFF0C\u4F8B\u5982 /ws add D:\\projects\\demo\u3002",
+        images: [],
+        cards: []
+      });
+      return;
+    }
+    if (this.workspaceList().some((candidate) => workspaceSamePath(candidate, path))) {
+      await this.sendReply(frame, { text: `\u8BE5\u8DEF\u5F84\u5DF2\u5728\u5019\u9009\u5217\u8868\u4E2D\uFF1A\`${path}\`\u3002\u53D1\u9001 /ws \u67E5\u770B\u5019\u9009\u5217\u8868\u3002`, images: [], cards: [] });
+      return;
+    }
+    let info;
+    try {
+      info = await stat2(path);
+    } catch {
+      await this.sendReply(frame, { text: `\u8BE5\u8DEF\u5F84\u4E0D\u5B58\u5728\u6216\u65E0\u6CD5\u8BBF\u95EE\uFF1A\`${path}\``, images: [], cards: [] });
+      return;
+    }
+    if (!info.isDirectory()) {
+      await this.sendReply(frame, { text: `\u8BE5\u8DEF\u5F84\u4E0D\u662F\u76EE\u5F55\uFF1A\`${path}\``, images: [], cards: [] });
+      return;
+    }
+    const taskId = generateTaskId(this.config.cardTaskIdPrefix);
+    const card = buildTemplateCard({
+      cardType: "button_interaction",
+      title: "\u65B0\u589E\u5DE5\u4F5C\u533A",
+      desc: `\u5C06\u65B0\u589E ${path}`,
+      taskId,
+      buttons: [
+        { text: "\u786E\u8BA4", key: WORKSPACE_CONFIRM_KEY, style: 2 },
+        { text: "\u53D6\u6D88", key: WORKSPACE_CANCEL_KEY, style: 2 }
+      ]
+    }, this.config.cardTaskIdPrefix);
+    this.workspaceConfirms.set(baseId, {
+      kind: "workspace-add",
+      payload: path,
+      taskId,
+      card,
+      expiresAt: Date.now() + WORKSPACE_CONFIRM_TTL_MS
+    });
+    await this.sendReply(frame, {
+      text: `\u5C06\u65B0\u589E\u5DE5\u4F5C\u533A \`${path}\`\u3002
+\u56DE\u590D 1 \u6216\u70B9\u51FB\u5361\u7247\u786E\u8BA4\uFF1B\u56DE\u590D\u5176\u4ED6\u5185\u5BB9\u53D6\u6D88\u3002`,
+      images: [],
+      cards: [card]
+    });
+  }
+  /** Settle a pending workspace confirmation from the user's plain text reply. */
+  async settleWorkspaceTextConfirm(frame, message, pending) {
+    this.workspaceConfirms.delete(this.baseIdOf(message));
+    if (!WORKSPACE_CONFIRM_TEXTS.has(extractTextContent(message).trim().toLowerCase())) {
+      await this.sendReply(frame, { text: "\u5DF2\u53D6\u6D88\u5DE5\u4F5C\u533A\u64CD\u4F5C\uFF0C\u5F53\u524D\u8BBE\u7F6E\u4FDD\u6301\u4E0D\u53D8\u3002", images: [], cards: [] });
+      return;
+    }
+    await this.applyWorkspaceDecision(message, pending, frame);
+  }
+  /** Settle a pending workspace confirmation from its card's button click. */
+  async acknowledgeWorkspaceConfirm(frame, body, pending, taskId, eventKey) {
+    this.workspaceConfirms.delete(this.baseIdOf(body));
+    this.rememberConsumedTask(taskId);
+    const label = pending.card.button_list?.find((button) => button.key === eventKey)?.text;
+    const ackCard = buildClickAckCard({
+      original: pending.card,
+      taskId,
+      eventKey,
+      ...label === void 0 ? {} : { selectedLabel: label },
+      ackTitle: this.config.cardClickAckTitle,
+      ackSubtitle: this.config.cardClickAckSubtitle
+    });
+    await this.acknowledgeCardClick(frame, taskId, ackCard, true);
+    if (eventKey !== WORKSPACE_CONFIRM_KEY) {
+      await this.replyTo(body, void 0, "\u5DF2\u53D6\u6D88\u5DE5\u4F5C\u533A\u64CD\u4F5C\uFF0C\u5F53\u524D\u8BBE\u7F6E\u4FDD\u6301\u4E0D\u53D8\u3002");
+      return;
+    }
+    await this.applyWorkspaceDecision(body, pending, void 0);
+  }
+  async applyWorkspaceDecision(message, pending, frame) {
+    if (pending.kind === "workspace-switch") {
+      try {
+        await this.conversations.reset(message, pending.payload);
+      } catch (error) {
+        this.log.error("WeCom workspace switch failed: %s", String(error));
+        await this.replyTo(message, frame, "\u5207\u6362\u5DE5\u4F5C\u533A\u5931\u8D25\uFF0C\u8BF7\u7A0D\u540E\u91CD\u8BD5\u3002");
+        return;
+      }
+      await this.replyTo(message, frame, `\u5DF2\u5207\u6362\u5DE5\u4F5C\u533A\u5230 \`${pending.payload}\`\uFF0C\u5E76\u5F00\u542F\u65B0\u5BF9\u8BDD\uFF1B\u65E7\u5386\u53F2\u4FDD\u7559\u5728\u7F51\u9875\u7AEF\u3002`);
+      return;
+    }
+    let info;
+    try {
+      info = await stat2(pending.payload);
+    } catch {
+      await this.replyTo(message, frame, `\u8BE5\u8DEF\u5F84\u5DF2\u4E0D\u5B58\u5728\u6216\u65E0\u6CD5\u8BBF\u95EE\uFF1A\`${pending.payload}\``);
+      return;
+    }
+    if (!info.isDirectory()) {
+      await this.replyTo(message, frame, `\u8BE5\u8DEF\u5F84\u4E0D\u662F\u76EE\u5F55\uFF1A\`${pending.payload}\``);
+      return;
+    }
+    await this.replyTo(message, frame, `\u5DF2\u65B0\u589E\u5DE5\u4F5C\u533A \`${pending.payload}\`\u3002\u53D1\u9001 /ws \u67E5\u770B\u5019\u9009\uFF0C\u56DE\u590D /ws <\u7F16\u53F7> \u5207\u6362\u3002`);
+    const next = [.../* @__PURE__ */ new Set([
+      ...this.config.workspaces.map((entry) => entry.trim()).filter((entry) => entry.length > 0),
+      ...this.workspaceOverlay,
+      pending.payload
+    ])];
+    try {
+      await this.persistWorkspaces(next);
+      this.workspaceOverlay.add(pending.payload);
+    } catch (error) {
+      this.log.error("WeCom workspace persist failed: %s", String(error));
+      await this.replyTo(message, frame, `\u5DE5\u4F5C\u533A\u4FDD\u5B58\u5931\u8D25\uFF1A${error instanceof Error ? error.message : String(error)}`);
+    }
+  }
+  async replyTo(message, frame, text) {
+    if (frame !== void 0) {
+      await this.sendReply(frame, { text, images: [], cards: [] });
+      return;
+    }
+    await this.sendProactive(chatTarget(message), { text, images: [], cards: [] });
+  }
+  /** Persist the workspace candidate list through the settings service. */
+  async persistWorkspaces(next) {
+    const settings = this.ctx.get("settings");
+    if (settings === void 0) throw new Error("settings service is not available");
+    if (!settings.writable) throw new Error("settings provider is read-only");
+    const apply2 = async () => {
+      const descriptor = settings.describe().find((row) => row.ns === SETTINGS_NS);
+      if (descriptor === void 0) throw new Error("WeCom settings namespace is not registered");
+      const current = descriptor.value ?? {};
+      await settings.update(SETTINGS_NS, { ...current, workspaces: [...next] }, descriptor.revision);
+    };
+    try {
+      await apply2();
+    } catch (error) {
+      if (!(error instanceof SettingsConflictError2)) throw error;
+      await apply2();
+    }
+  }
   helpText() {
     const harnessCommands = [...this.allowedHarnessCommands].map((name2) => `/${name2}`).join("\u3001") || "\uFF08\u672A\u5F00\u653E\uFF09";
     return [
@@ -2443,6 +3152,7 @@ var WeComHarnessBridge = class {
       "/bot-status \u2014 \u67E5\u770B\u5F53\u524D\u4F1A\u8BDD\u72B6\u6001",
       "/bot-cli \u2014 wecom-cli \u72B6\u6001\u68C0\u67E5\u4E0E\u5B89\u88C5/\u6388\u6743\u5F15\u5BFC",
       "/bot-cancel \u2014 \u53D6\u6D88\u5F53\u524D\u751F\u6210",
+      "/ws \u2014 \u67E5\u770B/\u5207\u6362/\u65B0\u589E\u4F1A\u8BDD\u5DE5\u4F5C\u533A\uFF08\u5207\u6362\u4F1A\u5F00\u542F\u65B0\u5BF9\u8BDD\uFF09",
       `\u5DF2\u5F00\u653E\u7684 Harness \u547D\u4EE4\uFF1A${harnessCommands}\uFF08\u4EC5\u5728\u5F53\u524D preset \u6CE8\u518C\u540E\u53EF\u7528\uFF09`,
       "\u5176\u4ED6\u659C\u6760\u547D\u4EE4\u4F1A\u88AB\u63D2\u4EF6\u62D2\u7EDD\uFF0C\u4E0D\u4F1A\u9001\u7ED9\u6A21\u578B\uFF1B\u666E\u901A\u6D88\u606F\u4F1A\u4EA4\u7ED9\u5F53\u524D Harness \u9ED8\u8BA4\u6A21\u578B\u5904\u7406\u3002"
     ].join("\n");
@@ -2870,16 +3580,17 @@ ${outcome.response.text}` : direct;
     return this.client;
   }
 };
-function slashCommand(message) {
-  let line;
-  if (message.msgtype === "text") {
-    line = message.text?.content?.trim() ?? "";
-  } else if (message.msgtype === "mixed") {
+function extractTextContent(message) {
+  if (message.msgtype === "text") return message.text?.content ?? "";
+  if (message.msgtype === "mixed") {
     const mixed = message.mixed;
-    line = (mixed?.msg_item ?? []).filter((item) => item.msgtype === "text").map((item) => item.text?.content ?? "").join("").trim();
-  } else {
-    return void 0;
+    return (mixed?.msg_item ?? []).filter((item) => item.msgtype === "text").map((item) => item.text?.content ?? "").join("");
   }
+  return "";
+}
+function slashCommand(message) {
+  const line = extractTextContent(message).trim();
+  if (line.length === 0) return void 0;
   const match = /^\/([a-z][a-z0-9_-]*)(?=$|[\t\n\r ])/iu.exec(line);
   if (match === null) return void 0;
   const rawName = match[1];
@@ -2930,332 +3641,11 @@ function chatTargetOf(frame) {
   if (body === void 0) throw new Error("WeCom stream frame has no message body");
   return chatTarget(body);
 }
-
-// src/config.ts
-import { tmpdir } from "os";
-import { join as join2 } from "path";
-import z from "@deepseek-ai/schemastery";
-var WECOM_FILE_MAX_BYTES = 20 * 1024 * 1024;
-var DEFAULT_WECOM_INBOUND_FILE_DIRECTORY = join2(
-  tmpdir(),
-  `deepseek-harness-wecom-plus-${typeof process.getuid === "function" ? process.getuid() : "current-user"}`,
-  "inbound"
-);
-var COMMAND_NAME_PATTERN = /^[a-z][a-z0-9_-]*$/u;
-var Config = z.object({
-  botId: z.string().default(""),
-  secretRef: z.string().default("WECOM_BOT_SECRET"),
-  accountId: z.string().default("default"),
-  cwd: z.string().required(),
-  agentPreset: z.string(),
-  websocketUrl: z.string().default("wss://openws.work.weixin.qq.com"),
-  scene: z.number().step(1).min(0).default(1),
-  singlePolicy: z.union(["open", "allowlist", "disabled"]).default("open"),
-  singleAllowFrom: z.array(z.string()).default([]),
-  groupPolicy: z.union(["open", "allowlist", "disabled"]).default("open"),
-  groupAllowFrom: z.array(z.string()).default([]),
-  allowedHarnessCommands: z.array(z.string().pattern(COMMAND_NAME_PATTERN)).default(["compact", "goal", "plan"]),
-  imageInputMode: z.union(["auto", "always", "never"]).default("auto"),
-  cardMode: z.union(["auto", "tool", "off"]).default("tool"),
-  cardTaskIdPrefix: z.string().default("dshp"),
-  cardClickAckTitle: z.string().default("\u6B63\u5728\u5904\u7406\u2026"),
-  cardClickAckSubtitle: z.string().default("\u5DF2\u6536\u5230\u6309\u94AE\u70B9\u51FB\uFF0C\u6B63\u5728\u5904\u7406\uFF0C\u8BF7\u7A0D\u5019\u3002"),
-  questionTimeoutMs: z.number().step(1).min(1e4).max(36e5).default(3e5),
-  inboundFileDirectory: z.string().default(DEFAULT_WECOM_INBOUND_FILE_DIRECTORY),
-  welcomeText: z.string().default(""),
-  startupTimeoutMs: z.number().step(1).min(1).default(3e4),
-  // Turn INACTIVITY limit: a running turn is cancelled only after this much
-  // time with no session events (text deltas, tool calls, step boundaries).
-  // A long turn that keeps producing events is never killed, no matter how
-  // long it runs in total.
-  responseTimeoutMs: z.number().step(1).min(1).default(3e5),
-  // Streaming-bubble heartbeat: when nothing streams for this long, re-send a
-  // frame with animated dots and elapsed time so the bubble visibly stays
-  // alive during silent phases (long tool executions, model thinking). 0 disables.
-  streamHeartbeatMs: z.number().step(1).min(0).max(3e5).default(5e3),
-  mediaDownloadTimeoutMs: z.number().step(1).min(1).default(3e4),
-  sendTimeoutMs: z.number().step(1).min(1).default(3e4),
-  reconnectIntervalMs: z.number().step(1).min(100).default(1e3),
-  maxReconnectAttempts: z.number().step(1).min(-1).default(10),
-  maxAuthFailureAttempts: z.number().step(1).min(1).default(2),
-  sendRetries: z.number().step(1).min(0).max(5).default(2),
-  maxReplyBytes: z.number().step(1).min(100).max(20480).default(2e4),
-  maxSeenMessageIds: z.number().step(1).min(100).max(1e5).default(5e3),
-  maxInboundFileBytes: z.number().step(1).min(1).max(WECOM_FILE_MAX_BYTES).default(WECOM_FILE_MAX_BYTES),
-  maxOutboundFileBytes: z.number().step(1).min(1).max(WECOM_FILE_MAX_BYTES).default(WECOM_FILE_MAX_BYTES),
-  systemPrompt: z.string().default(
-    "You are replying through WeCom. Keep replies clear and suitable for enterprise chat. Use WeCom-compatible Markdown for headings, lists, links, emphasis, quotes, and code when structure helps. When the WeCom user asks to receive an existing workspace file, use wecom_send_file instead of claiming that file attachments are unavailable or pasting the whole file. When you need the user to decide something, call ask_user_question: the channel renders it as a Markdown message plus a WeCom template card, and the user answers by clicking a button or replying with a number. Keep option labels SHORT (at most 6 characters, or the WeCom client visually truncates them) and put the full explanation of each choice in the question detail instead. When the user must choose among options or confirm/cancel an action, pair your reply with a card: put the FULL option details (what each choice does) in your Markdown reply, then call wecom_send_card with button_interaction whose buttons carry SHORT labels (at most 6 characters, or the WeCom client truncates them). One turn therefore renders as one Markdown message + one card. For lists of choices you may use vote_interaction (checkbox) or multiple_interaction (dropdowns) instead; keep every label within its cap and never duplicate the whole reply inside the card. When a user clicks a card button or submits a selection, the click arrives as a WeCom message carrying task_id and event_key (plus the selected label when known); answer that click in your reply. Inbound WeCom files are already downloaded and decrypted; their absolute local paths appear in the user message. Use the available file or shell tools to inspect those paths when the user asks you to process an attachment. Do not reveal credentials or internal system data. When a request needs an interactive approval that WeCom cannot provide, explain what approval is needed instead of waiting indefinitely."
-  )
-});
-
-// src/settings-web.ts
-import { credentialRef as credentialRef2 } from "@deepseek-ai/dsh-credentials";
-import {
-  SettingsConflictError
-} from "@deepseek-ai/dsh-settings";
-var SETTINGS_ROUTE = "/_dsh/deepseek-harness-wecom-plus/settings";
-var NAMESPACE_PATTERN = /^[a-z][a-z0-9]*(?:-[a-z0-9]+)*$/;
-var SETTINGS_NS = "deepseek-harness-wecom-plus";
-if (!NAMESPACE_PATTERN.test(SETTINGS_NS)) {
-  throw new TypeError(`settings namespace "${SETTINGS_NS}" must match ${String(NAMESPACE_PATTERN)}`);
-}
-var CLI_ACTIONS = ["cli-probe", "cli-install", "cli-authorize", "cli-auth-status", "cli-cancel-auth"];
-var USER_SETTINGS_KEYS = ["botId", "cardMode", "singlePolicy", "groupPolicy", "welcomeText"];
-function isRecord(value) {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
-}
-function descriptorOf(ctx) {
-  const settings = ctx.get("settings");
-  if (settings === void 0) throw new Error("settings service is not available");
-  const descriptor = settings.describe().find((row) => row.ns === SETTINGS_NS);
-  if (descriptor === void 0) throw new Error("deepseek-harness-wecom-plus Settings namespace is not registered");
-  return descriptor;
-}
-function requireSettings(ctx) {
-  const settings = ctx.get("settings");
-  if (settings === void 0) throw new Error("settings service is not available");
-  return settings;
-}
-function userSettingsOf(config) {
-  const record = isRecord(config) ? config : {};
-  return {
-    botId: typeof record.botId === "string" ? record.botId : "",
-    // Legacy "auto" settings normalize to "tool": adaptive derivation was
-    // removed, and the UI no longer offers "auto".
-    cardMode: record.cardMode === "off" ? "off" : "tool",
-    singlePolicy: record.singlePolicy === "allowlist" || record.singlePolicy === "disabled" ? record.singlePolicy : "open",
-    groupPolicy: record.groupPolicy === "allowlist" || record.groupPolicy === "disabled" ? record.groupPolicy : "open",
-    welcomeText: typeof record.welcomeText === "string" ? record.welcomeText : ""
-  };
-}
-function responseJson(res, status, body) {
-  const bytes = Buffer.from(JSON.stringify(body));
-  res.setHeader("Content-Type", "application/json; charset=utf-8");
-  res.setHeader("Content-Length", String(bytes.length));
-  res.setHeader("Cache-Control", "no-store");
-  res.setHeader("X-Content-Type-Options", "nosniff");
-  res.setHeader("Content-Security-Policy", "default-src 'none'; frame-ancestors 'none'");
-  res.writeHead(status);
-  res.end(bytes);
-}
-function requestError(res, status, code, message) {
-  responseJson(res, status, { ok: false, error: { code, message } });
-}
-function sameOriginPost(req) {
-  const fetchSite = req.headers["sec-fetch-site"];
-  if (fetchSite === "cross-site") return false;
-  const origin = req.headers.origin;
-  if (origin === void 0) return fetchSite === "same-origin" || fetchSite === "same-site" || fetchSite === "none";
-  const host = req.headers.host;
-  if (host === void 0) return false;
-  try {
-    const parsed = new URL(origin);
-    return (parsed.protocol === "http:" || parsed.protocol === "https:") && parsed.host === host;
-  } catch {
-    return false;
-  }
-}
-async function readJson(req, maxBytes = 64 * 1024) {
-  const contentType = req.headers["content-type"]?.split(";", 1)[0]?.trim().toLowerCase();
-  if (contentType !== "application/json") throw new TypeError("Content-Type must be application/json");
-  const chunks = [];
-  let bytes = 0;
-  for await (const chunk of req) {
-    const part = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
-    bytes += part.length;
-    if (bytes > maxBytes) throw new RangeError(`request body exceeds ${maxBytes} bytes`);
-    chunks.push(part);
-  }
-  if (chunks.length === 0) throw new TypeError("request body is empty");
-  return JSON.parse(Buffer.concat(chunks).toString("utf8"));
-}
-function parseRequest(value) {
-  if (!isRecord(value) || typeof value.action !== "string") throw new TypeError("request action is required");
-  if (value.action === "save") {
-    if (!Number.isSafeInteger(value.expectedRevision) || value.expectedRevision < 0) {
-      throw new TypeError("save.expectedRevision must be a non-negative integer");
-    }
-    if (!isRecord(value.value)) throw new TypeError("save.value must be an object");
-    const patch = {};
-    for (const key of USER_SETTINGS_KEYS) {
-      const entry = value.value[key];
-      if (typeof entry !== "string") throw new TypeError(`save.value.${key} must be a string`);
-      patch[key] = entry;
-    }
-    return {
-      action: "save",
-      expectedRevision: value.expectedRevision,
-      value: patch
-    };
-  }
-  if (value.action === "set-key") {
-    if (typeof value.value !== "string" || value.value.trim().length === 0) {
-      throw new TypeError("set-key.value must be a non-empty string");
-    }
-    return { action: "set-key", value: value.value.trim() };
-  }
-  if (typeof value.action === "string" && CLI_ACTIONS.includes(value.action)) {
-    return { action: value.action };
-  }
-  if (value.action === "clear-key") return { action: "clear-key" };
-  throw new TypeError(`unsupported action: ${String(value.action)}`);
-}
-function publicMessage(error) {
-  if (error instanceof Error) return error.message;
-  return String(error);
-}
-var WeComWebBackend = class {
-  constructor(ctx, status, cli) {
-    this.ctx = ctx;
-    this.status = status;
-    this.cli = cli;
-  }
-  ctx;
-  status;
-  cli;
-  cliProbeCache;
-  async credential(config) {
-    const info = await this.ctx.credentials.describe(credentialRef2(config.secretRef));
-    return {
-      configured: info.configured,
-      ...info.source === void 0 ? {} : { source: info.source },
-      writable: info.writable
-    };
-  }
-  /** Build the current settings/credential/channel snapshot without secrets. */
-  async snapshot() {
-    const descriptor = descriptorOf(this.ctx);
-    const config = descriptor.value;
-    const credential = await this.credential(config);
-    return {
-      schemaVersion: 1,
-      writable: requireSettings(this.ctx).writable,
-      settings: {
-        value: userSettingsOf(config),
-        revision: descriptor.revision,
-        applies: "live"
-      },
-      credential: {
-        ref: config.secretRef,
-        configured: credential.configured,
-        ...credential.source === void 0 ? {} : { source: credential.source },
-        writable: credential.writable
-      },
-      channel: this.status(),
-      ...this.cli === void 0 ? {} : { cli: await this.cliSnapshot() },
-      release: { pluginVersion: PLUGIN_VERSION }
-    };
-  }
-  /** Probe with a tiny cache: GET snapshots may arrive in bursts. */
-  async cliSnapshot() {
-    const cached = this.cliProbeCache;
-    if (cached !== void 0 && Date.now() - cached.at < 3e3) return cached.value;
-    const value = await this.cli.probe();
-    this.cliProbeCache = { at: Date.now(), value };
-    return value;
-  }
-  async handleCli(action) {
-    const cli = this.cli;
-    this.cliProbeCache = void 0;
-    switch (action) {
-      case "cli-probe":
-        return cli.probe();
-      case "cli-install":
-        return cli.install();
-      case "cli-authorize":
-        return cli.beginAuth();
-      case "cli-auth-status":
-        return cli.authStatus();
-      case "cli-cancel-auth":
-        cli.cancelAuth();
-        return { cancelled: true };
-    }
-  }
-  /** Merge the UI-editable subset into the namespace's user layer. */
-  async save(request) {
-    const settings = requireSettings(this.ctx);
-    if (!settings.writable) throw new Error("settings provider is read-only");
-    await settings.update(SETTINGS_NS, request.value, request.expectedRevision);
-    return this.snapshot();
-  }
-  /**
-   * Store one pasted Secret under the configured credential reference. The
-   * credentials seam enforces writability and never lets the value back out.
-   */
-  async setKey(value) {
-    const config = descriptorOf(this.ctx).value;
-    await this.ctx.credentials.set(credentialRef2(config.secretRef), value);
-    return this.snapshot();
-  }
-  /** Remove the stored Secret; an absent credential is a no-op. */
-  async clearKey() {
-    const config = descriptorOf(this.ctx).value;
-    await this.ctx.credentials.unset(credentialRef2(config.secretRef));
-    return this.snapshot();
-  }
-  /** Handle the exact Settings route. */
-  async handle(req, res) {
-    if (req.method === "GET") {
-      try {
-        responseJson(res, 200, { ok: true, value: await this.snapshot() });
-      } catch (error) {
-        this.ctx.logger.warn("deepseek-harness-wecom-plus Settings snapshot failed: %s", publicMessage(error));
-        requestError(res, 503, "settings-unavailable", "WeCom channel Settings are unavailable");
-      }
-      return;
-    }
-    if (req.method !== "POST") {
-      res.setHeader("Allow", "GET, POST");
-      requestError(res, 405, "method-not-allowed", "Use GET or POST");
-      return;
-    }
-    if (!sameOriginPost(req)) {
-      requestError(res, 403, "origin-rejected", "The request must originate from this DSH Web application");
-      return;
-    }
-    let parsed;
-    try {
-      parsed = parseRequest(await readJson(req));
-    } catch (error) {
-      requestError(res, error instanceof RangeError ? 413 : 400, "invalid-request", publicMessage(error));
-      return;
-    }
-    try {
-      if (CLI_ACTIONS.includes(parsed.action)) {
-        if (this.cli === void 0) {
-          requestError(res, 503, "cli-unavailable", "The CLI integration is not wired into this channel");
-          return;
-        }
-        responseJson(res, 200, { ok: true, value: await this.handleCli(parsed.action) });
-      } else if (parsed.action === "set-key") {
-        responseJson(res, 200, { ok: true, value: await this.setKey(parsed.value) });
-      } else if (parsed.action === "clear-key") {
-        responseJson(res, 200, { ok: true, value: await this.clearKey() });
-      } else {
-        responseJson(res, 200, { ok: true, value: await this.save(parsed) });
-      }
-    } catch (error) {
-      const conflict = error instanceof SettingsConflictError;
-      const code = conflict ? "settings-conflict" : parsed.action === "set-key" || parsed.action === "clear-key" ? "key-rejected" : "settings-rejected";
-      const status = conflict ? 409 : 400;
-      this.ctx.logger.warn("deepseek-harness-wecom-plus Web action=%s failed: %s", parsed.action, publicMessage(error));
-      requestError(res, status, code, publicMessage(error));
-    }
-  }
-};
-function installWeComSettingsWeb(ctx, backend) {
-  ctx.inject(["webServer"], (webCtx) => {
-    webCtx.effect(() => {
-      const dispose = webCtx.webServer.register({
-        kind: "exact",
-        path: SETTINGS_ROUTE,
-        handler: (req, res) => backend.handle(req, res)
-      });
-      return () => {
-        dispose();
-      };
-    }, "deepseek-harness-wecom-plus: Web Settings route");
-  });
+function workspaceSamePath(a, b) {
+  const normalize = (value) => value.trim().replace(/[\\/]+$/u, "");
+  const left = normalize(a);
+  const right = normalize(b);
+  return process.platform === "win32" ? left.toLowerCase() === right.toLowerCase() : left === right;
 }
 
 // src/index.ts

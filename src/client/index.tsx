@@ -25,6 +25,7 @@ interface UserSettings {
   singlePolicy: 'open' | 'allowlist' | 'disabled'
   groupPolicy: 'open' | 'allowlist' | 'disabled'
   welcomeText: string
+  workspaces: string[]
 }
 
 interface CliInfo {
@@ -41,6 +42,7 @@ interface Snapshot {
   credential: { ref: string; configured: boolean; source?: string; writable: boolean }
   channel: ChannelStatus
   cli?: CliInfo
+  defaultWorkspace: string
   release: { pluginVersion: string }
 }
 
@@ -404,6 +406,8 @@ function LoadedSettings({ controller }: SettingsInjected) {
   const snapshot = state.snapshot
   const [draft, setDraft] = useState<UserSettings | undefined>(undefined)
   const [keyDraft, setKeyDraft] = useState('')
+  const [wsDraft, setWsDraft] = useState('')
+  const [wsError, setWsError] = useState<string | undefined>(undefined)
 
   useEffect(() => { if (state.status === 'idle') void controller.load() }, [controller, state.status])
   useEffect(() => {
@@ -426,6 +430,23 @@ function LoadedSettings({ controller }: SettingsInjected) {
     setDraft(current => current === undefined ? current : { ...current, [key]: value })
   const busy = state.action !== undefined
   const channel = snapshot.channel
+
+  const addWorkspace = (): void => {
+    const candidate = wsDraft.trim()
+    if (candidate.length === 0) return
+    // Server-side is authoritative; this mirror gives instant feedback.
+    if (!/^(?:[A-Za-z]:[\\/]|\\\\|\/)/u.test(candidate)) {
+      setWsError('请输入本机绝对路径，例如 D:\\projects\\demo 或 /home/user/demo。')
+      return
+    }
+    if (snapshot.defaultWorkspace === candidate || draft.workspaces.includes(candidate)) {
+      setWsError('该路径已在候选列表中。')
+      return
+    }
+    update('workspaces', [...draft.workspaces, candidate])
+    setWsDraft('')
+    setWsError(undefined)
+  }
 
   return (
     <div className="wc-settings">
@@ -534,6 +555,48 @@ function LoadedSettings({ controller }: SettingsInjected) {
         </div>
       </section>
 
+      <section className="wc-panel">
+        <div className="wc-panel-title"><h3>工作区</h3></div>
+        <p className="wc-panel-note">
+          候选工作区列表：在企微里发送 /ws 可查看并用编号切换（切换会开启新对话），发送 /ws add 路径 也可新增。
+          默认工作区来自配置 cwd，不可在此修改。
+        </p>
+        <ul className="wc-workspace-list">
+          <li>
+            <code>{snapshot.defaultWorkspace}</code>
+            <span className="wc-workspace-tag">默认</span>
+          </li>
+          {draft.workspaces.map((path, index) => (
+            <li key={path}>
+              <code>{path}</code>
+              <button
+                type="button"
+                className="wc-button"
+                disabled={busy}
+                onClick={() => update('workspaces', draft.workspaces.filter((_, item) => item !== index))}
+              >
+                删除
+              </button>
+            </li>
+          ))}
+        </ul>
+        {wsError === undefined ? null : <div className="wc-alert error">{wsError}</div>}
+        <div className="wc-save-row">
+          <input
+            className="wc-input"
+            type="text"
+            placeholder="新增候选工作区绝对路径，如 D:\\projects\\demo"
+            value={wsDraft}
+            disabled={busy}
+            onChange={(event) => { setWsDraft(event.target.value) }}
+            onKeyDown={(event) => { if (event.key === 'Enter') addWorkspace() }}
+          />
+          <button type="button" className="wc-button primary" disabled={busy || wsDraft.trim().length === 0} onClick={addWorkspace}>
+            新增
+          </button>
+        </div>
+      </section>
+
       <CliCard controller={controller} initial={snapshot.cli} />
 
       <div className="wc-save-row">
@@ -556,6 +619,7 @@ function LoadedSettings({ controller }: SettingsInjected) {
           <li><code>/bot-image-test</code> — 图片回复检查</li>
           <li><code>/bot-file-test</code> — 文件发送检查</li>
           <li><code>/bot-cli</code> — wecom-cli 状态检查与引导</li>
+          <li><code>/ws</code> — 查看/切换/新增工作区</li>
           <li><code>/help</code> — 查看全部命令</li>
         </ul>
       </details>
@@ -598,6 +662,11 @@ const CSS = `
 .wc-loading{padding:24px;border-radius:12px;background:var(--dsw-alias-bg-layer-2,#f7f5f1);font-size:var(--wc-fs-sm);color:var(--dsw-alias-fg-muted,#77736d)}
 .wc-checklist{display:grid;gap:6px;margin:0;padding:0 0 0 2px;list-style:none;font-size:var(--wc-fs-sm);color:var(--dsw-alias-fg-muted,#77736d)}
 .wc-checklist code{background:var(--dsw-alias-bg-layer-2,#f7f5f1);padding:1px 6px;border-radius:6px;font-size:var(--wc-fs-xs)}
+.wc-workspace-list{display:grid;gap:6px;margin:0;padding:0;list-style:none}
+.wc-workspace-list li{display:flex;align-items:center;justify-content:space-between;gap:10px}
+.wc-workspace-list code{background:var(--dsw-alias-bg-layer-2,#f7f5f1);padding:4px 8px;border-radius:7px;font-size:var(--wc-fs-xs);word-break:break-all}
+.wc-workspace-tag{flex:none;font-size:var(--wc-fs-xs);color:var(--dsw-alias-fg-muted,#77736d)}
+.wc-panel-note{margin:0;font-size:var(--wc-fs-xs);line-height:1.45;color:var(--dsw-alias-fg-muted,#77736d)}
 @media(max-width:720px){.wc-settings-header{display:grid}.wc-release{width:auto;min-width:0}.wc-form-grid{grid-template-columns:1fr}.wc-panel-title{flex-direction:column}.wc-release span{white-space:normal;flex-wrap:wrap}}
 .wc-details{display:grid;gap:10px;padding:13px 15px;border:1px solid var(--dsw-alias-border-subtle,#dedbd5);border-radius:14px;background:var(--dsw-alias-bg-layer-1,#fff);content-visibility:auto;contain-intrinsic-size:auto 120px}
 .wc-details summary{cursor:pointer;list-style:none;display:flex;justify-content:space-between;align-items:flex-start;gap:12px;padding:2px 4px;margin:-2px -4px;border-radius:8px;transition:background .15s}

@@ -21,7 +21,7 @@ import {
 } from '@deepseek-ai/dsh-settings'
 import type { CliAuthStart, CliAuthStatus, CliInstallResult, CliProbeResult } from './cli.js'
 import type { WeComCliService } from './cli.js'
-import type { Config } from './config.js'
+import { isWorkspacePath, type Config } from './config.js'
 import { PLUGIN_VERSION } from './version.js'
 
 /** Exact route used by the browser Settings page. */
@@ -48,6 +48,8 @@ export interface WeComUserSettings {
   singlePolicy: Config['singlePolicy']
   groupPolicy: Config['groupPolicy']
   welcomeText: string
+  /** Extra workspace candidates selectable per conversation via `/ws`. */
+  workspaces: string[]
 }
 
 /** Public Settings snapshot; credential values are deliberately impossible here. */
@@ -67,6 +69,8 @@ export interface WeComSettingsSnapshot {
   }
   channel: WeComChannelStatus
   cli?: CliProbeResult
+  /** Default workspace (config cwd); display-only, not user-editable here. */
+  defaultWorkspace: string
   release: { pluginVersion: string }
 }
 
@@ -107,6 +111,24 @@ interface JsonSuccess<T> {
 type JsonResponse<T> = JsonSuccess<T> | JsonError
 
 const USER_SETTINGS_KEYS = ['botId', 'cardMode', 'singlePolicy', 'groupPolicy', 'welcomeText'] as const
+const USER_SETTINGS_ARRAY_KEYS = ['workspaces'] as const
+
+/** Trim, drop empties, dedupe (case-insensitively on Windows). */
+export function normalizeWorkspaceList(value: unknown): string[] {
+  if (!Array.isArray(value)) return []
+  const seen = new Set<string>()
+  const result: string[] = []
+  for (const entry of value) {
+    if (typeof entry !== 'string') continue
+    const candidate = entry.trim()
+    if (candidate.length === 0) continue
+    const key = process.platform === 'win32' ? candidate.toLowerCase() : candidate
+    if (seen.has(key)) continue
+    seen.add(key)
+    result.push(candidate)
+  }
+  return result
+}
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value)
@@ -136,6 +158,7 @@ function userSettingsOf(config: unknown): WeComUserSettings {
     singlePolicy: record.singlePolicy === 'allowlist' || record.singlePolicy === 'disabled' ? record.singlePolicy : 'open',
     groupPolicy: record.groupPolicy === 'allowlist' || record.groupPolicy === 'disabled' ? record.groupPolicy : 'open',
     welcomeText: typeof record.welcomeText === 'string' ? record.welcomeText : '',
+    workspaces: normalizeWorkspaceList(record.workspaces),
   }
 }
 
@@ -196,6 +219,13 @@ export function parseRequest(value: unknown): SettingsRequest {
     for (const key of USER_SETTINGS_KEYS) {
       const entry = value.value[key]
       if (typeof entry !== 'string') throw new TypeError(`save.value.${key} must be a string`)
+      patch[key] = entry
+    }
+    for (const key of USER_SETTINGS_ARRAY_KEYS) {
+      const entry = value.value[key]
+      if (!Array.isArray(entry) || entry.some(item => typeof item !== 'string')) {
+        throw new TypeError(`save.value.${key} must be an array of strings`)
+      }
       patch[key] = entry
     }
     return {
@@ -262,6 +292,7 @@ export class WeComWebBackend {
       },
       channel: this.status(),
       ...(this.cli === undefined ? {} : { cli: await this.cliSnapshot() }),
+      defaultWorkspace: config.cwd,
       release: { pluginVersion: PLUGIN_VERSION },
     }
   }
@@ -293,7 +324,15 @@ export class WeComWebBackend {
   private async save(request: SaveRequest): Promise<WeComSettingsSnapshot> {
     const settings = requireSettings(this.ctx)
     if (!settings.writable) throw new Error('settings provider is read-only')
-    await settings.update(SETTINGS_NS, request.value as object, request.expectedRevision)
+    // A non-absolute workspace would leave the channel dormant at startup
+    // (the bridge validates on construction), so normalize first and reject
+    // whatever survives normalization but is still not absolute.
+    const workspaces = normalizeWorkspaceList(request.value.workspaces)
+    const invalid = workspaces.filter(entry => !isWorkspacePath(entry))
+    if (invalid.length > 0) {
+      throw new Error(`工作区必须是本机绝对路径：${invalid.join('、')}`)
+    }
+    await settings.update(SETTINGS_NS, { ...request.value, workspaces }, request.expectedRevision)
     return this.snapshot()
   }
 

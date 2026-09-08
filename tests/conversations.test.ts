@@ -425,6 +425,7 @@ describe('ConversationManager', () => {
   function rotatingHarness(config: ReturnType<typeof testConfig>, options: {
     persisted?: Array<{ id: string }>
     inspectResult?: () => { meta: Record<string, unknown>; events: unknown[] }
+    registry?: ReturnType<typeof registryMock>
   } = {}) {
     const created: Array<{ sessionId: string; cwd: string | undefined }> = []
     const resumed: string[] = []
@@ -453,6 +454,7 @@ describe('ConversationManager', () => {
     }
     const ctx = {
       on: vi.fn(() => vi.fn()),
+      get: vi.fn((name: string) => name === 'workspaceRegistry' ? options.registry : undefined),
       sessionPersistence: {
         list: vi.fn(async () => options.persisted ?? []),
         inspect: vi.fn(async () => options.inspectResult?.() ?? { meta: {}, events: [] }),
@@ -539,6 +541,56 @@ describe('ConversationManager', () => {
 
     await manager.reset(textMessage('u-persist', 'm-new', '/new'))
     expect(created).toEqual([{ sessionId: `${baseId}-n1`, cwd: '/tmp/ws-persisted' }])
+    await manager.dispose()
+  })
+
+  /** Host workspace registry double: pre-seeded records plus a create spy. */
+  function registryMock(paths: string[] = []) {
+    const entities = paths.map(path => ({ path, attachSession: vi.fn(async () => undefined) }))
+    const create = vi.fn(async (path: string) => {
+      const entity = { path, attachSession: vi.fn(async () => undefined) }
+      entities.push(entity)
+      return entity
+    })
+    return { entities, create, list: vi.fn(() => entities) }
+  }
+
+  it('creates and attaches the workspace group only on an explicit switch', async () => {
+    const config = testConfig()
+    const baseId = sessionIdFor(config.accountId, textMessage('u-align', 'm-a'))
+    const registry = registryMock()
+    const { ctx } = rotatingHarness(config, { registry })
+    const manager = new ConversationManager(ctx, config, vi.fn(async () => undefined), vi.fn(async () => undefined), vi.fn(async () => undefined))
+    await manager.initialize()
+
+    // Ordinary creation: no group is created and none is attached.
+    await manager.process(textMessage('u-align', 'm-a'), downloadPort, noopTransport())
+    expect(registry.create).not.toHaveBeenCalled()
+    expect(registry.entities).toHaveLength(0)
+
+    // An explicit /ws switch creates the group and attaches the new generation.
+    await manager.reset(textMessage('u-align', 'm-b'), '/tmp/ws-align')
+    // The alignment is fire-and-forget: wait for its detached writes to land.
+    await vi.waitFor(() => expect(registry.create).toHaveBeenCalledWith('/tmp/ws-align'))
+    expect(registry.entities.at(-1)?.attachSession).toHaveBeenCalledWith(`${baseId}-n1`)
+    await manager.dispose()
+  })
+
+  it('migrates a resumed session into an existing workspace group without creating one', async () => {
+    const config = testConfig()
+    const baseId = sessionIdFor(config.accountId, textMessage('u-migrate', 'm-a'))
+    const registry = registryMock(['/tmp/ws-persisted'])
+    const { ctx } = rotatingHarness(config, {
+      persisted: [{ id: baseId }],
+      inspectResult: () => ({ meta: { cwd: '/tmp/ws-persisted', agentPreset: 'standard' }, events: [] }),
+      registry,
+    })
+    const manager = new ConversationManager(ctx, config, vi.fn(async () => undefined), vi.fn(async () => undefined), vi.fn(async () => undefined))
+    await manager.initialize()
+
+    await manager.process(textMessage('u-migrate', 'm-a'), downloadPort, noopTransport())
+    expect(registry.create).not.toHaveBeenCalled()
+    await vi.waitFor(() => expect(registry.entities[0]?.attachSession).toHaveBeenCalledWith(baseId))
     await manager.dispose()
   })
 

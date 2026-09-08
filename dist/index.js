@@ -672,6 +672,7 @@ var Config = z.object({
 });
 
 // src/conversations.ts
+import { realpath as realpath3 } from "fs/promises";
 import { createUserMessage } from "@deepseek-ai/dsh-llm";
 import { SessionId } from "@deepseek-ai/dsh-session";
 import { defineTool } from "@deepseek-ai/dsh-tools";
@@ -1262,6 +1263,16 @@ ${question.detail}`
 }
 
 // src/conversations.ts
+async function canonicalWorkspacePath(path) {
+  try {
+    return await realpath3(path);
+  } catch {
+    return path;
+  }
+}
+function sameCanonicalPath(a, b) {
+  return process.platform === "win32" ? a.toLowerCase() === b.toLowerCase() : a === b;
+}
 function resolveSessionPreset(header, events) {
   let preset = header.agentPreset;
   for (const event of events) {
@@ -1429,7 +1440,7 @@ var ConversationManager = class {
       const generation = this.generationFor(baseId);
       if (!Number.isSafeInteger(generation + 1)) throw new Error("WeCom conversation generation is exhausted");
       this.generations.set(baseId, generation + 1);
-      await this.getOrCreate(this.currentSessionId(baseId), nextCwd);
+      await this.getOrCreate(this.currentSessionId(baseId), nextCwd, cwd !== void 0);
     });
   }
   /** Execute a registered Harness command against the current WeCom session. */
@@ -1680,7 +1691,7 @@ var ConversationManager = class {
     }
     return this.config.cwd;
   }
-  async getOrCreate(id, cwd) {
+  async getOrCreate(id, cwd, allowCreate = false) {
     const sessionId = SessionId(id);
     const existing = this.bindings.get(id);
     if (existing !== void 0 && this.ctx.agents.get(sessionId) === existing.agent) return existing;
@@ -1690,13 +1701,13 @@ var ConversationManager = class {
     }
     const pending = this.creations.get(id);
     if (pending !== void 0) return pending;
-    const creation = this.createOrResume(id, cwd).finally(() => this.creations.delete(id));
+    const creation = this.createOrResume(id, cwd, allowCreate).finally(() => this.creations.delete(id));
     this.creations.set(id, creation);
     const binding = await creation;
     this.bindings.set(id, binding);
     return binding;
   }
-  async createOrResume(id, cwd) {
+  async createOrResume(id, cwd, allowCreate = false) {
     const sessionId = SessionId(id);
     const live = this.ctx.agents.get(sessionId);
     if (live !== void 0) return this.borrowAgent(live, id);
@@ -1708,11 +1719,13 @@ var ConversationManager = class {
       const resumedCwd = inspected.meta.cwd;
       if (typeof resumedCwd === "string" && resumedCwd.length > 0) this.sessionCwds.set(id, resumedCwd);
       try {
-        return this.ownAgent(await this.ctx.agents.resume({
+        const handle2 = await this.ctx.agents.resume({
           resumeSessionId: sessionId,
           agentOptions,
           setup: (agentCtx) => this.setupAgent(agentCtx, agentPreset2, id)
-        }));
+        });
+        if (resumedCwd !== void 0) void this.alignWorkspace(id, resumedCwd, false);
+        return this.ownAgent(handle2);
       } catch (error) {
         const raced = this.ctx.agents.get(sessionId);
         if (raced !== void 0) return this.borrowAgent(raced, id);
@@ -1736,7 +1749,42 @@ var ConversationManager = class {
     }
     this.sessionCwds.set(id, createdCwd);
     this.persistedIds.add(id);
+    void this.alignWorkspace(id, createdCwd, allowCreate);
     return this.ownAgent(handle);
+  }
+  /**
+   * Best-effort sidebar grouping: attach the session to the host workspace
+   * record for its cwd, creating that record only when `allowCreate` (an
+   * explicit /ws switch). Never throws: grouping must not break messaging.
+   */
+  async alignWorkspace(id, cwd, allowCreate) {
+    try {
+      const registry = this.ctx.get?.("workspaceRegistry");
+      if (registry === void 0) return;
+      const canonical = await canonicalWorkspacePath(cwd);
+      const existing = registry.list().find((workspace2) => sameCanonicalPath(workspace2.path, canonical));
+      const workspace = existing ?? (allowCreate ? await registry.create(cwd) : void 0);
+      if (workspace === void 0) return;
+      await workspace.attachSession(SessionId(id));
+    } catch (error) {
+      console.error("[wecom-plus] workspace alignment skipped: %s", String(error));
+    }
+  }
+  /**
+   * Find-or-create the host workspace record for one candidate path (no
+   * session attach): used after `/ws add` so the group exists in the Web UI
+   * before any session lands in it. Never throws.
+   */
+  async ensureWorkspaceRecord(cwd) {
+    try {
+      const registry = this.ctx.get?.("workspaceRegistry");
+      if (registry === void 0) return;
+      const canonical = await canonicalWorkspacePath(cwd);
+      const existing = registry.list().find((workspace) => sameCanonicalPath(workspace.path, canonical));
+      if (existing === void 0) await registry.create(cwd);
+    } catch (error) {
+      console.error("[wecom-plus] workspace record creation skipped: %s", String(error));
+    }
   }
   ownAgent(handle) {
     return { agent: handle.agent, release: () => handle.dispose() };
@@ -2142,7 +2190,7 @@ import {
 } from "@deepseek-ai/dsh-settings";
 
 // src/version.ts
-var PLUGIN_VERSION = "0.10.0";
+var PLUGIN_VERSION = "0.10.1";
 
 // src/settings-web.ts
 var SETTINGS_ROUTE = "/_dsh/deepseek-harness-wecom-plus/settings";
@@ -3108,6 +3156,7 @@ var WeComHarnessBridge = class {
     try {
       await this.persistWorkspaces(next);
       this.workspaceOverlay.add(pending.payload);
+      await this.conversations.ensureWorkspaceRecord(pending.payload);
     } catch (error) {
       this.log.error("WeCom workspace persist failed: %s", String(error));
       await this.replyTo(message, frame, `\u5DE5\u4F5C\u533A\u4FDD\u5B58\u5931\u8D25\uFF1A${error instanceof Error ? error.message : String(error)}`);

@@ -1,3 +1,4 @@
+import { realpath } from 'node:fs/promises'
 import type { Context } from '@deepseek-ai/cordis'
 import type { Agent, AgentHandle } from '@deepseek-ai/dsh-agent'
 import type {} from '@deepseek-ai/dsh-agent-default-model'
@@ -25,6 +26,29 @@ import { inboundContent, type WeComDownloadPort } from './inbound.js'
 import { resolveOutboundFile, type OutboundFile } from './outbound-file.js'
 import { WeComQuestionBridge, cardEventFacts, type QuestionCardSender, type QuestionTextSender } from './questions.js'
 import { chatTarget, sessionIdFor, withTimeout, type WeComPeer } from './util.js'
+
+/**
+ * Structural surface of the host workspace registry (dsh-workspace) the
+ * plugin aligns WeCom sessions with. Looked up optionally at call time; when
+ * the service is absent the alignment silently no-ops.
+ */
+interface WorkspaceRegistryLike {
+  list(): Array<{ path: string; attachSession(sessionId: SessionId): Promise<void> }>
+  create(path: string, title?: string): Promise<{ path: string; attachSession(sessionId: SessionId): Promise<void> }>
+}
+
+/** Registry paths are realpath-canonicalized by the host; mirror that for comparisons. */
+async function canonicalWorkspacePath(path: string): Promise<string> {
+  try {
+    return await realpath(path)
+  } catch {
+    return path
+  }
+}
+
+function sameCanonicalPath(a: string, b: string): boolean {
+  return process.platform === 'win32' ? a.toLowerCase() === b.toLowerCase() : a === b
+}
 
 /**
  * dsh 0.1.2-alpha.x turned session preset resolution into a session
@@ -293,7 +317,9 @@ export class ConversationManager {
       const generation = this.generationFor(baseId)
       if (!Number.isSafeInteger(generation + 1)) throw new Error('WeCom conversation generation is exhausted')
       this.generations.set(baseId, generation + 1)
-      await this.getOrCreate(this.currentSessionId(baseId), nextCwd)
+      // An explicit cwd is a deliberate /ws switch: the new generation may
+      // CREATE its workspace group; a plain /new only attaches when one exists.
+      await this.getOrCreate(this.currentSessionId(baseId), nextCwd, cwd !== undefined)
     })
   }
 
@@ -582,7 +608,7 @@ export class ConversationManager {
     return this.config.cwd
   }
 
-  private async getOrCreate(id: string, cwd?: string): Promise<ConversationAgentBinding> {
+  private async getOrCreate(id: string, cwd?: string, allowCreate = false): Promise<ConversationAgentBinding> {
     const sessionId = SessionId(id)
     const existing = this.bindings.get(id)
     if (existing !== undefined && this.ctx.agents.get(sessionId) === existing.agent) return existing
@@ -593,14 +619,14 @@ export class ConversationManager {
     const pending = this.creations.get(id)
     if (pending !== undefined) return pending
 
-    const creation = this.createOrResume(id, cwd).finally(() => this.creations.delete(id))
+    const creation = this.createOrResume(id, cwd, allowCreate).finally(() => this.creations.delete(id))
     this.creations.set(id, creation)
     const binding = await creation
     this.bindings.set(id, binding)
     return binding
   }
 
-  private async createOrResume(id: string, cwd?: string): Promise<ConversationAgentBinding> {
+  private async createOrResume(id: string, cwd?: string, allowCreate = false): Promise<ConversationAgentBinding> {
     const sessionId = SessionId(id)
     const live = this.ctx.agents.get(sessionId)
     if (live !== undefined) return this.borrowAgent(live, id)
@@ -615,11 +641,15 @@ export class ConversationManager {
       const resumedCwd = inspected.meta.cwd
       if (typeof resumedCwd === 'string' && resumedCwd.length > 0) this.sessionCwds.set(id, resumedCwd)
       try {
-        return this.ownAgent(await this.ctx.agents.resume({
+        const handle = await this.ctx.agents.resume({
           resumeSessionId: sessionId,
           agentOptions,
           setup: agentCtx => this.setupAgent(agentCtx, agentPreset, id),
-        }))
+        })
+        // Migrate pre-alignment sessions: an existing workspace group for the
+        // session's cwd adopts it; without one the session stays Ungrouped.
+        if (resumedCwd !== undefined) void this.alignWorkspace(id, resumedCwd, false)
+        return this.ownAgent(handle)
       } catch (error) {
         const raced = this.ctx.agents.get(sessionId)
         if (raced !== undefined) return this.borrowAgent(raced, id)
@@ -646,7 +676,46 @@ export class ConversationManager {
     }
     this.sessionCwds.set(id, createdCwd)
     this.persistedIds.add(id)
+    // Sidebar grouping: an explicit /ws switch may create the workspace
+    // group; ordinary sessions only attach when a matching group exists.
+    void this.alignWorkspace(id, createdCwd, allowCreate)
     return this.ownAgent(handle)
+  }
+
+  /**
+   * Best-effort sidebar grouping: attach the session to the host workspace
+   * record for its cwd, creating that record only when `allowCreate` (an
+   * explicit /ws switch). Never throws: grouping must not break messaging.
+   */
+  private async alignWorkspace(id: string, cwd: string, allowCreate: boolean): Promise<void> {
+    try {
+      const registry = (this.ctx as { get?(name: string): unknown }).get?.('workspaceRegistry') as WorkspaceRegistryLike | undefined
+      if (registry === undefined) return
+      const canonical = await canonicalWorkspacePath(cwd)
+      const existing = registry.list().find(workspace => sameCanonicalPath(workspace.path, canonical))
+      const workspace = existing ?? (allowCreate ? await registry.create(cwd) : undefined)
+      if (workspace === undefined) return
+      await workspace.attachSession(SessionId(id))
+    } catch (error) {
+      console.error('[wecom-plus] workspace alignment skipped: %s', String(error))
+    }
+  }
+
+  /**
+   * Find-or-create the host workspace record for one candidate path (no
+   * session attach): used after `/ws add` so the group exists in the Web UI
+   * before any session lands in it. Never throws.
+   */
+  async ensureWorkspaceRecord(cwd: string): Promise<void> {
+    try {
+      const registry = (this.ctx as { get?(name: string): unknown }).get?.('workspaceRegistry') as WorkspaceRegistryLike | undefined
+      if (registry === undefined) return
+      const canonical = await canonicalWorkspacePath(cwd)
+      const existing = registry.list().find(workspace => sameCanonicalPath(workspace.path, canonical))
+      if (existing === undefined) await registry.create(cwd)
+    } catch (error) {
+      console.error('[wecom-plus] workspace record creation skipped: %s', String(error))
+    }
   }
 
   private ownAgent(handle: AgentHandle): ConversationAgentBinding {

@@ -78,7 +78,7 @@ var WeComSettingsController = class {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ action: "save", expectedRevision, value })
       });
-      this.set({ status: "ready", snapshot, message: "saved" });
+      this.set({ status: "ready", snapshot, message: "saved", action: void 0 });
     } catch (error) {
       this.set({ ...this.state, action: void 0, error: error instanceof Error ? error.message : String(error) });
     }
@@ -94,7 +94,7 @@ var WeComSettingsController = class {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ action: "set-key", value: trimmed })
       });
-      this.set({ status: "ready", snapshot, message: "keySaved" });
+      this.set({ status: "ready", snapshot, message: "keySaved", action: void 0 });
     } catch (error) {
       this.set({ ...this.state, action: void 0, error: error instanceof Error ? error.message : String(error) });
     }
@@ -107,7 +107,7 @@ var WeComSettingsController = class {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ action: "clear-key" })
       });
-      this.set({ status: "ready", snapshot, message: "keyCleared" });
+      this.set({ status: "ready", snapshot, message: "keyCleared", action: void 0 });
     } catch (error) {
       this.set({ ...this.state, action: void 0, error: error instanceof Error ? error.message : String(error) });
     }

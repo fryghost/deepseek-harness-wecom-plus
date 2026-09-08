@@ -883,6 +883,9 @@ export class WeComHarnessBridge {
     try {
       await this.persistWorkspaces(next)
       this.workspaceOverlay.add(pending.payload)
+      // Make the group visible in the Web sidebar even before any session
+      // lands in it; failures are contained inside the manager.
+      await this.conversations.ensureWorkspaceRecord(pending.payload)
     } catch (error) {
       this.log.error('WeCom workspace persist failed: %s', String(error))
       await this.replyTo(message, frame, `工作区保存失败：${error instanceof Error ? error.message : String(error)}`)

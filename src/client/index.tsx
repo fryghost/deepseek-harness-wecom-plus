@@ -115,7 +115,10 @@ export class WeComSettingsController {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ action: 'save', expectedRevision, value }),
       })
-      this.set({ status: 'ready', snapshot, message: 'saved' })
+      // action must be cleared here too: otherwise busy stays true after the
+      // first successful save and every later edit button is dead until the
+      // dialog is remounted.
+      this.set({ status: 'ready', snapshot, message: 'saved', action: undefined })
     } catch (error) {
       this.set({ ...this.state, action: undefined, error: error instanceof Error ? error.message : String(error) })
     }
@@ -132,7 +135,7 @@ export class WeComSettingsController {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ action: 'set-key', value: trimmed }),
       })
-      this.set({ status: 'ready', snapshot, message: 'keySaved' })
+      this.set({ status: 'ready', snapshot, message: 'keySaved', action: undefined })
     } catch (error) {
       this.set({ ...this.state, action: undefined, error: error instanceof Error ? error.message : String(error) })
     }
@@ -146,7 +149,7 @@ export class WeComSettingsController {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ action: 'clear-key' }),
       })
-      this.set({ status: 'ready', snapshot, message: 'keyCleared' })
+      this.set({ status: 'ready', snapshot, message: 'keyCleared', action: undefined })
     } catch (error) {
       this.set({ ...this.state, action: undefined, error: error instanceof Error ? error.message : String(error) })
     }

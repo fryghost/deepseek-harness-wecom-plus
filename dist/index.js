@@ -1284,6 +1284,7 @@ function resolveSessionPreset(header, events) {
 }
 var MAX_CARD_LABEL_TASKS = 500;
 var GENERATION_PROBE_LIMIT = 200;
+var GENERATION_VACANT_TOLERANCE = 10;
 var ConversationManager = class {
   constructor(ctx, config, sendFile, sendQuestionCard, sendQuestionText) {
     this.ctx = ctx;
@@ -1385,10 +1386,16 @@ var ConversationManager = class {
   }
   async probeGenerations(baseId) {
     let highest = 0;
+    let vacantRun = 0;
     await this.probeOne(baseId);
     for (let generation = 1; generation <= GENERATION_PROBE_LIMIT; generation++) {
       const state = await this.probeOne(`${baseId}-n${generation}`);
-      if (state === "vacant") break;
+      if (state === "vacant") {
+        vacantRun++;
+        if (vacantRun >= GENERATION_VACANT_TOLERANCE) break;
+        continue;
+      }
+      vacantRun = 0;
       highest = generation;
     }
     return highest;
@@ -1403,11 +1410,33 @@ var ConversationManager = class {
     if (cached !== void 0) return cached;
     const pending = this.generationProbes.get(baseId);
     if (pending !== void 0) return pending;
-    const probe = this.probeGenerations(baseId).finally(() => this.generationProbes.delete(baseId));
+    const probe = this.probeGenerations(baseId).then((probed) => Promise.all([probed, this.listedGeneration(baseId)])).then(([probed, listed]) => Math.max(probed, listed)).finally(() => this.generationProbes.delete(baseId));
     this.generationProbes.set(baseId, probe);
     const generation = await probe;
     this.generations.set(baseId, generation);
     return generation;
+  }
+  /**
+   * Cross-check against the host's list(). Advisory only (rc.2 serves a
+   * lazily-populated index), but once warm it catches ids the probe window
+   * or a refusal identity might have missed.
+   */
+  async listedGeneration(baseId) {
+    try {
+      const headers = await this.ctx.sessionPersistence.list();
+      this.lastListedCount = headers.length;
+      const prefix = `${baseId}-n`;
+      let max = 0;
+      for (const header of headers) {
+        const id = String(header.id);
+        if (!id.startsWith(prefix)) continue;
+        const candidate = Number(id.slice(prefix.length));
+        if (Number.isSafeInteger(candidate)) max = Math.max(max, candidate);
+      }
+      return max;
+    } catch {
+      return 0;
+    }
   }
   /** Process one inbound message after earlier work in the same WeCom conversation. */
   process(message, client, transport) {
@@ -2298,7 +2327,7 @@ import {
 } from "@deepseek-ai/dsh-settings";
 
 // src/version.ts
-var PLUGIN_VERSION = "0.10.5";
+var PLUGIN_VERSION = "0.10.6";
 
 // src/settings-web.ts
 var SETTINGS_ROUTE = "/_dsh/deepseek-harness-wecom-plus/settings";

@@ -136,6 +136,13 @@ const MAX_CARD_LABEL_TASKS = 500
  */
 const GENERATION_PROBE_LIMIT = 200
 
+/**
+ * Archiving punches holes in the generation sequence (e.g. n2/n3 removed
+ * while n4..n11 exist), so a probe tolerates this many consecutive vacant
+ * ids before concluding the lineage has ended.
+ */
+const GENERATION_VACANT_TOLERANCE = 10
+
 /** One sent card plus the key → visible-label map used to resolve clicks. */
 interface CardRegistryEntry {
   card: TemplateCard
@@ -275,12 +282,18 @@ export class ConversationManager {
 
   private async probeGenerations(baseId: string): Promise<number> {
     let highest = 0
+    let vacantRun = 0
     // Generation 0 is the base session itself; it may be vacant while -nK
     // records exist, so its absence does not end the probe.
     await this.probeOne(baseId)
     for (let generation = 1; generation <= GENERATION_PROBE_LIMIT; generation++) {
       const state = await this.probeOne(`${baseId}-n${generation}`)
-      if (state === 'vacant') break
+      if (state === 'vacant') {
+        vacantRun++
+        if (vacantRun >= GENERATION_VACANT_TOLERANCE) break
+        continue
+      }
+      vacantRun = 0
       highest = generation
     }
     return highest
@@ -296,11 +309,37 @@ export class ConversationManager {
     if (cached !== undefined) return cached
     const pending = this.generationProbes.get(baseId)
     if (pending !== undefined) return pending
-    const probe = this.probeGenerations(baseId).finally(() => this.generationProbes.delete(baseId))
+    const probe = this.probeGenerations(baseId)
+      .then(probed => Promise.all([probed, this.listedGeneration(baseId)]))
+      .then(([probed, listed]) => Math.max(probed, listed))
+      .finally(() => this.generationProbes.delete(baseId))
     this.generationProbes.set(baseId, probe)
     const generation = await probe
     this.generations.set(baseId, generation)
     return generation
+  }
+
+  /**
+   * Cross-check against the host's list(). Advisory only (rc.2 serves a
+   * lazily-populated index), but once warm it catches ids the probe window
+   * or a refusal identity might have missed.
+   */
+  private async listedGeneration(baseId: string): Promise<number> {
+    try {
+      const headers = await this.ctx.sessionPersistence.list()
+      this.lastListedCount = headers.length
+      const prefix = `${baseId}-n`
+      let max = 0
+      for (const header of headers) {
+        const id = String(header.id)
+        if (!id.startsWith(prefix)) continue
+        const candidate = Number(id.slice(prefix.length))
+        if (Number.isSafeInteger(candidate)) max = Math.max(max, candidate)
+      }
+      return max
+    } catch {
+      return 0
+    }
   }
 
   /** Process one inbound message after earlier work in the same WeCom conversation. */

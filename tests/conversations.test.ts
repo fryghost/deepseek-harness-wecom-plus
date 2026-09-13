@@ -356,7 +356,7 @@ describe('ConversationManager', () => {
     const config = testConfig()
     const message = textMessage('u-collide', 'm-collide')
     const baseId = sessionIdFor(config.accountId, message)
-    const occupiedId = `${baseId}-n1`
+    const occupiedId = `${baseId}-n11`
     const events: unknown[] = []
     const agent = {
       status: 'idle',
@@ -384,8 +384,9 @@ describe('ConversationManager', () => {
       created.push(String(options.sessionId))
       throw Object.assign(new Error('session already exists'), { name: 'SessionAlreadyExistsError' })
     })
-    // Discovery sees nothing (NotFound everywhere), so the collision only
-    // surfaces at create time and must degrade to a migrating resume.
+    // list() reports -n10, so the switch targets the next generation -n11;
+    // the collision there (NotFound everywhere on inspect) must degrade to a
+    // migrating resume.
     const inspect = vi.fn(async () => {
       throw Object.assign(new Error('missing'), { name: 'SessionPersistenceNotFoundError' })
     })

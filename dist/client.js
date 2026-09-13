@@ -30,6 +30,13 @@ module.exports = __toCommonJS(client_exports);
 var import_react = require("react");
 var import_jsx_runtime = require("react/jsx-runtime");
 var ROUTE = "/_dsh/deepseek-harness-wecom-plus/settings";
+function sameWorkspacePath(a, b) {
+  const normalize = (value) => value.trim().replace(/[\\/]+$/u, "");
+  const left = normalize(a);
+  const right = normalize(b);
+  const windows = /^(?:[A-Za-z]:[\\/]|\\\\)/.test(left) || /^(?:[A-Za-z]:[\\/]|\\\\)/.test(right);
+  return windows ? left.toLowerCase() === right.toLowerCase() : left === right;
+}
 async function apiRequest(init) {
   const response = await fetch(ROUTE, { credentials: "same-origin", ...init });
   const body = await response.json();
@@ -316,13 +323,13 @@ function LoadedSettings({ controller }) {
   const busy = state.action !== void 0;
   const channel = snapshot.channel;
   const addWorkspace = () => {
-    const candidate = wsDraft.trim();
+    const candidate = wsDraft.trim().replace(/^["'“”‘’]+/u, "").replace(/["'“”‘’]+$/u, "").trim().replace(/[\\/]+$/u, "");
     if (candidate.length === 0) return;
     if (!/^(?:[A-Za-z]:[\\/]|\\\\|\/)/u.test(candidate)) {
-      setWsError("\u8BF7\u8F93\u5165\u672C\u673A\u7EDD\u5BF9\u8DEF\u5F84\uFF0C\u4F8B\u5982 D:\\projects\\demo \u6216 /home/user/demo\u3002");
+      setWsError("\u8BF7\u8F93\u5165\u672C\u673A\u7EDD\u5BF9\u8DEF\u5F84\uFF08\u53EF\u4ECE\u8D44\u6E90\u7BA1\u7406\u5668\u5730\u5740\u680F\u76F4\u63A5\u590D\u5236\uFF09\uFF0C\u4F8B\u5982 D:projectsdemo\u3002");
       return;
     }
-    if (snapshot.defaultWorkspace === candidate || draft.workspaces.includes(candidate)) {
+    if (sameWorkspacePath(candidate, snapshot.defaultWorkspace) || draft.workspaces.some((path) => sameWorkspacePath(path, candidate))) {
       setWsError("\u8BE5\u8DEF\u5F84\u5DF2\u5728\u5019\u9009\u5217\u8868\u4E2D\u3002");
       return;
     }
@@ -330,6 +337,7 @@ function LoadedSettings({ controller }) {
     setWsDraft("");
     setWsError(void 0);
   };
+  const addableHostWorkspaces = (snapshot.hostWorkspaces ?? []).filter((workspace) => !sameWorkspacePath(workspace.path, snapshot.defaultWorkspace) && !draft.workspaces.some((path) => sameWorkspacePath(path, workspace.path)));
   return /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", { className: "wc-settings", children: [
     /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("header", { className: "wc-settings-header", children: [
       /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", { children: [
@@ -448,6 +456,24 @@ function LoadedSettings({ controller }) {
           )
         ] }, path))
       ] }),
+      addableHostWorkspaces.length > 0 ? /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", { className: "wc-workspace-pick", children: [
+        /* @__PURE__ */ (0, import_jsx_runtime.jsx)("span", { className: "wc-workspace-tag", children: "\u4ECE\u7F51\u9875\u5DE5\u4F5C\u533A\u4E00\u952E\u6DFB\u52A0\uFF1A" }),
+        addableHostWorkspaces.map((workspace) => /* @__PURE__ */ (0, import_jsx_runtime.jsxs)(
+          "button",
+          {
+            type: "button",
+            className: "wc-button",
+            disabled: busy,
+            title: workspace.path,
+            onClick: () => update("workspaces", [...draft.workspaces, workspace.path]),
+            children: [
+              "+ ",
+              workspace.title
+            ]
+          },
+          workspace.path
+        ))
+      ] }) : null,
       wsError === void 0 ? null : /* @__PURE__ */ (0, import_jsx_runtime.jsx)("div", { className: "wc-alert error", children: wsError }),
       /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", { className: "wc-save-row", children: [
         /* @__PURE__ */ (0, import_jsx_runtime.jsx)(
@@ -455,7 +481,7 @@ function LoadedSettings({ controller }) {
           {
             className: "wc-input",
             type: "text",
-            placeholder: "\u65B0\u589E\u5019\u9009\u5DE5\u4F5C\u533A\u7EDD\u5BF9\u8DEF\u5F84\uFF0C\u5982 D:\\\\projects\\\\demo",
+            placeholder: "\u65B0\u589E\u5019\u9009\u5DE5\u4F5C\u533A\u7EDD\u5BF9\u8DEF\u5F84\uFF0C\u5982 D:\\projects\\demo",
             value: wsDraft,
             disabled: busy,
             onChange: (event) => {
@@ -555,6 +581,7 @@ var CSS = `
 .wc-workspace-list li{display:flex;align-items:center;justify-content:space-between;gap:10px}
 .wc-workspace-list code{background:var(--dsw-alias-bg-layer-2,#f7f5f1);padding:4px 8px;border-radius:7px;font-size:var(--wc-fs-xs);word-break:break-all}
 .wc-workspace-tag{flex:none;font-size:var(--wc-fs-xs);color:var(--dsw-alias-fg-muted,#77736d)}
+.wc-workspace-pick{display:flex;flex-wrap:wrap;align-items:center;gap:8px}
 .wc-panel-note{margin:0;font-size:var(--wc-fs-xs);line-height:1.45;color:var(--dsw-alias-fg-muted,#77736d)}
 @media(max-width:720px){.wc-settings-header{display:grid}.wc-release{width:auto;min-width:0}.wc-form-grid{grid-template-columns:1fr}.wc-panel-title{flex-direction:column}.wc-release span{white-space:normal;flex-wrap:wrap}}
 .wc-details{display:grid;gap:10px;padding:13px 15px;border:1px solid var(--dsw-alias-border-subtle,#dedbd5);border-radius:14px;background:var(--dsw-alias-bg-layer-1,#fff);content-visibility:auto;contain-intrinsic-size:auto 120px}

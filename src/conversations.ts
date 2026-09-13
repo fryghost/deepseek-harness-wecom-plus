@@ -127,6 +127,15 @@ interface ActiveStream {
 /** Bound on remembered card registries; oldest tasks are evicted first. */
 const MAX_CARD_LABEL_TASKS = 500
 
+/**
+ * The host's sessionPersistence.list() silently skips logs stored in a
+ * foreign format (SessionFormatUnsupportedError) — e.g. legacy sessions kept
+ * on disk after a host session-log upgrade. Generation discovery therefore
+ * probes this many generations above the newest listed one with inspect();
+ * a format refusal marks the generation occupied.
+ */
+const GENERATION_PROBE_LIMIT = 200
+
 /** One sent card plus the key → visible-label map used to resolve clicks. */
 interface CardRegistryEntry {
   card: TemplateCard
@@ -153,6 +162,8 @@ export class ConversationManager {
   /** Durable per-session workspace: session meta.cwd is immutable, so switching goes through a new generation. */
   private readonly sessionCwds = new Map<string, string>()
   private persistedIds = new Set<string>()
+  /** Occupied generations hidden from list() by a foreign log format; resume migrates them. */
+  private readonly hiddenIds = new Set<string>()
   private readonly disposeSessionEvents: () => void
 
   constructor(
@@ -192,6 +203,44 @@ export class ConversationManager {
   async initialize(): Promise<void> {
     const headers = await this.ctx.sessionPersistence.list()
     this.persistedIds = new Set(headers.map(header => String(header.id)))
+    await this.discoverHiddenGenerations()
+  }
+
+  /**
+   * list() hides foreign-format sessions, so after a host session-log
+   * upgrade the newest generations can vanish from the generation scan: a
+   * restart would silently fall back to an older conversation, and a /ws
+   * switch would try to create an id whose record still exists on disk
+   * (SessionAlreadyExistsError → “切换失败”). Probe upward per known WeCom
+   * base id and mark refused generations as occupied; resuming one lets the
+   * host migrate and publish it.
+   */
+  private async discoverHiddenGenerations(): Promise<void> {
+    const bases = new Set<string>()
+    for (const id of this.persistedIds) {
+      const base = id.replace(/-n[1-9][0-9]*$/u, '')
+      if (base !== id && base.startsWith('wecom-v2-')) bases.add(base)
+    }
+    for (const base of bases) {
+      let newest = 0
+      for (const id of this.persistedIds) {
+        if (!id.startsWith(`${base}-n`)) continue
+        const candidate = Number(id.slice(base.length + 2))
+        if (Number.isSafeInteger(candidate)) newest = Math.max(newest, candidate)
+      }
+      for (let probe = newest + 1; probe <= newest + GENERATION_PROBE_LIMIT; probe++) {
+        const id = `${base}-n${probe}`
+        try {
+          await this.ctx.sessionPersistence.inspect(SessionId(id))
+          this.persistedIds.add(id)
+        } catch (error) {
+          const name = error instanceof Error ? error.name : ''
+          if (name === 'SessionPersistenceNotFoundError') break
+          if (name !== 'SessionFormatUnsupportedError') break
+          this.hiddenIds.add(id)
+        }
+      }
+    }
   }
 
   /** Process one inbound message after earlier work in the same WeCom conversation. */
@@ -314,7 +363,13 @@ export class ConversationManager {
         await binding.release()
       }
       const nextCwd = cwd ?? await this.resolveWorkspace(id)
-      const generation = this.generationFor(baseId)
+      let generation = this.generationFor(baseId)
+      // A hidden legacy record can occupy generations beyond the discovered
+      // window; never target an occupied id — skip to the first free one.
+      while (this.persistedIds.has(`${baseId}-n${generation + 1}`)
+        || this.hiddenIds.has(`${baseId}-n${generation + 1}`)) {
+        generation++
+      }
       if (!Number.isSafeInteger(generation + 1)) throw new Error('WeCom conversation generation is exhausted')
       this.generations.set(baseId, generation + 1)
       // An explicit cwd is a deliberate /ws switch: the new generation may
@@ -382,6 +437,7 @@ export class ConversationManager {
     this.pendingCards.clear()
     this.cardRegistry.clear()
     this.sessionCwds.clear()
+    this.hiddenIds.clear()
   }
 
   private enqueue<T>(baseId: string, operation: () => Promise<T>): Promise<T> {
@@ -409,7 +465,9 @@ export class ConversationManager {
     if (cached !== undefined) return cached
     const prefix = `${baseId}-n`
     let generation = 0
-    for (const id of this.persistedIds) {
+    // Hidden generations are occupied too: they must raise the current
+    // generation even though list() cannot see them.
+    for (const id of [...this.persistedIds, ...this.hiddenIds]) {
       if (!id.startsWith(prefix)) continue
       const suffix = id.slice(prefix.length)
       if (!/^[1-9][0-9]*$/u.test(suffix)) continue
@@ -649,6 +707,34 @@ export class ConversationManager {
         // Migrate pre-alignment sessions: an existing workspace group for the
         // session's cwd adopts it; without one the session stays Ungrouped.
         if (resumedCwd !== undefined) void this.alignWorkspace(id, resumedCwd, false)
+        return this.ownAgent(handle)
+      } catch (error) {
+        const raced = this.ctx.agents.get(sessionId)
+        if (raced !== undefined) return this.borrowAgent(raced, id)
+        throw error
+      }
+    }
+
+    // A hidden id is occupied by a foreign-format log the host's list()
+    // skips. Its first write open migrates and publishes it, so resume —
+    // never create — is the only safe move for such an id.
+    if (this.hiddenIds.has(id)) {
+      try {
+        const handle = await this.ctx.agents.resume({
+          resumeSessionId: sessionId,
+          agentOptions,
+          setup: agentCtx => this.setupAgent(agentCtx, this.resolveAgentPreset(), id),
+        })
+        this.hiddenIds.delete(id)
+        this.persistedIds.add(id)
+        try {
+          const migrated = await this.ctx.sessionPersistence.inspect(sessionId)
+          const migratedCwd = migrated.meta.cwd
+          if (typeof migratedCwd === 'string' && migratedCwd.length > 0) this.sessionCwds.set(id, migratedCwd)
+        } catch {
+          // Migrated but the header stayed unreadable: the default-workspace
+          // fallback still applies.
+        }
         return this.ownAgent(handle)
       } catch (error) {
         const raced = this.ctx.agents.get(sessionId)

@@ -1283,6 +1283,7 @@ function resolveSessionPreset(header, events) {
   return preset ?? void 0;
 }
 var MAX_CARD_LABEL_TASKS = 500;
+var GENERATION_PROBE_LIMIT = 200;
 var ConversationManager = class {
   constructor(ctx, config, sendFile, sendQuestionCard, sendQuestionText) {
     this.ctx = ctx;
@@ -1324,11 +1325,50 @@ var ConversationManager = class {
   /** Durable per-session workspace: session meta.cwd is immutable, so switching goes through a new generation. */
   sessionCwds = /* @__PURE__ */ new Map();
   persistedIds = /* @__PURE__ */ new Set();
+  /** Occupied generations hidden from list() by a foreign log format; resume migrates them. */
+  hiddenIds = /* @__PURE__ */ new Set();
   disposeSessionEvents;
   /** Snapshot persisted identities once before accepting traffic. */
   async initialize() {
     const headers = await this.ctx.sessionPersistence.list();
     this.persistedIds = new Set(headers.map((header) => String(header.id)));
+    await this.discoverHiddenGenerations();
+  }
+  /**
+   * list() hides foreign-format sessions, so after a host session-log
+   * upgrade the newest generations can vanish from the generation scan: a
+   * restart would silently fall back to an older conversation, and a /ws
+   * switch would try to create an id whose record still exists on disk
+   * (SessionAlreadyExistsError → “切换失败”). Probe upward per known WeCom
+   * base id and mark refused generations as occupied; resuming one lets the
+   * host migrate and publish it.
+   */
+  async discoverHiddenGenerations() {
+    const bases = /* @__PURE__ */ new Set();
+    for (const id of this.persistedIds) {
+      const base = id.replace(/-n[1-9][0-9]*$/u, "");
+      if (base !== id && base.startsWith("wecom-v2-")) bases.add(base);
+    }
+    for (const base of bases) {
+      let newest = 0;
+      for (const id of this.persistedIds) {
+        if (!id.startsWith(`${base}-n`)) continue;
+        const candidate = Number(id.slice(base.length + 2));
+        if (Number.isSafeInteger(candidate)) newest = Math.max(newest, candidate);
+      }
+      for (let probe = newest + 1; probe <= newest + GENERATION_PROBE_LIMIT; probe++) {
+        const id = `${base}-n${probe}`;
+        try {
+          await this.ctx.sessionPersistence.inspect(SessionId(id));
+          this.persistedIds.add(id);
+        } catch (error) {
+          const name2 = error instanceof Error ? error.name : "";
+          if (name2 === "SessionPersistenceNotFoundError") break;
+          if (name2 !== "SessionFormatUnsupportedError") break;
+          this.hiddenIds.add(id);
+        }
+      }
+    }
   }
   /** Process one inbound message after earlier work in the same WeCom conversation. */
   process(message, client, transport) {
@@ -1437,7 +1477,10 @@ var ConversationManager = class {
         await binding.release();
       }
       const nextCwd = cwd ?? await this.resolveWorkspace(id);
-      const generation = this.generationFor(baseId);
+      let generation = this.generationFor(baseId);
+      while (this.persistedIds.has(`${baseId}-n${generation + 1}`) || this.hiddenIds.has(`${baseId}-n${generation + 1}`)) {
+        generation++;
+      }
       if (!Number.isSafeInteger(generation + 1)) throw new Error("WeCom conversation generation is exhausted");
       this.generations.set(baseId, generation + 1);
       await this.getOrCreate(this.currentSessionId(baseId), nextCwd, cwd !== void 0);
@@ -1498,6 +1541,7 @@ var ConversationManager = class {
     this.pendingCards.clear();
     this.cardRegistry.clear();
     this.sessionCwds.clear();
+    this.hiddenIds.clear();
   }
   enqueue(baseId, operation) {
     const previous = this.queues.get(baseId) ?? Promise.resolve();
@@ -1523,7 +1567,7 @@ var ConversationManager = class {
     if (cached !== void 0) return cached;
     const prefix = `${baseId}-n`;
     let generation = 0;
-    for (const id of this.persistedIds) {
+    for (const id of [...this.persistedIds, ...this.hiddenIds]) {
       if (!id.startsWith(prefix)) continue;
       const suffix = id.slice(prefix.length);
       if (!/^[1-9][0-9]*$/u.test(suffix)) continue;
@@ -1725,6 +1769,28 @@ var ConversationManager = class {
           setup: (agentCtx) => this.setupAgent(agentCtx, agentPreset2, id)
         });
         if (resumedCwd !== void 0) void this.alignWorkspace(id, resumedCwd, false);
+        return this.ownAgent(handle2);
+      } catch (error) {
+        const raced = this.ctx.agents.get(sessionId);
+        if (raced !== void 0) return this.borrowAgent(raced, id);
+        throw error;
+      }
+    }
+    if (this.hiddenIds.has(id)) {
+      try {
+        const handle2 = await this.ctx.agents.resume({
+          resumeSessionId: sessionId,
+          agentOptions,
+          setup: (agentCtx) => this.setupAgent(agentCtx, this.resolveAgentPreset(), id)
+        });
+        this.hiddenIds.delete(id);
+        this.persistedIds.add(id);
+        try {
+          const migrated = await this.ctx.sessionPersistence.inspect(sessionId);
+          const migratedCwd = migrated.meta.cwd;
+          if (typeof migratedCwd === "string" && migratedCwd.length > 0) this.sessionCwds.set(id, migratedCwd);
+        } catch {
+        }
         return this.ownAgent(handle2);
       } catch (error) {
         const raced = this.ctx.agents.get(sessionId);
@@ -2190,7 +2256,7 @@ import {
 } from "@deepseek-ai/dsh-settings";
 
 // src/version.ts
-var PLUGIN_VERSION = "0.10.1";
+var PLUGIN_VERSION = "0.10.2";
 
 // src/settings-web.ts
 var SETTINGS_ROUTE = "/_dsh/deepseek-harness-wecom-plus/settings";
@@ -2208,14 +2274,20 @@ function normalizeWorkspaceList(value) {
   const result = [];
   for (const entry of value) {
     if (typeof entry !== "string") continue;
-    const candidate = entry.trim();
+    const candidate = unwrapWorkspaceInput(entry);
     if (candidate.length === 0) continue;
-    const key = process.platform === "win32" ? candidate.toLowerCase() : candidate;
+    const key = workspaceDedupeKey(candidate);
     if (seen.has(key)) continue;
     seen.add(key);
     result.push(candidate);
   }
   return result;
+}
+function unwrapWorkspaceInput(raw) {
+  return raw.trim().replace(/^["'“”‘’]+/u, "").replace(/["'“”‘’]+$/u, "").trim().replace(/[\\/]+$/u, "");
+}
+function workspaceDedupeKey(candidate) {
+  return process.platform === "win32" ? candidate.toLowerCase() : candidate;
 }
 function isRecord(value) {
   return typeof value === "object" && value !== null && !Array.isArray(value);
@@ -2368,8 +2440,16 @@ var WeComWebBackend = class {
       channel: this.status(),
       ...this.cli === void 0 ? {} : { cli: await this.cliSnapshot() },
       defaultWorkspace: config.cwd,
+      ...this.hostWorkspaces(),
       release: { pluginVersion: PLUGIN_VERSION }
     };
+  }
+  /** Host sidebar workspaces (dsh-workspace registry), when the service is present. */
+  hostWorkspaces() {
+    const registry = this.ctx.get("workspaceRegistry");
+    const list = registry?.list?.();
+    if (!Array.isArray(list)) return {};
+    return { hostWorkspaces: list.map((workspace) => ({ path: workspace.path, title: workspace.title })) };
   }
   /** Probe with a tiny cache: GET snapshots may arrive in bursts. */
   async cliSnapshot() {
@@ -2954,7 +3034,8 @@ var WeComHarnessBridge = class {
     }
     const addMatch = /^add\s+(.+)$/is.exec(rest);
     if (addMatch !== null) {
-      await this.requestWorkspaceAdd(frame, message, baseId, (addMatch[1] ?? "").trim().replace(/^["']|["']$/gu, ""));
+      const raw = (addMatch[1] ?? "").trim().replace(/^["'“”‘’]+/u, "").replace(/["'“”‘’]+$/u, "").trim().replace(/[\\/]+$/u, "");
+      await this.requestWorkspaceAdd(frame, message, baseId, raw);
       return;
     }
     if (/^\d+$/u.test(rest)) {
@@ -3098,7 +3179,9 @@ var WeComHarnessBridge = class {
   /** Settle a pending workspace confirmation from the user's plain text reply. */
   async settleWorkspaceTextConfirm(frame, message, pending) {
     this.workspaceConfirms.delete(this.baseIdOf(message));
-    if (!WORKSPACE_CONFIRM_TEXTS.has(extractTextContent(message).trim().toLowerCase())) {
+    const text = extractTextContent(message).trim().toLowerCase();
+    const numberedConfirm = pending.kind === "workspace-switch" && /^[1-9][0-9]*$/u.test(text) && workspaceSamePath(this.workspaceList()[Number(text) - 1] ?? "", pending.payload);
+    if (!WORKSPACE_CONFIRM_TEXTS.has(text) && !numberedConfirm) {
       await this.sendReply(frame, { text: "\u5DF2\u53D6\u6D88\u5DE5\u4F5C\u533A\u64CD\u4F5C\uFF0C\u5F53\u524D\u8BBE\u7F6E\u4FDD\u6301\u4E0D\u53D8\u3002", images: [], cards: [] });
       return;
     }

@@ -35,7 +35,7 @@ function mockRequest(method: string, body?: unknown): never {
   } as never
 }
 
-function backend(value: unknown = testConfig(), writable = true) {
+function backend(value: unknown = testConfig(), writable = true, registry?: { list(): Array<{ path: string; title: string }> }) {
   const update = vi.fn(async () => undefined)
   const set = vi.fn(async () => undefined)
   const unset = vi.fn(async () => undefined)
@@ -46,7 +46,7 @@ function backend(value: unknown = testConfig(), writable = true) {
   }
   const ctx = {
     logger: { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() },
-    get: vi.fn((name: string) => (name === 'settings' ? settings : undefined)),
+    get: vi.fn((name: string) => (name === 'settings' ? settings : name === 'workspaceRegistry' ? registry : undefined)),
     credentials: {
       describe: vi.fn(async () => ({ configured: false, writable: true })),
       set,
@@ -196,6 +196,34 @@ describe('WeCom settings web backend', () => {
     const value = captured.body.value as { defaultWorkspace?: string; settings?: { value?: { workspaces?: string[] } } }
     expect(value.defaultWorkspace).toBe('/tmp/wecom-test')
     expect(value.settings?.value?.workspaces).toEqual(['/tmp/ws-a'])
+  })
+
+  it('strips wrapping quotes and trailing separators from saved workspaces', async () => {
+    const { instance } = backend(testConfig({ workspaces: ['"D:\\ws-a"', 'D:\\ws-a\\', '“D:\\ws-b”'] }))
+    const { res, captured } = mockResponse()
+
+    await instance.handle(mockRequest('GET'), res)
+
+    const value = captured.body.value as { settings?: { value?: { workspaces?: string[] } } }
+    expect(value.settings?.value?.workspaces).toEqual(['D:\\ws-a', 'D:\\ws-b'])
+  })
+
+  it('exposes host sidebar workspaces as one-click add sources', async () => {
+    const { instance } = backend(testConfig(), true, {
+      list: vi.fn(() => [
+        { path: 'D:\\deepseek\\test', title: 'test' },
+        { path: 'D:\\deepseek\\deepseek-harness', title: 'deepseek-harness' },
+      ]),
+    })
+    const { res, captured } = mockResponse()
+
+    await instance.handle(mockRequest('GET'), res)
+
+    const value = captured.body.value as { hostWorkspaces?: Array<{ path: string; title: string }> }
+    expect(value.hostWorkspaces).toEqual([
+      { path: 'D:\\deepseek\\test', title: 'test' },
+      { path: 'D:\\deepseek\\deepseek-harness', title: 'deepseek-harness' },
+    ])
   })
 
   it('rejects a save whose workspaces are not absolute paths', async () => {

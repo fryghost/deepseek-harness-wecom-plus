@@ -43,6 +43,7 @@ interface Snapshot {
   channel: ChannelStatus
   cli?: CliInfo
   defaultWorkspace: string
+  hostWorkspaces?: Array<{ path: string; title: string }>
   release: { pluginVersion: string }
 }
 
@@ -51,6 +52,15 @@ interface ApiFailure { ok: false; error: { code: string; message: string } }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value)
+}
+
+/** Workspace path equality for UI checks: trailing separators dropped, case-insensitive for Windows-style paths. */
+function sameWorkspacePath(a: string, b: string): boolean {
+  const normalize = (value: string): string => value.trim().replace(/[\\/]+$/u, '')
+  const left = normalize(a)
+  const right = normalize(b)
+  const windows = /^(?:[A-Za-z]:[\\/]|\\\\)/.test(left) || /^(?:[A-Za-z]:[\\/]|\\\\)/.test(right)
+  return windows ? left.toLowerCase() === right.toLowerCase() : left === right
 }
 
 async function apiRequest<T>(init?: RequestInit): Promise<T> {
@@ -435,14 +445,22 @@ function LoadedSettings({ controller }: SettingsInjected) {
   const channel = snapshot.channel
 
   const addWorkspace = (): void => {
-    const candidate = wsDraft.trim()
+    // Explorer's "copy as path" wraps the value in quotes; strip those and any
+    // trailing separator so pasted paths just work.
+    const candidate = wsDraft
+      .trim()
+      .replace(/^["'“”‘’]+/u, '')
+      .replace(/["'“”‘’]+$/u, '')
+      .trim()
+      .replace(/[\\/]+$/u, '')
     if (candidate.length === 0) return
     // Server-side is authoritative; this mirror gives instant feedback.
     if (!/^(?:[A-Za-z]:[\\/]|\\\\|\/)/u.test(candidate)) {
-      setWsError('请输入本机绝对路径，例如 D:\\projects\\demo 或 /home/user/demo。')
+      setWsError('请输入本机绝对路径（可从资源管理器地址栏直接复制），例如 D:\projects\demo。')
       return
     }
-    if (snapshot.defaultWorkspace === candidate || draft.workspaces.includes(candidate)) {
+    if (sameWorkspacePath(candidate, snapshot.defaultWorkspace)
+      || draft.workspaces.some(path => sameWorkspacePath(path, candidate))) {
       setWsError('该路径已在候选列表中。')
       return
     }
@@ -450,6 +468,10 @@ function LoadedSettings({ controller }: SettingsInjected) {
     setWsDraft('')
     setWsError(undefined)
   }
+
+  const addableHostWorkspaces = (snapshot.hostWorkspaces ?? []).filter(workspace =>
+    !sameWorkspacePath(workspace.path, snapshot.defaultWorkspace)
+    && !draft.workspaces.some(path => sameWorkspacePath(path, workspace.path)))
 
   return (
     <div className="wc-settings">
@@ -583,12 +605,31 @@ function LoadedSettings({ controller }: SettingsInjected) {
             </li>
           ))}
         </ul>
+        {addableHostWorkspaces.length > 0
+          ? (
+            <div className="wc-workspace-pick">
+              <span className="wc-workspace-tag">从网页工作区一键添加：</span>
+              {addableHostWorkspaces.map(workspace => (
+                <button
+                  key={workspace.path}
+                  type="button"
+                  className="wc-button"
+                  disabled={busy}
+                  title={workspace.path}
+                  onClick={() => update('workspaces', [...draft.workspaces, workspace.path])}
+                >
+                  + {workspace.title}
+                </button>
+              ))}
+            </div>
+          )
+          : null}
         {wsError === undefined ? null : <div className="wc-alert error">{wsError}</div>}
         <div className="wc-save-row">
           <input
             className="wc-input"
             type="text"
-            placeholder="新增候选工作区绝对路径，如 D:\\projects\\demo"
+            placeholder="新增候选工作区绝对路径，如 D:\projects\demo"
             value={wsDraft}
             disabled={busy}
             onChange={(event) => { setWsDraft(event.target.value) }}
@@ -669,6 +710,7 @@ const CSS = `
 .wc-workspace-list li{display:flex;align-items:center;justify-content:space-between;gap:10px}
 .wc-workspace-list code{background:var(--dsw-alias-bg-layer-2,#f7f5f1);padding:4px 8px;border-radius:7px;font-size:var(--wc-fs-xs);word-break:break-all}
 .wc-workspace-tag{flex:none;font-size:var(--wc-fs-xs);color:var(--dsw-alias-fg-muted,#77736d)}
+.wc-workspace-pick{display:flex;flex-wrap:wrap;align-items:center;gap:8px}
 .wc-panel-note{margin:0;font-size:var(--wc-fs-xs);line-height:1.45;color:var(--dsw-alias-fg-muted,#77736d)}
 @media(max-width:720px){.wc-settings-header{display:grid}.wc-release{width:auto;min-width:0}.wc-form-grid{grid-template-columns:1fr}.wc-panel-title{flex-direction:column}.wc-release span{white-space:normal;flex-wrap:wrap}}
 .wc-details{display:grid;gap:10px;padding:13px 15px;border:1px solid var(--dsw-alias-border-subtle,#dedbd5);border-radius:14px;background:var(--dsw-alias-bg-layer-1,#fff);content-visibility:auto;contain-intrinsic-size:auto 120px}

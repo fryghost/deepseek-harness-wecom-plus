@@ -499,6 +499,25 @@ describe('WeComHarnessBridge', () => {
     await bridge.stop()
   })
 
+  it('accepts the proposed workspace number as a switch confirmation', async () => {
+    const client = new FakeClient()
+    const created: Array<{ sessionId: string; cwd: string | undefined }> = []
+    const ctx = agentContext(undefined, options => created.push({
+      sessionId: String(options.sessionId),
+      cwd: options.meta?.cwd,
+    }))
+    const config = testConfig({ workspaces: ['/tmp/ws-a'] })
+    const bridge = new WeComHarnessBridge(ctx, config, () => client as never)
+    await bridge.start()
+    await client.message(textMessage('/ws 2', 'm-ws-num'))
+    // Replying with the proposed workspace's own number confirms the switch
+    // instead of cancelling it — the historical “回复 2 被当成取消” trap.
+    await client.message(textMessage('2', 'm-num'))
+    expect(client.replies.at(-1)?.content).toContain('已切换工作区到 `/tmp/ws-a`')
+    expect(created.at(-1)).toEqual({ sessionId: expect.stringMatching(/-n1$/u), cwd: '/tmp/ws-a' })
+    await bridge.stop()
+  })
+
   it('adds a workspace after confirmation and persists it through the settings service', async () => {
     const workspace = await mkdtemp(join(tmpdir(), 'dsh-wecom-ws-add-'))
     const client = new FakeClient()

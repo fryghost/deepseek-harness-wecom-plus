@@ -649,7 +649,15 @@ export class WeComHarnessBridge {
     }
     const addMatch = /^add\s+(.+)$/is.exec(rest)
     if (addMatch !== null) {
-      await this.requestWorkspaceAdd(frame, message, baseId, (addMatch[1] ?? '').trim().replace(/^["']|["']$/gu, ''))
+      // Explorer "copy as path" wraps values in quotes; strip straight and
+      // typographic ones plus trailing separators before anything else.
+      const raw = (addMatch[1] ?? '')
+        .trim()
+        .replace(/^["'“”‘’]+/u, '')
+        .replace(/["'“”‘’]+$/u, '')
+        .trim()
+        .replace(/[\\/]+$/u, '')
+      await this.requestWorkspaceAdd(frame, message, baseId, raw)
       return
     }
     if (/^\d+$/u.test(rest)) {
@@ -810,7 +818,13 @@ export class WeComHarnessBridge {
     pending: WorkspacePending,
   ): Promise<void> {
     this.workspaceConfirms.delete(this.baseIdOf(message))
-    if (!WORKSPACE_CONFIRM_TEXTS.has(extractTextContent(message).trim().toLowerCase())) {
+    const text = extractTextContent(message).trim().toLowerCase()
+    // For a switch, the proposed workspace's own number is also a natural
+    // confirmation — accepted only while it still points at that target.
+    const numberedConfirm = pending.kind === 'workspace-switch'
+      && /^[1-9][0-9]*$/u.test(text)
+      && workspaceSamePath(this.workspaceList()[Number(text) - 1] ?? '', pending.payload)
+    if (!WORKSPACE_CONFIRM_TEXTS.has(text) && !numberedConfirm) {
       await this.sendReply(frame, { text: '已取消工作区操作，当前设置保持不变。', images: [], cards: [] })
       return
     }

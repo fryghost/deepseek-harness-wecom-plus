@@ -71,6 +71,8 @@ export interface WeComSettingsSnapshot {
   cli?: CliProbeResult
   /** Default workspace (config cwd); display-only, not user-editable here. */
   defaultWorkspace: string
+  /** Workspaces registered in the host's Web sidebar registry; one-click add sources. */
+  hostWorkspaces?: Array<{ path: string; title: string }>
   release: { pluginVersion: string }
 }
 
@@ -113,21 +115,35 @@ type JsonResponse<T> = JsonSuccess<T> | JsonError
 const USER_SETTINGS_KEYS = ['botId', 'cardMode', 'singlePolicy', 'groupPolicy', 'welcomeText'] as const
 const USER_SETTINGS_ARRAY_KEYS = ['workspaces'] as const
 
-/** Trim, drop empties, dedupe (case-insensitively on Windows). */
+/** Trim, strip wrapping quotes and trailing separators, drop empties, dedupe (case-insensitively on Windows). */
 export function normalizeWorkspaceList(value: unknown): string[] {
   if (!Array.isArray(value)) return []
   const seen = new Set<string>()
   const result: string[] = []
   for (const entry of value) {
     if (typeof entry !== 'string') continue
-    const candidate = entry.trim()
+    const candidate = unwrapWorkspaceInput(entry)
     if (candidate.length === 0) continue
-    const key = process.platform === 'win32' ? candidate.toLowerCase() : candidate
+    const key = workspaceDedupeKey(candidate)
     if (seen.has(key)) continue
     seen.add(key)
     result.push(candidate)
   }
   return result
+}
+
+/** Strip wrapping quotes (straight and typographic) and trailing separators. */
+export function unwrapWorkspaceInput(raw: string): string {
+  return raw
+    .trim()
+    .replace(/^["'“”‘’]+/u, '')
+    .replace(/["'“”‘’]+$/u, '')
+    .trim()
+    .replace(/[\\/]+$/u, '')
+}
+
+function workspaceDedupeKey(candidate: string): string {
+  return process.platform === 'win32' ? candidate.toLowerCase() : candidate
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -293,8 +309,17 @@ export class WeComWebBackend {
       channel: this.status(),
       ...(this.cli === undefined ? {} : { cli: await this.cliSnapshot() }),
       defaultWorkspace: config.cwd,
+      ...this.hostWorkspaces(),
       release: { pluginVersion: PLUGIN_VERSION },
     }
+  }
+
+  /** Host sidebar workspaces (dsh-workspace registry), when the service is present. */
+  private hostWorkspaces(): { hostWorkspaces?: Array<{ path: string; title: string }> } {
+    const registry = this.ctx.get('workspaceRegistry') as { list?(): Array<{ path: string; title: string }> } | undefined
+    const list = registry?.list?.()
+    if (!Array.isArray(list)) return {}
+    return { hostWorkspaces: list.map(workspace => ({ path: workspace.path, title: workspace.title })) }
   }
 
   /** Probe with a tiny cache: GET snapshots may arrive in bursts. */

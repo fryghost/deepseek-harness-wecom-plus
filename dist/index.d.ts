@@ -374,6 +374,11 @@ interface WeComSettingsSnapshot {
     cli?: CliProbeResult;
     /** Default workspace (config cwd); display-only, not user-editable here. */
     defaultWorkspace: string;
+    /** Workspaces registered in the host's Web sidebar registry; one-click add sources. */
+    hostWorkspaces?: Array<{
+        path: string;
+        title: string;
+    }>;
     release: {
         pluginVersion: string;
     };
@@ -408,6 +413,8 @@ declare class WeComWebBackend {
     private credential;
     /** Build the current settings/credential/channel snapshot without secrets. */
     snapshot(): Promise<WeComSettingsSnapshot>;
+    /** Host sidebar workspaces (dsh-workspace registry), when the service is present. */
+    private hostWorkspaces;
     /** Probe with a tiny cache: GET snapshots may arrive in bursts. */
     private cliSnapshot;
     private handleCli;

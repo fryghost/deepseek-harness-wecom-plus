@@ -191,10 +191,15 @@ describe('ConversationManager', () => {
       await options.setup?.(mockAgentCtx(section, register))
       return { agent, dispose }
     })
-    const inspect = vi.fn(async () => ({
-      meta: { version: 0, id, createdAt: 1, cwd: config.cwd, agentPreset: 'minimal' },
-      events: [],
-    }))
+    const inspect = vi.fn(async (probed: unknown) => {
+      if (String(probed) !== id) {
+        throw Object.assign(new Error('missing'), { name: 'SessionPersistenceNotFoundError' })
+      }
+      return {
+        meta: { version: 0, id, createdAt: 1, cwd: config.cwd, agentPreset: 'minimal' },
+        events: [],
+      }
+    })
     const ctx = {
       on: vi.fn(() => vi.fn()),
       sessionPersistence: { list: vi.fn(async () => [{ id }]), inspect },
@@ -217,6 +222,73 @@ describe('ConversationManager', () => {
     expect(section).toHaveBeenCalledWith(expect.objectContaining({ name: 'channel:wecom', order: 190 }))
     await manager.dispose()
     expect(dispose).toHaveBeenCalledOnce()
+  })
+
+  it('resumes a foreign-format generation hidden by list() and switches past it', async () => {
+    const config = testConfig()
+    const message = textMessage('u-legacy', 'm-legacy')
+    const baseId = sessionIdFor(config.accountId, message)
+    const hiddenId = `${baseId}-n11`
+    const events: unknown[] = []
+    const agent = {
+      status: 'idle',
+      options: { provider: 'deepseek', model: 'deepseek-chat' },
+      session: { events },
+      followup: vi.fn(() => {
+        events.push({
+          type: 'assistant/message',
+          data: { message: { content: [{ type: 'text', text: 'Migrated reply' }] } },
+        })
+        events.push({ type: 'turn/end', data: { reason: { kind: 'stop' } } })
+      }),
+      whenIdle: vi.fn(async () => undefined),
+    }
+    const dispose = vi.fn(async () => undefined)
+    const section = vi.fn(() => vi.fn())
+    const register = vi.fn(() => vi.fn())
+    const resumed: string[] = []
+    const created: string[] = []
+    const build = async (options: { setup?: (ctx: never) => Promise<void> }, seen: string[], id: string) => {
+      seen.push(id)
+      await options.setup?.(mockAgentCtx(section, register))
+      return { agent, dispose }
+    }
+    const resume = vi.fn(async (options: { resumeSessionId: unknown; setup?: (ctx: never) => Promise<void> }) =>
+      build(options, resumed, String(options.resumeSessionId)))
+    const create = vi.fn(async (options: { sessionId: unknown; setup?: (ctx: never) => Promise<void> }) =>
+      build(options, created, String(options.sessionId)))
+    // Simulate a post-upgrade host: list() hides the legacy -n11 log while
+    // inspect() refuses it with the host's format-refusal error name.
+    const inspect = vi.fn(async (id: unknown) => {
+      if (String(id) === hiddenId) {
+        throw Object.assign(new Error('foreign log format'), { name: 'SessionFormatUnsupportedError' })
+      }
+      throw Object.assign(new Error('missing'), { name: 'SessionPersistenceNotFoundError' })
+    })
+    const ctx = {
+      on: vi.fn(() => vi.fn()),
+      sessionPersistence: { list: vi.fn(async () => [{ id: `${baseId}-n10` }]), inspect },
+      agentDefaultModel: { currentSelection: vi.fn(() => ({ provider: 'deepseek', model: 'deepseek-chat' })) },
+      agentPresets: { defaultId: 'standard', mount: vi.fn(async () => ({ id: 'standard' })) },
+      llm: { resolveModelInfo: vi.fn(async () => ({ inputModalities: ['text'] })) },
+      agents: { resume, create, get: vi.fn() },
+      attachments: {
+        imageLimits: { maxImagesPerMessage: 4, maxMessageImageBytes: 10_000, maxImageBytes: 10_000 },
+      },
+    } as never
+    const manager = new ConversationManager(ctx, config, vi.fn(async () => undefined), vi.fn(async () => undefined), vi.fn(async () => undefined))
+    await manager.initialize()
+
+    // The newest conversation must still be resumed, not silently replaced
+    // by the older -n10 fallback.
+    await expect(manager.process(message, downloadPort, noopTransport()))
+      .resolves.toEqual({ text: 'Migrated reply', images: [], cards: [] })
+    expect(resumed).toEqual([hiddenId])
+
+    // A /ws-style switch skips the occupied generation entirely.
+    await manager.reset(message, '/tmp/ws-legacy-next')
+    expect(created).toEqual([`${baseId}-n12`])
+    await manager.dispose()
   })
 
   it('borrows a live Web agent and excludes its earlier output from the WeCom reply', async () => {

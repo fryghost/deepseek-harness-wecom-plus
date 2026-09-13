@@ -128,7 +128,7 @@ export async function apply(ctx: Context, config: WeComConfig): Promise<void> {
   }
 
   // Optional Web Settings route; mounts only while an httpServer is present.
-  installWeComSettingsWeb(ctx, new WeComWebBackend(ctx, () => bridge?.status() ?? { state: 'inactive' }, cli))
+  installWeComSettingsWeb(ctx, new WeComWebBackend(ctx, () => bridge?.status() ?? { state: 'inactive' }, cli, () => bridge?.scan()))
 
   // The resolved composition entry doubles as the settings base layer; stored
   // sections override it, and every committed change restarts the channel.

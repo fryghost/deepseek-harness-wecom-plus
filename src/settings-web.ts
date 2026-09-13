@@ -98,7 +98,12 @@ interface CliActionRequest {
   action: CliActionName
 }
 
-type SettingsRequest = SaveRequest | SetKeyRequest | ClearKeyRequest | CliActionRequest
+/** Read-only self-diagnostics: what the conversation scan actually sees. */
+const SCAN_ACTIONS = ['session-scan'] as const
+
+type ScanActionRequest = { action: typeof SCAN_ACTIONS[number] }
+
+type SettingsRequest = SaveRequest | SetKeyRequest | ClearKeyRequest | CliActionRequest | ScanActionRequest
 
 interface JsonError {
   ok: false
@@ -259,6 +264,9 @@ export function parseRequest(value: unknown): SettingsRequest {
   if (typeof value.action === 'string' && (CLI_ACTIONS as readonly string[]).includes(value.action)) {
     return { action: value.action } as CliActionRequest
   }
+  if (typeof value.action === 'string' && (SCAN_ACTIONS as readonly string[]).includes(value.action)) {
+    return { action: value.action } as ScanActionRequest
+  }
   if (value.action === 'clear-key') return { action: 'clear-key' }
   throw new TypeError(`unsupported action: ${String(value.action)}`)
 }
@@ -276,6 +284,7 @@ export class WeComWebBackend {
     private readonly ctx: Context,
     private readonly status: () => WeComChannelStatus,
     private readonly cli?: WeComCliService,
+    private readonly scan?: () => unknown,
   ) {}
 
   private async credential(config: Config): Promise<{ configured: boolean; source?: string; writable: boolean }> {
@@ -412,6 +421,8 @@ export class WeComWebBackend {
           return
         }
         responseJson(res, 200, { ok: true, value: await this.handleCli(parsed.action as CliActionName) })
+      } else if (parsed.action === 'session-scan') {
+        responseJson(res, 200, { ok: true, value: this.scan?.() ?? { available: false } })
       } else if (parsed.action === 'set-key') {
         responseJson(res, 200, { ok: true, value: await this.setKey(parsed.value) })
       } else if (parsed.action === 'clear-key') {

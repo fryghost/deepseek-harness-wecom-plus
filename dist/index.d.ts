@@ -221,6 +221,8 @@ declare class WeComHarnessBridge {
         state: 'inactive' | 'connecting' | 'connected';
         detail?: string;
     };
+    /** Read-only conversation-scan diagnostics for the Settings self-check. */
+    scan(): unknown;
     /** Stay dormant without credentials, or authenticate and wait for WeCom readiness. */
     start(): Promise<void>;
     /** Stop ingress and drain owned conversations. */
@@ -400,7 +402,12 @@ type CliActionName = typeof CLI_ACTIONS[number];
 interface CliActionRequest {
     action: CliActionName;
 }
-type SettingsRequest = SaveRequest | SetKeyRequest | ClearKeyRequest | CliActionRequest;
+/** Read-only self-diagnostics: what the conversation scan actually sees. */
+declare const SCAN_ACTIONS: readonly ["session-scan"];
+type ScanActionRequest = {
+    action: typeof SCAN_ACTIONS[number];
+};
+type SettingsRequest = SaveRequest | SetKeyRequest | ClearKeyRequest | CliActionRequest | ScanActionRequest;
 /** Validate and parse one POST body; throws TypeError on a malformed request. */
 declare function parseRequest(value: unknown): SettingsRequest;
 /** Same-origin Settings handler for the WeCom channel. */
@@ -408,8 +415,9 @@ declare class WeComWebBackend {
     private readonly ctx;
     private readonly status;
     private readonly cli?;
+    private readonly scan?;
     private cliProbeCache;
-    constructor(ctx: Context, status: () => WeComChannelStatus, cli?: WeComCliService | undefined);
+    constructor(ctx: Context, status: () => WeComChannelStatus, cli?: WeComCliService | undefined, scan?: (() => unknown) | undefined);
     private credential;
     /** Build the current settings/credential/channel snapshot without secrets. */
     snapshot(): Promise<WeComSettingsSnapshot>;

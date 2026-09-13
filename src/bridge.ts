@@ -191,6 +191,11 @@ export class WeComHarnessBridge {
     return { state: 'connecting', ...(this.lastError === undefined ? {} : { detail: this.lastError }) }
   }
 
+  /** Read-only conversation-scan diagnostics for the Settings self-check. */
+  scan(): unknown {
+    return this.conversations.scanSummary()
+  }
+
   /** Stay dormant without credentials, or authenticate and wait for WeCom readiness. */
   async start(): Promise<void> {
     if (!this.config.botId.trim()) {
@@ -605,12 +610,12 @@ export class WeComHarnessBridge {
         await this.conversations.process(message, this.requireClient(), transport)
       } catch (error) {
         this.log.error('WeCom message %s failed: %s', message.msgid, wireErrorDetail(error))
-        await transport.fail('处理消息时发生错误，请稍后重试。')
+        await transport.fail(`处理消息时发生错误：${error instanceof Error ? error.message : String(error)}`)
       }
     } catch (error) {
       this.log.error('WeCom message %s failed: %s', message.msgid, wireErrorDetail(error))
       try {
-        await this.sendReply(frame, { text: '处理消息时发生错误，请稍后重试。', images: [], cards: [] })
+        await this.sendReply(frame, { text: `处理消息时发生错误：${error instanceof Error ? error.message : String(error)}`, images: [], cards: [] })
       } catch (sendError) {
         this.log.error('WeCom error reply failed: %s', String(sendError))
       }

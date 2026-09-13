@@ -204,6 +204,29 @@ export class ConversationManager {
     const headers = await this.ctx.sessionPersistence.list()
     this.persistedIds = new Set(headers.map(header => String(header.id)))
     await this.discoverHiddenGenerations()
+    const summary = this.scanSummary()
+    console.error(
+      '[wecom-plus] session scan: listed=%d wecomListed=%s hidden=%s generations=%s',
+      summary.listedCount,
+      JSON.stringify(summary.wecomListed),
+      JSON.stringify(summary.hidden),
+      JSON.stringify(summary.generations),
+    )
+  }
+
+  /** What the generation scan currently sees; surfaced by the session-scan action. */
+  scanSummary(): {
+    listedCount: number
+    wecomListed: string[]
+    hidden: string[]
+    generations: Record<string, number>
+  } {
+    return {
+      listedCount: this.persistedIds.size,
+      wecomListed: [...this.persistedIds].filter(id => id.startsWith('wecom-v2-')),
+      hidden: [...this.hiddenIds],
+      generations: Object.fromEntries(this.generations),
+    }
   }
 
   /**

@@ -1333,6 +1333,23 @@ var ConversationManager = class {
     const headers = await this.ctx.sessionPersistence.list();
     this.persistedIds = new Set(headers.map((header) => String(header.id)));
     await this.discoverHiddenGenerations();
+    const summary = this.scanSummary();
+    console.error(
+      "[wecom-plus] session scan: listed=%d wecomListed=%s hidden=%s generations=%s",
+      summary.listedCount,
+      JSON.stringify(summary.wecomListed),
+      JSON.stringify(summary.hidden),
+      JSON.stringify(summary.generations)
+    );
+  }
+  /** What the generation scan currently sees; surfaced by the session-scan action. */
+  scanSummary() {
+    return {
+      listedCount: this.persistedIds.size,
+      wecomListed: [...this.persistedIds].filter((id) => id.startsWith("wecom-v2-")),
+      hidden: [...this.hiddenIds],
+      generations: Object.fromEntries(this.generations)
+    };
   }
   /**
    * list() hides foreign-format sessions, so after a host session-log
@@ -2263,7 +2280,7 @@ import {
 } from "@deepseek-ai/dsh-settings";
 
 // src/version.ts
-var PLUGIN_VERSION = "0.10.3";
+var PLUGIN_VERSION = "0.10.4";
 
 // src/settings-web.ts
 var SETTINGS_ROUTE = "/_dsh/deepseek-harness-wecom-plus/settings";
@@ -2273,6 +2290,7 @@ if (!NAMESPACE_PATTERN.test(SETTINGS_NS)) {
   throw new TypeError(`settings namespace "${SETTINGS_NS}" must match ${String(NAMESPACE_PATTERN)}`);
 }
 var CLI_ACTIONS = ["cli-probe", "cli-install", "cli-authorize", "cli-auth-status", "cli-cancel-auth"];
+var SCAN_ACTIONS = ["session-scan"];
 var USER_SETTINGS_KEYS = ["botId", "cardMode", "singlePolicy", "groupPolicy", "welcomeText"];
 var USER_SETTINGS_ARRAY_KEYS = ["workspaces"];
 function normalizeWorkspaceList(value) {
@@ -2400,6 +2418,9 @@ function parseRequest(value) {
   if (typeof value.action === "string" && CLI_ACTIONS.includes(value.action)) {
     return { action: value.action };
   }
+  if (typeof value.action === "string" && SCAN_ACTIONS.includes(value.action)) {
+    return { action: value.action };
+  }
   if (value.action === "clear-key") return { action: "clear-key" };
   throw new TypeError(`unsupported action: ${String(value.action)}`);
 }
@@ -2408,14 +2429,16 @@ function publicMessage(error) {
   return String(error);
 }
 var WeComWebBackend = class {
-  constructor(ctx, status, cli) {
+  constructor(ctx, status, cli, scan) {
     this.ctx = ctx;
     this.status = status;
     this.cli = cli;
+    this.scan = scan;
   }
   ctx;
   status;
   cli;
+  scan;
   cliProbeCache;
   async credential(config) {
     const info = await this.ctx.credentials.describe(credentialRef(config.secretRef));
@@ -2544,6 +2567,8 @@ var WeComWebBackend = class {
           return;
         }
         responseJson(res, 200, { ok: true, value: await this.handleCli(parsed.action) });
+      } else if (parsed.action === "session-scan") {
+        responseJson(res, 200, { ok: true, value: this.scan?.() ?? { available: false } });
       } else if (parsed.action === "set-key") {
         responseJson(res, 200, { ok: true, value: await this.setKey(parsed.value) });
       } else if (parsed.action === "clear-key") {
@@ -2643,6 +2668,10 @@ var WeComHarnessBridge = class {
     }
     if (client.isConnected) return { state: "connected" };
     return { state: "connecting", ...this.lastError === void 0 ? {} : { detail: this.lastError } };
+  }
+  /** Read-only conversation-scan diagnostics for the Settings self-check. */
+  scan() {
+    return this.conversations.scanSummary();
   }
   /** Stay dormant without credentials, or authenticate and wait for WeCom readiness. */
   async start() {
@@ -3005,12 +3034,12 @@ var WeComHarnessBridge = class {
         await this.conversations.process(message, this.requireClient(), transport);
       } catch (error) {
         this.log.error("WeCom message %s failed: %s", message.msgid, wireErrorDetail(error));
-        await transport.fail("\u5904\u7406\u6D88\u606F\u65F6\u53D1\u751F\u9519\u8BEF\uFF0C\u8BF7\u7A0D\u540E\u91CD\u8BD5\u3002");
+        await transport.fail(`\u5904\u7406\u6D88\u606F\u65F6\u53D1\u751F\u9519\u8BEF\uFF1A${error instanceof Error ? error.message : String(error)}`);
       }
     } catch (error) {
       this.log.error("WeCom message %s failed: %s", message.msgid, wireErrorDetail(error));
       try {
-        await this.sendReply(frame, { text: "\u5904\u7406\u6D88\u606F\u65F6\u53D1\u751F\u9519\u8BEF\uFF0C\u8BF7\u7A0D\u540E\u91CD\u8BD5\u3002", images: [], cards: [] });
+        await this.sendReply(frame, { text: `\u5904\u7406\u6D88\u606F\u65F6\u53D1\u751F\u9519\u8BEF\uFF1A${error instanceof Error ? error.message : String(error)}`, images: [], cards: [] });
       } catch (sendError) {
         this.log.error("WeCom error reply failed: %s", String(sendError));
       }
@@ -3864,7 +3893,7 @@ async function apply(ctx, config) {
     restarting = (restarting ?? Promise.resolve()).then(restartBridge, restartBridge);
     restarting.catch(() => void 0);
   };
-  installWeComSettingsWeb(ctx, new WeComWebBackend(ctx, () => bridge?.status() ?? { state: "inactive" }, cli));
+  installWeComSettingsWeb(ctx, new WeComWebBackend(ctx, () => bridge?.status() ?? { state: "inactive" }, cli, () => bridge?.scan()));
   installSettingsSection(ctx, SETTINGS_NS, Config, Config(config), {
     setSource: (source) => {
       current = source;

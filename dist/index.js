@@ -1636,6 +1636,12 @@ var ConversationManager = class {
   async currentSessionId(baseId) {
     return this.sessionIdForGeneration(baseId, await this.ensureGeneration(baseId));
   }
+  /** Human-readable dump of why a completed turn produced nothing. */
+  emptyTurnNote(stream, agent) {
+    const note = `\uFF08\u8BCA\u65AD\uFF1A\u6D41\u4E8B\u4EF6[${stream.eventTypes.join(",") || "\u65E0"}] \u6D41\u6587\u672C${stream.text.length}\u5B57 \u4F1A\u8BDD\u4E8B\u4EF6${String(agent.session?.events?.length)} session\u5B57\u6BB5[${Object.keys(agent.session ?? {}).join(",") || "\u65E0"}]\uFF09`;
+    console.error("[wecom-plus] empty turn: %s", note);
+    return note;
+  }
   async processNow(id, message, client, transport) {
     const binding = await this.getOrCreate(id);
     const agent = binding.agent;
@@ -1670,6 +1676,9 @@ var ConversationManager = class {
         text: collected.text.trim() || stream.text.trim(),
         images: collected.images
       });
+      if (reply.text === "" || reply.text === "\u5904\u7406\u5B8C\u6210\uFF0C\u4F46\u6CA1\u6709\u751F\u6210\u53EF\u53D1\u9001\u7684\u5185\u5BB9\u3002") {
+        reply.text += this.emptyTurnNote(stream, agent);
+      }
       await transport.finish(reply);
       return reply;
     } finally {
@@ -1752,6 +1761,9 @@ var ConversationManager = class {
         text: collected.text.trim() || stream.text.trim(),
         images: collected.images
       });
+      if (reply.text === "" || reply.text === "\u5904\u7406\u5B8C\u6210\uFF0C\u4F46\u6CA1\u6709\u751F\u6210\u53EF\u53D1\u9001\u7684\u5185\u5BB9\u3002") {
+        reply.text += this.emptyTurnNote(stream, agent);
+      }
       await transport.finish(reply);
       return reply;
     } finally {
@@ -2337,7 +2349,7 @@ import {
 } from "@deepseek-ai/dsh-settings";
 
 // src/version.ts
-var PLUGIN_VERSION = "0.10.7";
+var PLUGIN_VERSION = "0.10.8";
 
 // src/settings-web.ts
 var SETTINGS_ROUTE = "/_dsh/deepseek-harness-wecom-plus/settings";

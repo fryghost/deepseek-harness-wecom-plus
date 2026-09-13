@@ -570,6 +570,13 @@ export class ConversationManager {
     return this.sessionIdForGeneration(baseId, await this.ensureGeneration(baseId))
   }
 
+  /** Human-readable dump of why a completed turn produced nothing. */
+  private emptyTurnNote(stream: ActiveStream, agent: Agent): string {
+    const note = `（诊断：流事件[${stream.eventTypes.join(',') || '无'}] 流文本${stream.text.length}字 会话事件${String(agent.session?.events?.length)} session字段[${Object.keys(agent.session ?? {}).join(',') || '无'}]）`
+    console.error('[wecom-plus] empty turn: %s', note)
+    return note
+  }
+
   private async processNow(
     id: string,
     message: BaseMessage,
@@ -613,6 +620,9 @@ export class ConversationManager {
         text: collected.text.trim() || stream.text.trim(),
         images: collected.images,
       })
+      if (reply.text === '' || reply.text === '处理完成，但没有生成可发送的内容。') {
+        reply.text += this.emptyTurnNote(stream, agent)
+      }
       await transport.finish(reply)
       return reply
     } finally {
@@ -707,6 +717,9 @@ export class ConversationManager {
         text: collected.text.trim() || stream.text.trim(),
         images: collected.images,
       })
+      if (reply.text === '' || reply.text === '处理完成，但没有生成可发送的内容。') {
+        reply.text += this.emptyTurnNote(stream, agent)
+      }
       await transport.finish(reply)
       return reply
     } finally {

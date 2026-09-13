@@ -867,8 +867,11 @@ export class WeComHarnessBridge {
       try {
         await this.conversations.reset(message, pending.payload)
       } catch (error) {
+        const detail = error instanceof Error ? error.message : String(error)
         this.log.error('WeCom workspace switch failed: %s', String(error))
-        await this.replyTo(message, frame, '切换工作区失败，请稍后重试。')
+        // Surface the concrete cause: a switch failure has been host-upgrade
+        // sensitive (session formats), so the reply must be diagnosable.
+        await this.replyTo(message, frame, `切换工作区失败：${detail}`)
         return
       }
       await this.replyTo(message, frame, `已切换工作区到 \`${pending.payload}\`，并开启新对话；旧历史保留在网页端。`)

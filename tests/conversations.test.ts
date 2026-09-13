@@ -291,6 +291,116 @@ describe('ConversationManager', () => {
     await manager.dispose()
   })
 
+  it('treats any non-notfound inspect refusal as an occupied generation', async () => {
+    const config = testConfig()
+    const message = textMessage('u-legacy2', 'm-legacy2')
+    const baseId = sessionIdFor(config.accountId, message)
+    const hiddenId = `${baseId}-n11`
+    const events: unknown[] = []
+    const agent = {
+      status: 'idle',
+      options: { provider: 'deepseek', model: 'deepseek-chat' },
+      session: { events },
+      followup: vi.fn(() => {
+        events.push({
+          type: 'assistant/message',
+          data: { message: { content: [{ type: 'text', text: 'Migrated reply' }] } },
+        })
+        events.push({ type: 'turn/end', data: { reason: { kind: 'stop' } } })
+      }),
+      whenIdle: vi.fn(async () => undefined),
+    }
+    const section = vi.fn(() => vi.fn())
+    const register = vi.fn(() => vi.fn())
+    const resumed: string[] = []
+    const resume = vi.fn(async (options: { resumeSessionId: unknown; setup?: (ctx: never) => Promise<void> }) => {
+      resumed.push(String(options.resumeSessionId))
+      await options.setup?.(mockAgentCtx(section, register))
+      return { agent, dispose: vi.fn(async () => undefined) }
+    })
+    // The host refuses foreign formats under several error identities; a
+    // refusal without the format error name must still mark occupancy.
+    const inspect = vi.fn(async (id: unknown) => {
+      if (String(id) === hiddenId) throw new Error('migration guard refused the log')
+      throw Object.assign(new Error('missing'), { name: 'SessionPersistenceNotFoundError' })
+    })
+    const ctx = {
+      on: vi.fn(() => vi.fn()),
+      sessionPersistence: { list: vi.fn(async () => [{ id: `${baseId}-n10` }]), inspect },
+      agentDefaultModel: { currentSelection: vi.fn(() => ({ provider: 'deepseek', model: 'deepseek-chat' })) },
+      agentPresets: { defaultId: 'standard', mount: vi.fn(async () => ({ id: 'standard' })) },
+      llm: { resolveModelInfo: vi.fn(async () => ({ inputModalities: ['text'] })) },
+      agents: { resume, get: vi.fn() },
+      attachments: {
+        imageLimits: { maxImagesPerMessage: 4, maxMessageImageBytes: 10_000, maxImageBytes: 10_000 },
+      },
+    } as never
+    const manager = new ConversationManager(ctx, config, vi.fn(async () => undefined), vi.fn(async () => undefined), vi.fn(async () => undefined))
+    await manager.initialize()
+
+    await expect(manager.process(message, downloadPort, noopTransport()))
+      .resolves.toEqual({ text: 'Migrated reply', images: [], cards: [] })
+    expect(resumed).toEqual([hiddenId])
+    await manager.dispose()
+  })
+
+  it('falls back to a migrating resume when create hits an occupied id', async () => {
+    const config = testConfig()
+    const message = textMessage('u-collide', 'm-collide')
+    const baseId = sessionIdFor(config.accountId, message)
+    const occupiedId = `${baseId}-n11`
+    const events: unknown[] = []
+    const agent = {
+      status: 'idle',
+      options: { provider: 'deepseek', model: 'deepseek-chat' },
+      session: { events },
+      followup: vi.fn(() => {
+        events.push({
+          type: 'assistant/message',
+          data: { message: { content: [{ type: 'text', text: 'Migrated reply' }] } },
+        })
+        events.push({ type: 'turn/end', data: { reason: { kind: 'stop' } } })
+      }),
+      whenIdle: vi.fn(async () => undefined),
+    }
+    const section = vi.fn(() => vi.fn())
+    const register = vi.fn(() => vi.fn())
+    const resumed: string[] = []
+    const created: string[] = []
+    const resume = vi.fn(async (options: { resumeSessionId: unknown; setup?: (ctx: never) => Promise<void> }) => {
+      resumed.push(String(options.resumeSessionId))
+      await options.setup?.(mockAgentCtx(section, register))
+      return { agent, dispose: vi.fn(async () => undefined) }
+    })
+    const create = vi.fn(async (options: { sessionId: unknown }) => {
+      created.push(String(options.sessionId))
+      throw Object.assign(new Error('session already exists'), { name: 'SessionAlreadyExistsError' })
+    })
+    // Discovery sees nothing (NotFound everywhere), so the collision only
+    // surfaces at create time and must degrade to a migrating resume.
+    const inspect = vi.fn(async () => {
+      throw Object.assign(new Error('missing'), { name: 'SessionPersistenceNotFoundError' })
+    })
+    const ctx = {
+      on: vi.fn(() => vi.fn()),
+      sessionPersistence: { list: vi.fn(async () => [{ id: `${baseId}-n10` }]), inspect },
+      agentDefaultModel: { currentSelection: vi.fn(() => ({ provider: 'deepseek', model: 'deepseek-chat' })) },
+      agentPresets: { defaultId: 'standard', mount: vi.fn(async () => ({ id: 'standard' })) },
+      llm: { resolveModelInfo: vi.fn(async () => ({ inputModalities: ['text'] })) },
+      agents: { resume, create, get: vi.fn() },
+      attachments: {
+        imageLimits: { maxImagesPerMessage: 4, maxMessageImageBytes: 10_000, maxImageBytes: 10_000 },
+      },
+    } as never
+    const manager = new ConversationManager(ctx, config, vi.fn(async () => undefined), vi.fn(async () => undefined), vi.fn(async () => undefined))
+    await manager.initialize()
+
+    await manager.reset(message, '/tmp/ws-collide')
+    expect(created).toEqual([occupiedId])
+    expect(resumed).toEqual([occupiedId])
+    await manager.dispose()
+  })
+
   it('borrows a live Web agent and excludes its earlier output from the WeCom reply', async () => {
     const config = testConfig()
     const message = textMessage('u-live', 'm-live', 'WeCom follow-up')

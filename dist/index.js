@@ -1364,7 +1364,6 @@ var ConversationManager = class {
         } catch (error) {
           const name2 = error instanceof Error ? error.name : "";
           if (name2 === "SessionPersistenceNotFoundError") break;
-          if (name2 !== "SessionFormatUnsupportedError") break;
           this.hiddenIds.add(id);
         }
       }
@@ -1777,26 +1776,7 @@ var ConversationManager = class {
       }
     }
     if (this.hiddenIds.has(id)) {
-      try {
-        const handle2 = await this.ctx.agents.resume({
-          resumeSessionId: sessionId,
-          agentOptions,
-          setup: (agentCtx) => this.setupAgent(agentCtx, this.resolveAgentPreset(), id)
-        });
-        this.hiddenIds.delete(id);
-        this.persistedIds.add(id);
-        try {
-          const migrated = await this.ctx.sessionPersistence.inspect(sessionId);
-          const migratedCwd = migrated.meta.cwd;
-          if (typeof migratedCwd === "string" && migratedCwd.length > 0) this.sessionCwds.set(id, migratedCwd);
-        } catch {
-        }
-        return this.ownAgent(handle2);
-      } catch (error) {
-        const raced = this.ctx.agents.get(sessionId);
-        if (raced !== void 0) return this.borrowAgent(raced, id);
-        throw error;
-      }
+      return this.resumeHidden(id, sessionId, agentOptions);
     }
     const agentPreset = this.resolveAgentPreset();
     const createdCwd = cwd ?? this.config.cwd;
@@ -1811,12 +1791,39 @@ var ConversationManager = class {
     } catch (error) {
       const raced = this.ctx.agents.get(sessionId);
       if (raced !== void 0) return this.borrowAgent(raced, id);
+      if (error instanceof Error && error.name === "SessionAlreadyExistsError") {
+        this.hiddenIds.add(id);
+        return this.resumeHidden(id, sessionId, agentOptions);
+      }
       throw error;
     }
     this.sessionCwds.set(id, createdCwd);
     this.persistedIds.add(id);
     void this.alignWorkspace(id, createdCwd, allowCreate);
     return this.ownAgent(handle);
+  }
+  /** Resume a session occupied by a foreign-format log; migrating it on open. */
+  async resumeHidden(id, sessionId, agentOptions) {
+    try {
+      const handle = await this.ctx.agents.resume({
+        resumeSessionId: sessionId,
+        agentOptions,
+        setup: (agentCtx) => this.setupAgent(agentCtx, this.resolveAgentPreset(), id)
+      });
+      this.hiddenIds.delete(id);
+      this.persistedIds.add(id);
+      try {
+        const migrated = await this.ctx.sessionPersistence.inspect(sessionId);
+        const migratedCwd = migrated.meta.cwd;
+        if (typeof migratedCwd === "string" && migratedCwd.length > 0) this.sessionCwds.set(id, migratedCwd);
+      } catch {
+      }
+      return this.ownAgent(handle);
+    } catch (error) {
+      const raced = this.ctx.agents.get(sessionId);
+      if (raced !== void 0) return this.borrowAgent(raced, id);
+      throw error;
+    }
   }
   /**
    * Best-effort sidebar grouping: attach the session to the host workspace
@@ -2256,7 +2263,7 @@ import {
 } from "@deepseek-ai/dsh-settings";
 
 // src/version.ts
-var PLUGIN_VERSION = "0.10.2";
+var PLUGIN_VERSION = "0.10.3";
 
 // src/settings-web.ts
 var SETTINGS_ROUTE = "/_dsh/deepseek-harness-wecom-plus/settings";
@@ -3212,8 +3219,9 @@ var WeComHarnessBridge = class {
       try {
         await this.conversations.reset(message, pending.payload);
       } catch (error) {
+        const detail = error instanceof Error ? error.message : String(error);
         this.log.error("WeCom workspace switch failed: %s", String(error));
-        await this.replyTo(message, frame, "\u5207\u6362\u5DE5\u4F5C\u533A\u5931\u8D25\uFF0C\u8BF7\u7A0D\u540E\u91CD\u8BD5\u3002");
+        await this.replyTo(message, frame, `\u5207\u6362\u5DE5\u4F5C\u533A\u5931\u8D25\uFF1A${detail}`);
         return;
       }
       await this.replyTo(message, frame, `\u5DF2\u5207\u6362\u5DE5\u4F5C\u533A\u5230 \`${pending.payload}\`\uFF0C\u5E76\u5F00\u542F\u65B0\u5BF9\u8BDD\uFF1B\u65E7\u5386\u53F2\u4FDD\u7559\u5728\u7F51\u9875\u7AEF\u3002`);

@@ -236,7 +236,10 @@ export class ConversationManager {
         } catch (error) {
           const name = error instanceof Error ? error.name : ''
           if (name === 'SessionPersistenceNotFoundError') break
-          if (name !== 'SessionFormatUnsupportedError') break
+          // Any other refusal still means the generation is occupied: the
+          // host rejects foreign formats under several error identities
+          // (format refusal, migration guard, corruption guard), so this
+          // deliberately does not depend on one exact error name.
           this.hiddenIds.add(id)
         }
       }
@@ -719,28 +722,7 @@ export class ConversationManager {
     // skips. Its first write open migrates and publishes it, so resume —
     // never create — is the only safe move for such an id.
     if (this.hiddenIds.has(id)) {
-      try {
-        const handle = await this.ctx.agents.resume({
-          resumeSessionId: sessionId,
-          agentOptions,
-          setup: agentCtx => this.setupAgent(agentCtx, this.resolveAgentPreset(), id),
-        })
-        this.hiddenIds.delete(id)
-        this.persistedIds.add(id)
-        try {
-          const migrated = await this.ctx.sessionPersistence.inspect(sessionId)
-          const migratedCwd = migrated.meta.cwd
-          if (typeof migratedCwd === 'string' && migratedCwd.length > 0) this.sessionCwds.set(id, migratedCwd)
-        } catch {
-          // Migrated but the header stayed unreadable: the default-workspace
-          // fallback still applies.
-        }
-        return this.ownAgent(handle)
-      } catch (error) {
-        const raced = this.ctx.agents.get(sessionId)
-        if (raced !== undefined) return this.borrowAgent(raced, id)
-        throw error
-      }
+      return this.resumeHidden(id, sessionId, agentOptions)
     }
 
     const agentPreset = this.resolveAgentPreset()
@@ -758,6 +740,13 @@ export class ConversationManager {
     } catch (error) {
       const raced = this.ctx.agents.get(sessionId)
       if (raced !== undefined) return this.borrowAgent(raced, id)
+      if (error instanceof Error && error.name === 'SessionAlreadyExistsError') {
+        // An undiscovered foreign-format record owns this id (the probe
+        // window or error identity missed it): retry as a resume — its
+        // first write open migrates and publishes it.
+        this.hiddenIds.add(id)
+        return this.resumeHidden(id, sessionId, agentOptions)
+      }
       throw error
     }
     this.sessionCwds.set(id, createdCwd)
@@ -766,6 +755,36 @@ export class ConversationManager {
     // group; ordinary sessions only attach when a matching group exists.
     void this.alignWorkspace(id, createdCwd, allowCreate)
     return this.ownAgent(handle)
+  }
+
+  /** Resume a session occupied by a foreign-format log; migrating it on open. */
+  private async resumeHidden(
+    id: string,
+    sessionId: SessionId,
+    agentOptions: { provider: string | undefined; model: string | undefined },
+  ): Promise<ConversationAgentBinding> {
+    try {
+      const handle = await this.ctx.agents.resume({
+        resumeSessionId: sessionId,
+        agentOptions,
+        setup: agentCtx => this.setupAgent(agentCtx, this.resolveAgentPreset(), id),
+      })
+      this.hiddenIds.delete(id)
+      this.persistedIds.add(id)
+      try {
+        const migrated = await this.ctx.sessionPersistence.inspect(sessionId)
+        const migratedCwd = migrated.meta.cwd
+        if (typeof migratedCwd === 'string' && migratedCwd.length > 0) this.sessionCwds.set(id, migratedCwd)
+      } catch {
+        // Migrated but the header stayed unreadable: the default-workspace
+        // fallback still applies.
+      }
+      return this.ownAgent(handle)
+    } catch (error) {
+      const raced = this.ctx.agents.get(sessionId)
+      if (raced !== undefined) return this.borrowAgent(raced, id)
+      throw error
+    }
   }
 
   /**

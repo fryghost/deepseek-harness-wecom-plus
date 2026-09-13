@@ -1321,80 +1321,103 @@ var ConversationManager = class {
   pendingCards = /* @__PURE__ */ new Map();
   cardRegistry = /* @__PURE__ */ new Map();
   questions;
+  /** Resolved current generation per WeCom base id (0 = the base session itself). */
   generations = /* @__PURE__ */ new Map();
   /** Durable per-session workspace: session meta.cwd is immutable, so switching goes through a new generation. */
   sessionCwds = /* @__PURE__ */ new Map();
-  persistedIds = /* @__PURE__ */ new Set();
-  /** Occupied generations hidden from list() by a foreign log format; resume migrates them. */
-  hiddenIds = /* @__PURE__ */ new Set();
+  /** Occupied session ids found by probing: 'visible' (listable) or 'hidden' (foreign format; resume migrates it). */
+  occupied = /* @__PURE__ */ new Map();
+  /** In-flight per-base generation probes. */
+  generationProbes = /* @__PURE__ */ new Map();
+  /** Diagnostics: size of the last host list() snapshot (advisory only, see initialize). */
+  lastListedCount = 0;
   disposeSessionEvents;
-  /** Snapshot persisted identities once before accepting traffic. */
+  /**
+   * Advisory only since v0.10.5: the host's list() no longer guarantees a
+   * full disk scan (dsh 0.1.5-rc.2 serves a lazily-populated index), and it
+   * has always skipped foreign-format logs — so the generation truth comes
+   * from per-id inspect() probing at conversation time (ensureGeneration),
+   * never from this snapshot.
+   */
   async initialize() {
-    const headers = await this.ctx.sessionPersistence.list();
-    this.persistedIds = new Set(headers.map((header) => String(header.id)));
-    await this.discoverHiddenGenerations();
-    const summary = this.scanSummary();
+    try {
+      const headers = await this.ctx.sessionPersistence.list();
+      this.lastListedCount = headers.length;
+    } catch (error) {
+      this.lastListedCount = -1;
+      console.error("[wecom-plus] advisory session list failed: %s", String(error));
+    }
     console.error(
-      "[wecom-plus] session scan: listed=%d wecomListed=%s hidden=%s generations=%s",
-      summary.listedCount,
-      JSON.stringify(summary.wecomListed),
-      JSON.stringify(summary.hidden),
-      JSON.stringify(summary.generations)
+      "[wecom-plus] session scan: listed=%d (advisory; generations resolve per conversation via inspect)",
+      this.lastListedCount
     );
   }
   /** What the generation scan currently sees; surfaced by the session-scan action. */
   scanSummary() {
     return {
-      listedCount: this.persistedIds.size,
-      wecomListed: [...this.persistedIds].filter((id) => id.startsWith("wecom-v2-")),
-      hidden: [...this.hiddenIds],
+      listedCount: this.lastListedCount,
+      occupied: Object.fromEntries(this.occupied),
       generations: Object.fromEntries(this.generations)
     };
   }
+  /** Inspect one candidate id; a missing inspect capability counts as not-found. */
+  async inspectCandidate(id) {
+    const persistence = this.ctx.sessionPersistence;
+    if (typeof persistence?.inspect !== "function") {
+      throw Object.assign(new Error("session persistence cannot inspect"), { name: "SessionPersistenceNotFoundError" });
+    }
+    return persistence.inspect(SessionId(id));
+  }
+  /** Classify one candidate id: 'visible', 'hidden' (occupied; a resume migrates it), or 'vacant'. */
+  async probeOne(id) {
+    try {
+      const inspected = await this.inspectCandidate(id);
+      this.occupied.set(id, "visible");
+      const cwd = inspected.meta?.cwd;
+      if (typeof cwd === "string" && cwd.length > 0) this.sessionCwds.set(id, cwd);
+      return "visible";
+    } catch (error) {
+      const name2 = error instanceof Error ? error.name : "";
+      if (name2 === "SessionPersistenceNotFoundError") return "vacant";
+      this.occupied.set(id, "hidden");
+      return "hidden";
+    }
+  }
+  async probeGenerations(baseId) {
+    let highest = 0;
+    await this.probeOne(baseId);
+    for (let generation = 1; generation <= GENERATION_PROBE_LIMIT; generation++) {
+      const state = await this.probeOne(`${baseId}-n${generation}`);
+      if (state === "vacant") break;
+      highest = generation;
+    }
+    return highest;
+  }
   /**
-   * list() hides foreign-format sessions, so after a host session-log
-   * upgrade the newest generations can vanish from the generation scan: a
-   * restart would silently fall back to an older conversation, and a /ws
-   * switch would try to create an id whose record still exists on disk
-   * (SessionAlreadyExistsError → “切换失败”). Probe upward per known WeCom
-   * base id and mark refused generations as occupied; resuming one lets the
-   * host migrate and publish it.
+   * Resolve the conversation's current generation by probing the host per
+   * id. inspect() reads the disk directly, so it stays authoritative no
+   * matter what list() indexes or skips.
    */
-  async discoverHiddenGenerations() {
-    const bases = /* @__PURE__ */ new Set();
-    for (const id of this.persistedIds) {
-      const base = id.replace(/-n[1-9][0-9]*$/u, "");
-      if (base !== id && base.startsWith("wecom-v2-")) bases.add(base);
-    }
-    for (const base of bases) {
-      let newest = 0;
-      for (const id of this.persistedIds) {
-        if (!id.startsWith(`${base}-n`)) continue;
-        const candidate = Number(id.slice(base.length + 2));
-        if (Number.isSafeInteger(candidate)) newest = Math.max(newest, candidate);
-      }
-      for (let probe = newest + 1; probe <= newest + GENERATION_PROBE_LIMIT; probe++) {
-        const id = `${base}-n${probe}`;
-        try {
-          await this.ctx.sessionPersistence.inspect(SessionId(id));
-          this.persistedIds.add(id);
-        } catch (error) {
-          const name2 = error instanceof Error ? error.name : "";
-          if (name2 === "SessionPersistenceNotFoundError") break;
-          this.hiddenIds.add(id);
-        }
-      }
-    }
+  async ensureGeneration(baseId) {
+    const cached = this.generations.get(baseId);
+    if (cached !== void 0) return cached;
+    const pending = this.generationProbes.get(baseId);
+    if (pending !== void 0) return pending;
+    const probe = this.probeGenerations(baseId).finally(() => this.generationProbes.delete(baseId));
+    this.generationProbes.set(baseId, probe);
+    const generation = await probe;
+    this.generations.set(baseId, generation);
+    return generation;
   }
   /** Process one inbound message after earlier work in the same WeCom conversation. */
   process(message, client, transport) {
     const baseId = sessionIdFor(this.config.accountId, message);
-    return this.enqueue(baseId, () => this.processNow(this.currentSessionId(baseId), message, client, transport));
+    return this.enqueue(baseId, async () => this.processNow(await this.currentSessionId(baseId), message, client, transport));
   }
   /** Process one template card button click as a user message into the same conversation. */
   processCardEvent(message, selectedLabel, transport) {
     const baseId = sessionIdFor(this.config.accountId, message);
-    return this.enqueue(baseId, () => this.processCardEventNow(this.currentSessionId(baseId), message, selectedLabel, transport));
+    return this.enqueue(baseId, async () => this.processCardEventNow(await this.currentSessionId(baseId), message, selectedLabel, transport));
   }
   /**
    * Resolve one card click back to the visible option label the card carried.
@@ -1485,7 +1508,7 @@ var ConversationManager = class {
     const baseId = sessionIdFor(this.config.accountId, message);
     this.cancel(message);
     await this.enqueue(baseId, async () => {
-      const id = this.currentSessionId(baseId);
+      const id = await this.currentSessionId(baseId);
       this.pendingCards.delete(id);
       const binding = this.bindings.get(id);
       if (binding !== void 0) {
@@ -1493,20 +1516,18 @@ var ConversationManager = class {
         await binding.release();
       }
       const nextCwd = cwd ?? await this.resolveWorkspace(id);
-      let generation = this.generationFor(baseId);
-      while (this.persistedIds.has(`${baseId}-n${generation + 1}`) || this.hiddenIds.has(`${baseId}-n${generation + 1}`)) {
-        generation++;
-      }
+      let generation = await this.ensureGeneration(baseId);
+      while (this.occupied.has(`${baseId}-n${generation + 1}`)) generation++;
       if (!Number.isSafeInteger(generation + 1)) throw new Error("WeCom conversation generation is exhausted");
       this.generations.set(baseId, generation + 1);
-      await this.getOrCreate(this.currentSessionId(baseId), nextCwd, cwd !== void 0);
+      await this.getOrCreate(await this.currentSessionId(baseId), nextCwd, cwd !== void 0);
     });
   }
   /** Execute a registered Harness command against the current WeCom session. */
   executeCommand(message, line) {
     const baseId = sessionIdFor(this.config.accountId, message);
     return this.enqueue(baseId, async () => {
-      const id = this.currentSessionId(baseId);
+      const id = await this.currentSessionId(baseId);
       const binding = await this.getOrCreate(id);
       const agent = binding.agent;
       await withTimeout(
@@ -1514,7 +1535,7 @@ var ConversationManager = class {
         this.config.responseTimeoutMs,
         "DeepSeek Harness conversation availability"
       );
-      const start = agent.session.events.length;
+      const start = agent.session?.events?.length ?? 0;
       const controller = new AbortController();
       const timer = setTimeout(() => {
         controller.abort(new Error(`DeepSeek Harness command timed out after ${this.config.responseTimeoutMs}ms`));
@@ -1527,7 +1548,7 @@ var ConversationManager = class {
           return { execution, response: void 0 };
         }
         await withTimeout(agent.whenIdle(), this.config.responseTimeoutMs, "DeepSeek Harness command response");
-        const events = agent.session.events.slice(start);
+        const events = (agent.session?.events ?? []).slice(start);
         const response = events.some((event) => event.type === "assistant/message") ? this.finalizeReply(id, await this.collectReply(agent, events)) : (this.takeCards(id), void 0);
         return { execution, response };
       } finally {
@@ -1539,11 +1560,14 @@ var ConversationManager = class {
   /** Cancel active work for one WeCom conversation. */
   cancel(message) {
     const baseId = sessionIdFor(this.config.accountId, message);
-    const id = this.currentSessionId(baseId);
-    const agent = this.bindings.get(id)?.agent ?? this.ctx.agents.get(SessionId(id));
-    if (agent === void 0 || agent.status === "idle") return false;
-    agent.cancel({ kind: "user" });
-    return true;
+    const candidates = [baseId, `${baseId}-n${this.generations.get(baseId) ?? 0}`];
+    for (const id of candidates) {
+      const agent = this.bindings.get(id)?.agent ?? this.ctx.agents.get(SessionId(id));
+      if (agent === void 0 || agent.status === "idle") continue;
+      agent.cancel({ kind: "user" });
+      return true;
+    }
+    return false;
   }
   /** Dispose every bridge-owned Agent after queued message work settles. */
   async dispose() {
@@ -1557,7 +1581,8 @@ var ConversationManager = class {
     this.pendingCards.clear();
     this.cardRegistry.clear();
     this.sessionCwds.clear();
-    this.hiddenIds.clear();
+    this.occupied.clear();
+    this.generationProbes.clear();
   }
   enqueue(baseId, operation) {
     const previous = this.queues.get(baseId) ?? Promise.resolve();
@@ -1574,31 +1599,20 @@ var ConversationManager = class {
     this.queues.set(baseId, tracked);
     return current;
   }
-  currentSessionId(baseId) {
-    const generation = this.generationFor(baseId);
+  sessionIdForGeneration(baseId, generation) {
     return generation === 0 ? baseId : `${baseId}-n${generation}`;
   }
-  generationFor(baseId) {
-    const cached = this.generations.get(baseId);
-    if (cached !== void 0) return cached;
-    const prefix = `${baseId}-n`;
-    let generation = 0;
-    for (const id of [...this.persistedIds, ...this.hiddenIds]) {
-      if (!id.startsWith(prefix)) continue;
-      const suffix = id.slice(prefix.length);
-      if (!/^[1-9][0-9]*$/u.test(suffix)) continue;
-      const candidate = Number(suffix);
-      if (Number.isSafeInteger(candidate)) generation = Math.max(generation, candidate);
-    }
-    this.generations.set(baseId, generation);
-    return generation;
+  /** Current session id, resolving the generation via per-id probing. */
+  async currentSessionId(baseId) {
+    return this.sessionIdForGeneration(baseId, await this.ensureGeneration(baseId));
   }
   async processNow(id, message, client, transport) {
     const binding = await this.getOrCreate(id);
     const agent = binding.agent;
     const content = await inboundContent(this.ctx, this.config, client, message, await this.includeImages(agent));
     await withTimeout(agent.whenIdle(), this.config.responseTimeoutMs, "DeepSeek Harness conversation availability");
-    const start = agent.session.events.length;
+    const events = agent.session?.events ?? [];
+    const start = events.length;
     this.activeTurns.set(id, chatTarget(message));
     const stream = { transport, text: "", activity: void 0, lastEventAt: Date.now() };
     this.activeStreams.set(id, stream);
@@ -1612,7 +1626,7 @@ var ConversationManager = class {
         await transport.fail("\u751F\u6210\u8D85\u65F6\uFF08\u957F\u65F6\u95F4\u6CA1\u6709\u4EFB\u4F55\u8FDB\u5C55\uFF09\uFF0C\u5DF2\u53D6\u6D88\u672C\u6B21\u751F\u6210\uFF0C\u8BF7\u91CD\u65B0\u53D1\u9001\u3002");
         throw error;
       }
-      const collected = await this.collectReply(agent, agent.session.events.slice(start));
+      const collected = await this.collectReply(agent, (agent.session?.events ?? []).slice(start));
       const reply = this.finalizeReply(id, {
         text: collected.text.trim() || stream.text.trim(),
         images: collected.images
@@ -1679,7 +1693,8 @@ var ConversationManager = class {
       ].join("\n")
     }];
     await withTimeout(agent.whenIdle(), this.config.responseTimeoutMs, "DeepSeek Harness conversation availability");
-    const start = agent.session.events.length;
+    const events = agent.session?.events ?? [];
+    const start = events.length;
     this.activeTurns.set(id, chatTarget(message));
     const stream = { transport, text: "", activity: void 0, lastEventAt: Date.now() };
     this.activeStreams.set(id, stream);
@@ -1693,7 +1708,7 @@ var ConversationManager = class {
         await transport.fail("\u751F\u6210\u8D85\u65F6\uFF08\u957F\u65F6\u95F4\u6CA1\u6709\u4EFB\u4F55\u8FDB\u5C55\uFF09\uFF0C\u5DF2\u53D6\u6D88\u672C\u6B21\u751F\u6210\uFF0C\u8BF7\u91CD\u65B0\u53D1\u9001\u3002");
         throw error;
       }
-      const collected = await this.collectReply(agent, agent.session.events.slice(start));
+      const collected = await this.collectReply(agent, (agent.session?.events ?? []).slice(start));
       const reply = this.finalizeReply(id, {
         text: collected.text.trim() || stream.text.trim(),
         images: collected.images
@@ -1733,15 +1748,15 @@ var ConversationManager = class {
   /** Current workspace of one WeCom conversation (cache → persistence → default). */
   async workspaceOf(message) {
     const baseId = sessionIdFor(this.config.accountId, message);
-    return this.resolveWorkspace(this.currentSessionId(baseId));
+    return this.resolveWorkspace(await this.currentSessionId(baseId));
   }
   async resolveWorkspace(id) {
     const cached = this.sessionCwds.get(id);
     if (cached !== void 0) return cached;
-    if (this.persistedIds.has(id)) {
+    if (this.occupied.get(id) === "visible") {
       try {
-        const inspected = await this.ctx.sessionPersistence.inspect(SessionId(id));
-        const cwd = inspected.meta.cwd;
+        const inspected = await this.inspectCandidate(id);
+        const cwd = inspected.meta?.cwd;
         if (typeof cwd === "string" && cwd.length > 0) {
           this.sessionCwds.set(id, cwd);
           return cwd;
@@ -1773,11 +1788,15 @@ var ConversationManager = class {
     if (live !== void 0) return this.borrowAgent(live, id);
     const current = this.ctx.agentDefaultModel.currentSelection();
     const agentOptions = { provider: current.provider, model: current.model };
-    if (this.persistedIds.has(id)) {
-      const inspected = await this.ctx.sessionPersistence.inspect(sessionId);
-      const agentPreset2 = resolveSessionPreset(inspected.meta, inspected.events) ?? this.resolveAgentPreset();
-      const resumedCwd = inspected.meta.cwd;
-      if (typeof resumedCwd === "string" && resumedCwd.length > 0) this.sessionCwds.set(id, resumedCwd);
+    if (this.occupied.get(id) === "visible") {
+      const inspected = await this.inspectCandidate(id);
+      const agentPreset2 = resolveSessionPreset(inspected.meta, inspected.events ?? []) ?? this.resolveAgentPreset();
+      const inspectedCwd = inspected.meta?.cwd;
+      let resumedCwd;
+      if (typeof inspectedCwd === "string" && inspectedCwd.length > 0) {
+        resumedCwd = inspectedCwd;
+        this.sessionCwds.set(id, resumedCwd);
+      }
       try {
         const handle2 = await this.ctx.agents.resume({
           resumeSessionId: sessionId,
@@ -1792,7 +1811,7 @@ var ConversationManager = class {
         throw error;
       }
     }
-    if (this.hiddenIds.has(id)) {
+    if (this.occupied.get(id) === "hidden") {
       return this.resumeHidden(id, sessionId, agentOptions);
     }
     const agentPreset = this.resolveAgentPreset();
@@ -1809,13 +1828,13 @@ var ConversationManager = class {
       const raced = this.ctx.agents.get(sessionId);
       if (raced !== void 0) return this.borrowAgent(raced, id);
       if (error instanceof Error && error.name === "SessionAlreadyExistsError") {
-        this.hiddenIds.add(id);
+        this.occupied.set(id, "hidden");
         return this.resumeHidden(id, sessionId, agentOptions);
       }
       throw error;
     }
+    this.occupied.set(id, "visible");
     this.sessionCwds.set(id, createdCwd);
-    this.persistedIds.add(id);
     void this.alignWorkspace(id, createdCwd, allowCreate);
     return this.ownAgent(handle);
   }
@@ -1827,10 +1846,9 @@ var ConversationManager = class {
         agentOptions,
         setup: (agentCtx) => this.setupAgent(agentCtx, this.resolveAgentPreset(), id)
       });
-      this.hiddenIds.delete(id);
-      this.persistedIds.add(id);
+      this.occupied.set(id, "visible");
       try {
-        const migrated = await this.ctx.sessionPersistence.inspect(sessionId);
+        const migrated = await this.inspectCandidate(id);
         const migratedCwd = migrated.meta.cwd;
         if (typeof migratedCwd === "string" && migratedCwd.length > 0) this.sessionCwds.set(id, migratedCwd);
       } catch {
@@ -2280,7 +2298,7 @@ import {
 } from "@deepseek-ai/dsh-settings";
 
 // src/version.ts
-var PLUGIN_VERSION = "0.10.4";
+var PLUGIN_VERSION = "0.10.5";
 
 // src/settings-web.ts
 var SETTINGS_ROUTE = "/_dsh/deepseek-harness-wecom-plus/settings";

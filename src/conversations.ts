@@ -158,12 +158,16 @@ export class ConversationManager {
   private readonly pendingCards = new Map<string, TemplateCard[]>()
   private readonly cardRegistry = new Map<string, CardRegistryEntry>()
   private readonly questions: WeComQuestionBridge
+  /** Resolved current generation per WeCom base id (0 = the base session itself). */
   private readonly generations = new Map<string, number>()
   /** Durable per-session workspace: session meta.cwd is immutable, so switching goes through a new generation. */
   private readonly sessionCwds = new Map<string, string>()
-  private persistedIds = new Set<string>()
-  /** Occupied generations hidden from list() by a foreign log format; resume migrates them. */
-  private readonly hiddenIds = new Set<string>()
+  /** Occupied session ids found by probing: 'visible' (listable) or 'hidden' (foreign format; resume migrates it). */
+  private readonly occupied = new Map<string, 'visible' | 'hidden'>()
+  /** In-flight per-base generation probes. */
+  private readonly generationProbes = new Map<string, Promise<number>>()
+  /** Diagnostics: size of the last host list() snapshot (advisory only, see initialize). */
+  private lastListedCount = 0
   private readonly disposeSessionEvents: () => void
 
   constructor(
@@ -199,80 +203,110 @@ export class ConversationManager {
     })
   }
 
-  /** Snapshot persisted identities once before accepting traffic. */
+  /**
+   * Advisory only since v0.10.5: the host's list() no longer guarantees a
+   * full disk scan (dsh 0.1.5-rc.2 serves a lazily-populated index), and it
+   * has always skipped foreign-format logs — so the generation truth comes
+   * from per-id inspect() probing at conversation time (ensureGeneration),
+   * never from this snapshot.
+   */
   async initialize(): Promise<void> {
-    const headers = await this.ctx.sessionPersistence.list()
-    this.persistedIds = new Set(headers.map(header => String(header.id)))
-    await this.discoverHiddenGenerations()
-    const summary = this.scanSummary()
+    try {
+      const headers = await this.ctx.sessionPersistence.list()
+      this.lastListedCount = headers.length
+    } catch (error) {
+      this.lastListedCount = -1
+      console.error('[wecom-plus] advisory session list failed: %s', String(error))
+    }
     console.error(
-      '[wecom-plus] session scan: listed=%d wecomListed=%s hidden=%s generations=%s',
-      summary.listedCount,
-      JSON.stringify(summary.wecomListed),
-      JSON.stringify(summary.hidden),
-      JSON.stringify(summary.generations),
+      '[wecom-plus] session scan: listed=%d (advisory; generations resolve per conversation via inspect)',
+      this.lastListedCount,
     )
   }
 
   /** What the generation scan currently sees; surfaced by the session-scan action. */
   scanSummary(): {
     listedCount: number
-    wecomListed: string[]
-    hidden: string[]
+    occupied: Record<string, 'visible' | 'hidden'>
     generations: Record<string, number>
   } {
     return {
-      listedCount: this.persistedIds.size,
-      wecomListed: [...this.persistedIds].filter(id => id.startsWith('wecom-v2-')),
-      hidden: [...this.hiddenIds],
+      listedCount: this.lastListedCount,
+      occupied: Object.fromEntries(this.occupied),
       generations: Object.fromEntries(this.generations),
     }
   }
 
+  /** Inspect one candidate id; a missing inspect capability counts as not-found. */
+  private async inspectCandidate(id: string): Promise<{
+    meta: { cwd?: unknown; agentPreset?: string }
+    events?: readonly SessionEvent[]
+  }> {
+    const persistence = this.ctx.sessionPersistence as unknown as {
+      inspect?: (id: SessionId) => Promise<{
+        meta: { cwd?: unknown; agentPreset?: string }
+        events?: readonly SessionEvent[]
+      }>
+    }
+    if (typeof persistence?.inspect !== 'function') {
+      throw Object.assign(new Error('session persistence cannot inspect'), { name: 'SessionPersistenceNotFoundError' })
+    }
+    return persistence.inspect(SessionId(id))
+  }
+
+  /** Classify one candidate id: 'visible', 'hidden' (occupied; a resume migrates it), or 'vacant'. */
+  private async probeOne(id: string): Promise<'visible' | 'hidden' | 'vacant'> {
+    try {
+      const inspected = await this.inspectCandidate(id)
+      this.occupied.set(id, 'visible')
+      const cwd = inspected.meta?.cwd
+      if (typeof cwd === 'string' && cwd.length > 0) this.sessionCwds.set(id, cwd)
+      return 'visible'
+    } catch (error) {
+      const name = error instanceof Error ? error.name : ''
+      if (name === 'SessionPersistenceNotFoundError') return 'vacant'
+      // Any other refusal still means the id is occupied: the host rejects
+      // foreign formats under several error identities (format refusal,
+      // migration guard, corruption guard).
+      this.occupied.set(id, 'hidden')
+      return 'hidden'
+    }
+  }
+
+  private async probeGenerations(baseId: string): Promise<number> {
+    let highest = 0
+    // Generation 0 is the base session itself; it may be vacant while -nK
+    // records exist, so its absence does not end the probe.
+    await this.probeOne(baseId)
+    for (let generation = 1; generation <= GENERATION_PROBE_LIMIT; generation++) {
+      const state = await this.probeOne(`${baseId}-n${generation}`)
+      if (state === 'vacant') break
+      highest = generation
+    }
+    return highest
+  }
+
   /**
-   * list() hides foreign-format sessions, so after a host session-log
-   * upgrade the newest generations can vanish from the generation scan: a
-   * restart would silently fall back to an older conversation, and a /ws
-   * switch would try to create an id whose record still exists on disk
-   * (SessionAlreadyExistsError → “切换失败”). Probe upward per known WeCom
-   * base id and mark refused generations as occupied; resuming one lets the
-   * host migrate and publish it.
+   * Resolve the conversation's current generation by probing the host per
+   * id. inspect() reads the disk directly, so it stays authoritative no
+   * matter what list() indexes or skips.
    */
-  private async discoverHiddenGenerations(): Promise<void> {
-    const bases = new Set<string>()
-    for (const id of this.persistedIds) {
-      const base = id.replace(/-n[1-9][0-9]*$/u, '')
-      if (base !== id && base.startsWith('wecom-v2-')) bases.add(base)
-    }
-    for (const base of bases) {
-      let newest = 0
-      for (const id of this.persistedIds) {
-        if (!id.startsWith(`${base}-n`)) continue
-        const candidate = Number(id.slice(base.length + 2))
-        if (Number.isSafeInteger(candidate)) newest = Math.max(newest, candidate)
-      }
-      for (let probe = newest + 1; probe <= newest + GENERATION_PROBE_LIMIT; probe++) {
-        const id = `${base}-n${probe}`
-        try {
-          await this.ctx.sessionPersistence.inspect(SessionId(id))
-          this.persistedIds.add(id)
-        } catch (error) {
-          const name = error instanceof Error ? error.name : ''
-          if (name === 'SessionPersistenceNotFoundError') break
-          // Any other refusal still means the generation is occupied: the
-          // host rejects foreign formats under several error identities
-          // (format refusal, migration guard, corruption guard), so this
-          // deliberately does not depend on one exact error name.
-          this.hiddenIds.add(id)
-        }
-      }
-    }
+  private async ensureGeneration(baseId: string): Promise<number> {
+    const cached = this.generations.get(baseId)
+    if (cached !== undefined) return cached
+    const pending = this.generationProbes.get(baseId)
+    if (pending !== undefined) return pending
+    const probe = this.probeGenerations(baseId).finally(() => this.generationProbes.delete(baseId))
+    this.generationProbes.set(baseId, probe)
+    const generation = await probe
+    this.generations.set(baseId, generation)
+    return generation
   }
 
   /** Process one inbound message after earlier work in the same WeCom conversation. */
   process(message: BaseMessage, client: WeComDownloadPort, transport: TurnTransport): Promise<ConversationReply> {
     const baseId = sessionIdFor(this.config.accountId, message)
-    return this.enqueue(baseId, () => this.processNow(this.currentSessionId(baseId), message, client, transport))
+    return this.enqueue(baseId, async () => this.processNow(await this.currentSessionId(baseId), message, client, transport))
   }
 
   /** Process one template card button click as a user message into the same conversation. */
@@ -282,7 +316,7 @@ export class ConversationManager {
     transport: TurnTransport,
   ): Promise<ConversationReply> {
     const baseId = sessionIdFor(this.config.accountId, message)
-    return this.enqueue(baseId, () => this.processCardEventNow(this.currentSessionId(baseId), message, selectedLabel, transport))
+    return this.enqueue(baseId, async () => this.processCardEventNow(await this.currentSessionId(baseId), message, selectedLabel, transport))
   }
 
   /**
@@ -381,7 +415,7 @@ export class ConversationManager {
     const baseId = sessionIdFor(this.config.accountId, message)
     this.cancel(message)
     await this.enqueue(baseId, async () => {
-      const id = this.currentSessionId(baseId)
+      const id = await this.currentSessionId(baseId)
       this.pendingCards.delete(id)
       const binding = this.bindings.get(id)
       if (binding !== undefined) {
@@ -389,18 +423,16 @@ export class ConversationManager {
         await binding.release()
       }
       const nextCwd = cwd ?? await this.resolveWorkspace(id)
-      let generation = this.generationFor(baseId)
-      // A hidden legacy record can occupy generations beyond the discovered
-      // window; never target an occupied id — skip to the first free one.
-      while (this.persistedIds.has(`${baseId}-n${generation + 1}`)
-        || this.hiddenIds.has(`${baseId}-n${generation + 1}`)) {
-        generation++
-      }
+      let generation = await this.ensureGeneration(baseId)
+      // Never target an occupied id: the probe window can miss occupancy
+      // that only surfaces as a create refusal, and getOrCreate's fallback
+      // handles that case.
+      while (this.occupied.has(`${baseId}-n${generation + 1}`)) generation++
       if (!Number.isSafeInteger(generation + 1)) throw new Error('WeCom conversation generation is exhausted')
       this.generations.set(baseId, generation + 1)
       // An explicit cwd is a deliberate /ws switch: the new generation may
       // CREATE its workspace group; a plain /new only attaches when one exists.
-      await this.getOrCreate(this.currentSessionId(baseId), nextCwd, cwd !== undefined)
+      await this.getOrCreate(await this.currentSessionId(baseId), nextCwd, cwd !== undefined)
     })
   }
 
@@ -408,7 +440,7 @@ export class ConversationManager {
   executeCommand(message: BaseMessage, line: string): Promise<ConversationCommandReply> {
     const baseId = sessionIdFor(this.config.accountId, message)
     return this.enqueue(baseId, async () => {
-      const id = this.currentSessionId(baseId)
+      const id = await this.currentSessionId(baseId)
       const binding = await this.getOrCreate(id)
       const agent = binding.agent
       await withTimeout(
@@ -416,7 +448,7 @@ export class ConversationManager {
         this.config.responseTimeoutMs,
         'DeepSeek Harness conversation availability',
       )
-      const start = agent.session.events.length
+      const start = agent.session?.events?.length ?? 0
       const controller = new AbortController()
       const timer = setTimeout(() => {
         controller.abort(new Error(`DeepSeek Harness command timed out after ${this.config.responseTimeoutMs}ms`))
@@ -429,7 +461,7 @@ export class ConversationManager {
           return { execution, response: undefined }
         }
         await withTimeout(agent.whenIdle(), this.config.responseTimeoutMs, 'DeepSeek Harness command response')
-        const events = agent.session.events.slice(start)
+        const events = (agent.session?.events ?? []).slice(start)
         const response = events.some(event => event.type === 'assistant/message')
           ? this.finalizeReply(id, await this.collectReply(agent, events))
           : (this.takeCards(id), undefined)
@@ -444,11 +476,16 @@ export class ConversationManager {
   /** Cancel active work for one WeCom conversation. */
   cancel(message: WeComPeer): boolean {
     const baseId = sessionIdFor(this.config.accountId, message)
-    const id = this.currentSessionId(baseId)
-    const agent = this.bindings.get(id)?.agent ?? this.ctx.agents.get(SessionId(id))
-    if (agent === undefined || agent.status === 'idle') return false
-    agent.cancel({ kind: 'user' })
-    return true
+    // Synchronous by contract: check the base id and the cached generation
+    // (the probe may not have run yet when a cancel arrives first).
+    const candidates = [baseId, `${baseId}-n${this.generations.get(baseId) ?? 0}`]
+    for (const id of candidates) {
+      const agent = this.bindings.get(id)?.agent ?? this.ctx.agents.get(SessionId(id))
+      if (agent === undefined || agent.status === 'idle') continue
+      agent.cancel({ kind: 'user' })
+      return true
+    }
+    return false
   }
 
   /** Dispose every bridge-owned Agent after queued message work settles. */
@@ -463,7 +500,8 @@ export class ConversationManager {
     this.pendingCards.clear()
     this.cardRegistry.clear()
     this.sessionCwds.clear()
-    this.hiddenIds.clear()
+    this.occupied.clear()
+    this.generationProbes.clear()
   }
 
   private enqueue<T>(baseId: string, operation: () => Promise<T>): Promise<T> {
@@ -481,27 +519,13 @@ export class ConversationManager {
     return current
   }
 
-  private currentSessionId(baseId: string): string {
-    const generation = this.generationFor(baseId)
+  private sessionIdForGeneration(baseId: string, generation: number): string {
     return generation === 0 ? baseId : `${baseId}-n${generation}`
   }
 
-  private generationFor(baseId: string): number {
-    const cached = this.generations.get(baseId)
-    if (cached !== undefined) return cached
-    const prefix = `${baseId}-n`
-    let generation = 0
-    // Hidden generations are occupied too: they must raise the current
-    // generation even though list() cannot see them.
-    for (const id of [...this.persistedIds, ...this.hiddenIds]) {
-      if (!id.startsWith(prefix)) continue
-      const suffix = id.slice(prefix.length)
-      if (!/^[1-9][0-9]*$/u.test(suffix)) continue
-      const candidate = Number(suffix)
-      if (Number.isSafeInteger(candidate)) generation = Math.max(generation, candidate)
-    }
-    this.generations.set(baseId, generation)
-    return generation
+  /** Current session id, resolving the generation via per-id probing. */
+  private async currentSessionId(baseId: string): Promise<string> {
+    return this.sessionIdForGeneration(baseId, await this.ensureGeneration(baseId))
   }
 
   private async processNow(
@@ -514,7 +538,8 @@ export class ConversationManager {
     const agent = binding.agent
     const content = await inboundContent(this.ctx, this.config, client, message, await this.includeImages(agent))
     await withTimeout(agent.whenIdle(), this.config.responseTimeoutMs, 'DeepSeek Harness conversation availability')
-    const start = agent.session.events.length
+    const events = agent.session?.events ?? []
+    const start = events.length
     this.activeTurns.set(id, chatTarget(message))
     const stream: ActiveStream = { transport, text: '', activity: undefined, lastEventAt: Date.now() }
     this.activeStreams.set(id, stream)
@@ -530,7 +555,7 @@ export class ConversationManager {
         await transport.fail('生成超时（长时间没有任何进展），已取消本次生成，请重新发送。')
         throw error
       }
-      const collected = await this.collectReply(agent, agent.session.events.slice(start))
+      const collected = await this.collectReply(agent, (agent.session?.events ?? []).slice(start))
       // The collected events carry EVERY assistant message of the turn, while
       // the stream text only holds the latest step (step/start resets it for
       // retry correctness): prefer the full collected text so a multi-step
@@ -611,7 +636,8 @@ export class ConversationManager {
       ].join('\n'),
     }]
     await withTimeout(agent.whenIdle(), this.config.responseTimeoutMs, 'DeepSeek Harness conversation availability')
-    const start = agent.session.events.length
+    const events = agent.session?.events ?? []
+    const start = events.length
     this.activeTurns.set(id, chatTarget(message))
     const stream: ActiveStream = { transport, text: '', activity: undefined, lastEventAt: Date.now() }
     this.activeStreams.set(id, stream)
@@ -625,7 +651,7 @@ export class ConversationManager {
         await transport.fail('生成超时（长时间没有任何进展），已取消本次生成，请重新发送。')
         throw error
       }
-      const collected = await this.collectReply(agent, agent.session.events.slice(start))
+      const collected = await this.collectReply(agent, (agent.session?.events ?? []).slice(start))
       // Same as processNow: the full collected text wins over the last step's
       // stream text so multi-step turns keep every assistant message.
       const reply = this.finalizeReply(id, {
@@ -671,16 +697,16 @@ export class ConversationManager {
   /** Current workspace of one WeCom conversation (cache → persistence → default). */
   async workspaceOf(message: WeComPeer): Promise<string> {
     const baseId = sessionIdFor(this.config.accountId, message)
-    return this.resolveWorkspace(this.currentSessionId(baseId))
+    return this.resolveWorkspace(await this.currentSessionId(baseId))
   }
 
   private async resolveWorkspace(id: string): Promise<string> {
     const cached = this.sessionCwds.get(id)
     if (cached !== undefined) return cached
-    if (this.persistedIds.has(id)) {
+    if (this.occupied.get(id) === 'visible') {
       try {
-        const inspected = await this.ctx.sessionPersistence.inspect(SessionId(id))
-        const cwd = inspected.meta.cwd
+        const inspected = await this.inspectCandidate(id)
+        const cwd = inspected.meta?.cwd
         if (typeof cwd === 'string' && cwd.length > 0) {
           this.sessionCwds.set(id, cwd)
           return cwd
@@ -717,13 +743,16 @@ export class ConversationManager {
 
     const current = this.ctx.agentDefaultModel.currentSelection()
     const agentOptions = { provider: current.provider, model: current.model }
-    if (this.persistedIds.has(id)) {
-      const inspected = await this.ctx.sessionPersistence.inspect(sessionId)
-      const agentPreset = resolveSessionPreset(inspected.meta, inspected.events)
+    if (this.occupied.get(id) === 'visible') {
+      const inspected = await this.inspectCandidate(id)
+      const agentPreset = resolveSessionPreset(inspected.meta, inspected.events ?? [])
         ?? this.resolveAgentPreset()
-      // The session's durable cwd is the workspace of record for resumes.
-      const resumedCwd = inspected.meta.cwd
-      if (typeof resumedCwd === 'string' && resumedCwd.length > 0) this.sessionCwds.set(id, resumedCwd)
+      const inspectedCwd = inspected.meta?.cwd
+      let resumedCwd: string | undefined
+      if (typeof inspectedCwd === 'string' && inspectedCwd.length > 0) {
+        resumedCwd = inspectedCwd
+        this.sessionCwds.set(id, resumedCwd)
+      }
       try {
         const handle = await this.ctx.agents.resume({
           resumeSessionId: sessionId,
@@ -744,7 +773,7 @@ export class ConversationManager {
     // A hidden id is occupied by a foreign-format log the host's list()
     // skips. Its first write open migrates and publishes it, so resume —
     // never create — is the only safe move for such an id.
-    if (this.hiddenIds.has(id)) {
+    if (this.occupied.get(id) === 'hidden') {
       return this.resumeHidden(id, sessionId, agentOptions)
     }
 
@@ -767,13 +796,13 @@ export class ConversationManager {
         // An undiscovered foreign-format record owns this id (the probe
         // window or error identity missed it): retry as a resume — its
         // first write open migrates and publishes it.
-        this.hiddenIds.add(id)
+        this.occupied.set(id, 'hidden')
         return this.resumeHidden(id, sessionId, agentOptions)
       }
       throw error
     }
+    this.occupied.set(id, 'visible')
     this.sessionCwds.set(id, createdCwd)
-    this.persistedIds.add(id)
     // Sidebar grouping: an explicit /ws switch may create the workspace
     // group; ordinary sessions only attach when a matching group exists.
     void this.alignWorkspace(id, createdCwd, allowCreate)
@@ -781,10 +810,10 @@ export class ConversationManager {
   }
 
   /** Resume a session occupied by a foreign-format log; migrating it on open. */
-  private async resumeHidden(
+  private async resumeHidden<A extends { provider?: string; model?: string }>(
     id: string,
     sessionId: SessionId,
-    agentOptions: { provider: string | undefined; model: string | undefined },
+    agentOptions: A,
   ): Promise<ConversationAgentBinding> {
     try {
       const handle = await this.ctx.agents.resume({
@@ -792,10 +821,9 @@ export class ConversationManager {
         agentOptions,
         setup: agentCtx => this.setupAgent(agentCtx, this.resolveAgentPreset(), id),
       })
-      this.hiddenIds.delete(id)
-      this.persistedIds.add(id)
+      this.occupied.set(id, 'visible')
       try {
-        const migrated = await this.ctx.sessionPersistence.inspect(sessionId)
+        const migrated = await this.inspectCandidate(id)
         const migratedCwd = migrated.meta.cwd
         if (typeof migratedCwd === 'string' && migratedCwd.length > 0) this.sessionCwds.set(id, migratedCwd)
       } catch {

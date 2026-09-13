@@ -168,7 +168,7 @@ describe('ConversationManager', () => {
   it('restores the recorded agent preset before resuming a conversation', async () => {
     const config = testConfig()
     const message = textMessage('u2', 'm2')
-    const id = `${sessionIdFor(config.accountId, message)}-n2`
+    const id = sessionIdFor(config.accountId, message)
     const events: unknown[] = []
     const agent = {
       status: 'idle',
@@ -257,11 +257,15 @@ describe('ConversationManager', () => {
       build(options, resumed, String(options.resumeSessionId)))
     const create = vi.fn(async (options: { sessionId: unknown; setup?: (ctx: never) => Promise<void> }) =>
       build(options, created, String(options.sessionId)))
-    // Simulate a post-upgrade host: list() hides the legacy -n11 log while
-    // inspect() refuses it with the host's format-refusal error name.
-    const inspect = vi.fn(async (id: unknown) => {
-      if (String(id) === hiddenId) {
+    // Simulate a post-upgrade host: base through -n10 are readable, -n11 is
+    // a legacy log the host refuses, and nothing exists beyond it.
+    const inspect = vi.fn(async (probed: unknown) => {
+      const id = String(probed)
+      if (id === hiddenId) {
         throw Object.assign(new Error('foreign log format'), { name: 'SessionFormatUnsupportedError' })
+      }
+      if (id === baseId || /^-n(?:[1-9]|10)$/u.test(id.slice(baseId.length))) {
+        return { meta: { cwd: 'D:\\deepseek\\test' }, events: [] }
       }
       throw Object.assign(new Error('missing'), { name: 'SessionPersistenceNotFoundError' })
     })
@@ -320,8 +324,12 @@ describe('ConversationManager', () => {
     })
     // The host refuses foreign formats under several error identities; a
     // refusal without the format error name must still mark occupancy.
-    const inspect = vi.fn(async (id: unknown) => {
-      if (String(id) === hiddenId) throw new Error('migration guard refused the log')
+    const inspect = vi.fn(async (probed: unknown) => {
+      const id = String(probed)
+      if (id === hiddenId) throw new Error('migration guard refused the log')
+      if (id === baseId || /^-n(?:[1-9]|10)$/u.test(id.slice(baseId.length))) {
+        return { meta: { cwd: 'D:\\deepseek\\test' }, events: [] }
+      }
       throw Object.assign(new Error('missing'), { name: 'SessionPersistenceNotFoundError' })
     })
     const ctx = {
@@ -348,7 +356,7 @@ describe('ConversationManager', () => {
     const config = testConfig()
     const message = textMessage('u-collide', 'm-collide')
     const baseId = sessionIdFor(config.accountId, message)
-    const occupiedId = `${baseId}-n11`
+    const occupiedId = `${baseId}-n1`
     const events: unknown[] = []
     const agent = {
       status: 'idle',
@@ -435,7 +443,12 @@ describe('ConversationManager', () => {
         }
       }),
     }
-    const inspect = vi.fn()
+    const inspect = vi.fn(async (probed: unknown) => {
+      if (String(probed) !== id) {
+        throw Object.assign(new Error('missing'), { name: 'SessionPersistenceNotFoundError' })
+      }
+      return { meta: {}, events: [] }
+    })
     const resume = vi.fn()
     const create = vi.fn()
     const ctx = {
@@ -455,7 +468,6 @@ describe('ConversationManager', () => {
     await expect(manager.process(message, downloadPort, noopTransport())).resolves.toEqual({ text: 'WeCom reply', images: [], cards: [] })
 
     expect(section).toHaveBeenCalledWith(expect.objectContaining({ name: 'channel:wecom', order: 190 }))
-    expect(inspect).not.toHaveBeenCalled()
     expect(resume).not.toHaveBeenCalled()
     expect(create).not.toHaveBeenCalled()
     expect(agent.whenIdle).toHaveBeenCalledTimes(2)
@@ -639,7 +651,13 @@ describe('ConversationManager', () => {
       get: vi.fn((name: string) => name === 'workspaceRegistry' ? options.registry : undefined),
       sessionPersistence: {
         list: vi.fn(async () => options.persisted ?? []),
-        inspect: vi.fn(async () => options.inspectResult?.() ?? { meta: {}, events: [] }),
+        inspect: vi.fn(async (probed: unknown) => {
+          const id = String(probed)
+          if (!(options.persisted ?? []).some(header => String(header.id) === id)) {
+            throw Object.assign(new Error('missing'), { name: 'SessionPersistenceNotFoundError' })
+          }
+          return options.inspectResult?.() ?? { meta: {}, events: [] }
+        }),
       },
       agentDefaultModel: { currentSelection: vi.fn(() => ({ provider: 'deepseek', model: 'deepseek-chat' })) },
       agentPresets: { defaultId: 'standard', mount: vi.fn(async () => ({ id: 'standard' })) },

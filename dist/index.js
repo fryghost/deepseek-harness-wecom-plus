@@ -1295,6 +1295,7 @@ var ConversationManager = class {
       const active = this.activeStreams.get(String(session.id));
       if (active === void 0) return;
       active.lastEventAt = Date.now();
+      if (active.eventTypes.length < 50) active.eventTypes.push(event.type);
       if (event.type === "step/start") {
         active.text = "";
         active.activity = void 0;
@@ -1643,7 +1644,7 @@ var ConversationManager = class {
     const events = agent.session?.events ?? [];
     const start = events.length;
     this.activeTurns.set(id, chatTarget(message));
-    const stream = { transport, text: "", activity: void 0, lastEventAt: Date.now() };
+    const stream = { transport, text: "", activity: void 0, lastEventAt: Date.now(), eventTypes: [] };
     this.activeStreams.set(id, stream);
     try {
       agent.followup(createUserMessage({ content, source: { kind: "user" } }));
@@ -1656,6 +1657,15 @@ var ConversationManager = class {
         throw error;
       }
       const collected = await this.collectReply(agent, (agent.session?.events ?? []).slice(start));
+      if (collected.text.trim() === "" && collected.images.length === 0) {
+        console.error(
+          "[wecom-plus] empty turn: streamEvents=%s streamText=%d sessionEventCount=%s sessionKeys=%s",
+          JSON.stringify(stream.eventTypes),
+          stream.text.length,
+          String(agent.session?.events?.length),
+          JSON.stringify(Object.keys(agent.session ?? {}))
+        );
+      }
       const reply = this.finalizeReply(id, {
         text: collected.text.trim() || stream.text.trim(),
         images: collected.images
@@ -1725,7 +1735,7 @@ var ConversationManager = class {
     const events = agent.session?.events ?? [];
     const start = events.length;
     this.activeTurns.set(id, chatTarget(message));
-    const stream = { transport, text: "", activity: void 0, lastEventAt: Date.now() };
+    const stream = { transport, text: "", activity: void 0, lastEventAt: Date.now(), eventTypes: [] };
     this.activeStreams.set(id, stream);
     try {
       agent.followup(createUserMessage({ content, source: { kind: "user" } }));
@@ -2327,7 +2337,7 @@ import {
 } from "@deepseek-ai/dsh-settings";
 
 // src/version.ts
-var PLUGIN_VERSION = "0.10.6";
+var PLUGIN_VERSION = "0.10.7";
 
 // src/settings-web.ts
 var SETTINGS_ROUTE = "/_dsh/deepseek-harness-wecom-plus/settings";

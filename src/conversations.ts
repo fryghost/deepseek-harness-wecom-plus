@@ -122,6 +122,8 @@ interface ActiveStream {
   activity: string | undefined
   /** Timestamp of the latest session event; drives the inactivity watchdog. */
   lastEventAt: number
+  /** Bounded event-type log for empty-turn diagnostics. */
+  eventTypes: string[]
 }
 
 /** Bound on remembered card registries; oldest tasks are evicted first. */
@@ -192,6 +194,7 @@ export class ConversationManager {
       // EVERY event counts as progress for the inactivity watchdog: a turn
       // that emits anything at all is healthy no matter how long it runs.
       active.lastEventAt = Date.now()
+      if (active.eventTypes.length < 50) active.eventTypes.push(event.type)
       if (event.type === 'step/start') {
         // A new step (possibly after a retried request) restarts the visible text.
         active.text = ''
@@ -580,7 +583,7 @@ export class ConversationManager {
     const events = agent.session?.events ?? []
     const start = events.length
     this.activeTurns.set(id, chatTarget(message))
-    const stream: ActiveStream = { transport, text: '', activity: undefined, lastEventAt: Date.now() }
+    const stream: ActiveStream = { transport, text: '', activity: undefined, lastEventAt: Date.now(), eventTypes: [] }
     this.activeStreams.set(id, stream)
     try {
       agent.followup(createUserMessage({ content, source: { kind: 'user' } }))
@@ -595,10 +598,17 @@ export class ConversationManager {
         throw error
       }
       const collected = await this.collectReply(agent, (agent.session?.events ?? []).slice(start))
-      // The collected events carry EVERY assistant message of the turn, while
-      // the stream text only holds the latest step (step/start resets it for
-      // retry correctness): prefer the full collected text so a multi-step
-      // turn does not lose its earlier content in the final WeCom message.
+      if (collected.text.trim() === '' && collected.images.length === 0) {
+        // Empty-turn diagnostic: the rc.2 host changed event shapes once
+        // already, so record exactly what the turn emitted before giving up.
+        console.error(
+          '[wecom-plus] empty turn: streamEvents=%s streamText=%d sessionEventCount=%s sessionKeys=%s',
+          JSON.stringify(stream.eventTypes),
+          stream.text.length,
+          String(agent.session?.events?.length),
+          JSON.stringify(Object.keys(agent.session ?? {})),
+        )
+      }
       const reply = this.finalizeReply(id, {
         text: collected.text.trim() || stream.text.trim(),
         images: collected.images,
@@ -678,7 +688,7 @@ export class ConversationManager {
     const events = agent.session?.events ?? []
     const start = events.length
     this.activeTurns.set(id, chatTarget(message))
-    const stream: ActiveStream = { transport, text: '', activity: undefined, lastEventAt: Date.now() }
+    const stream: ActiveStream = { transport, text: '', activity: undefined, lastEventAt: Date.now(), eventTypes: [] }
     this.activeStreams.set(id, stream)
     try {
       agent.followup(createUserMessage({ content, source: { kind: 'user' } }))

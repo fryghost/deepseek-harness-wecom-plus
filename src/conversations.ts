@@ -69,6 +69,26 @@ function resolveSessionPreset(
   return preset ?? undefined
 }
 
+/**
+ * The session coordinator's stable rejection signals. peer-range hosts
+ * (≥0.1.0-rc.6) throw plain errors whose name is generic — the message text
+ * is the only stable signal — so match both, message first.
+ */
+function isNotFound(error: unknown): boolean {
+  const message = error instanceof Error ? error.message : String(error)
+  const name = error instanceof Error ? error.name : ''
+  return name === 'SessionPersistenceNotFoundError' || /not found/u.test(message)
+}
+
+function isAlreadyExists(error: unknown): boolean {
+  const message = error instanceof Error ? error.message : String(error)
+  const name = error instanceof Error ? error.name : ''
+  return name === 'SessionAlreadyExistsError' || /already exists|already has a persisted log/u.test(message)
+}
+
+/** Sentinel produced by collectReply when a completed turn carried nothing. */
+const EMPTY_TURN_PLACEHOLDER = '处理完成，但没有生成可发送的内容。'
+
 /** Completed response from one WeCom-triggered Harness turn. */
 export interface ConversationReply {
   text: string
@@ -201,7 +221,12 @@ export class ConversationManager {
       // that emits anything at all is healthy no matter how long it runs.
       active.lastEventAt = Date.now()
       if (active.eventTypes.length < 50) active.eventTypes.push(event.type)
-      if (active.events.length < 500) active.events.push(event as SessionEvent)
+      // Chunk events carry only deltas already accumulated into active.text;
+      // capturing them would drown the bounded buffer and truncate the
+      // turn's tail (assistant/message, turn/end) on streaming-heavy turns.
+      if (event.type !== 'assistant/chunk' && active.events.length < 500) {
+        active.events.push(event as SessionEvent)
+      }
       if (event.type === 'step/start') {
         // A new step (possibly after a retried request) restarts the visible text.
         active.text = ''
@@ -280,11 +305,13 @@ export class ConversationManager {
       if (typeof cwd === 'string' && cwd.length > 0) this.sessionCwds.set(id, cwd)
       return 'visible'
     } catch (error) {
-      const name = error instanceof Error ? error.name : ''
-      if (name === 'SessionPersistenceNotFoundError') return 'vacant'
-      // Any other refusal still means the id is occupied: the host rejects
+      if (isNotFound(error)) return 'vacant'
+      // Any other refusal means the id is occupied — the host rejects
       // foreign formats under several error identities (format refusal,
-      // migration guard, corruption guard).
+      // migration guard, corruption guard), so this deliberately does not
+      // depend on one exact error name. A wrongly-hidden vacant id self-
+      // heals: resumeHidden clears the marker when resume reports the
+      // session missing, and the next message creates fresh.
       this.occupied.set(id, 'hidden')
       return 'hidden'
     }
@@ -484,7 +511,7 @@ export class ConversationManager {
           this.generations.set(baseId, candidate)
           return
         } catch (error) {
-          if (!(error instanceof Error && error.name === 'SessionAlreadyExistsError')) throw error
+          if (!isAlreadyExists(error)) throw error
         }
       }
       throw new Error('WeCom conversation generation is exhausted')
@@ -504,6 +531,25 @@ export class ConversationManager {
         'DeepSeek Harness conversation availability',
       )
       const start = agent.session?.events?.length ?? 0
+      // rc.2 removed agent.session.events: capture the command's events from
+      // the same feed the turn path uses, so command-triggered model output
+      // is not silently lost.
+      const capture: ActiveStream = {
+        transport: {
+          pushText() {},
+          setActivity() {},
+          sendQuestionText: async () => {},
+          sendQuestionCard: async () => {},
+          finish: async () => {},
+          fail: async () => {},
+        },
+        text: '',
+        activity: undefined,
+        lastEventAt: Date.now(),
+        eventTypes: [],
+        events: [],
+      }
+      this.activeStreams.set(id, capture)
       const controller = new AbortController()
       const timer = setTimeout(() => {
         controller.abort(new Error(`DeepSeek Harness command timed out after ${this.config.responseTimeoutMs}ms`))
@@ -516,13 +562,17 @@ export class ConversationManager {
           return { execution, response: undefined }
         }
         await withTimeout(agent.whenIdle(), this.config.responseTimeoutMs, 'DeepSeek Harness command response')
-        const events = (agent.session?.events ?? []).slice(start)
-        const response = events.some(event => event.type === 'assistant/message')
-          ? this.finalizeReply(id, await this.collectReply(agent, events))
+        const turnEvents = capture.events.some(event => event.type === 'assistant/message')
+          || agent.session?.events === undefined
+          ? capture.events
+          : (agent.session?.events ?? []).slice(start)
+        const response = turnEvents.some(event => event.type === 'assistant/message')
+          ? this.finalizeReply(id, await this.collectReply(agent, turnEvents))
           : (this.takeCards(id), undefined)
         return { execution, response }
       } finally {
         clearTimeout(timer)
+        this.activeStreams.delete(id)
         this.activeTurns.delete(id)
       }
     })
@@ -642,7 +692,7 @@ export class ConversationManager {
         text: collected.text.trim() || stream.text.trim(),
         images: collected.images,
       })
-      if (reply.text === '' || reply.text === '处理完成，但没有生成可发送的内容。') {
+      if (reply.text === '' || reply.text === EMPTY_TURN_PLACEHOLDER) {
         reply.text += this.emptyTurnNote(stream, agent)
       }
       await transport.finish(reply)
@@ -744,7 +794,7 @@ export class ConversationManager {
         text: collected.text.trim() || stream.text.trim(),
         images: collected.images,
       })
-      if (reply.text === '' || reply.text === '处理完成，但没有生成可发送的内容。') {
+      if (reply.text === '' || reply.text === EMPTY_TURN_PLACEHOLDER) {
         reply.text += this.emptyTurnNote(stream, agent)
       }
       await transport.finish(reply)
@@ -891,7 +941,7 @@ export class ConversationManager {
     } catch (error) {
       const raced = this.ctx.agents.get(sessionId)
       if (raced !== undefined) return this.borrowAgent(raced, id)
-      if (error instanceof Error && error.name === 'SessionAlreadyExistsError') {
+      if (isAlreadyExists(error)) {
         this.occupied.set(id, 'hidden')
         if (collision === 'skip') throw error
         // A conversation message hit an undiscovered foreign-format record:
@@ -933,6 +983,10 @@ export class ConversationManager {
     } catch (error) {
       const raced = this.ctx.agents.get(sessionId)
       if (raced !== undefined) return this.borrowAgent(raced, id)
+      // A resume that reports the session missing means the hidden marker
+      // was wrong (transient probe failure): clear it so a later probe can
+      // reclassify the id, and surface the error for this turn.
+      if (isNotFound(error)) this.occupied.delete(id)
       throw error
     }
   }
@@ -1391,7 +1445,7 @@ export class ConversationManager {
       return { text: `处理失败（${finalTurn.data.reason.error.code}），请稍后重试。`, images }
     }
     if (texts.length === 0 && images.length === 0) {
-      return { text: '处理完成，但没有生成可发送的内容。', images }
+      return { text: EMPTY_TURN_PLACEHOLDER, images }
     }
     return { text: texts.join('\n\n'), images }
   }

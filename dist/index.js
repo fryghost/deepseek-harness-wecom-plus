@@ -650,8 +650,11 @@ var Config = z.object({
   // Turn INACTIVITY limit: a running turn is cancelled only after this much
   // time with no session events (text deltas, tool calls, step boundaries).
   // A long turn that keeps producing events is never killed, no matter how
-  // long it runs in total.
-  responseTimeoutMs: z.number().step(1).min(1).default(3e5),
+  // long it runs in total. NOTE: since dsh 0.1.5-rc.2 no events are emitted
+  // between request/header and assistant/message, so on rc.2+ this limit
+  // effectively bounds the whole silent generation — raise it for
+  // long-running tasks.
+  responseTimeoutMs: z.number().step(1).min(1).default(9e5),
   // Streaming-bubble heartbeat: when nothing streams for this long, re-send a
   // frame with animated dots and elapsed time so the bubble visibly stays
   // alive during silent phases (long tool executions, model thinking). 0 disables.
@@ -1282,6 +1285,17 @@ function resolveSessionPreset(header, events) {
   }
   return preset ?? void 0;
 }
+function isNotFound(error) {
+  const message = error instanceof Error ? error.message : String(error);
+  const name2 = error instanceof Error ? error.name : "";
+  return name2 === "SessionPersistenceNotFoundError" || /not found/u.test(message);
+}
+function isAlreadyExists(error) {
+  const message = error instanceof Error ? error.message : String(error);
+  const name2 = error instanceof Error ? error.name : "";
+  return name2 === "SessionAlreadyExistsError" || /already exists|already has a persisted log/u.test(message);
+}
+var EMPTY_TURN_PLACEHOLDER = "\u5904\u7406\u5B8C\u6210\uFF0C\u4F46\u6CA1\u6709\u751F\u6210\u53EF\u53D1\u9001\u7684\u5185\u5BB9\u3002";
 var MAX_CARD_LABEL_TASKS = 500;
 var GENERATION_PROBE_LIMIT = 200;
 var GENERATION_VACANT_TOLERANCE = 10;
@@ -1296,7 +1310,9 @@ var ConversationManager = class {
       if (active === void 0) return;
       active.lastEventAt = Date.now();
       if (active.eventTypes.length < 50) active.eventTypes.push(event.type);
-      if (active.events.length < 500) active.events.push(event);
+      if (event.type !== "assistant/chunk" && active.events.length < 500) {
+        active.events.push(event);
+      }
       if (event.type === "step/start") {
         active.text = "";
         active.activity = void 0;
@@ -1380,8 +1396,7 @@ var ConversationManager = class {
       if (typeof cwd === "string" && cwd.length > 0) this.sessionCwds.set(id, cwd);
       return "visible";
     } catch (error) {
-      const name2 = error instanceof Error ? error.name : "";
-      if (name2 === "SessionPersistenceNotFoundError") return "vacant";
+      if (isNotFound(error)) return "vacant";
       this.occupied.set(id, "hidden");
       return "hidden";
     }
@@ -1556,7 +1571,7 @@ var ConversationManager = class {
           this.generations.set(baseId, candidate);
           return;
         } catch (error) {
-          if (!(error instanceof Error && error.name === "SessionAlreadyExistsError")) throw error;
+          if (!isAlreadyExists(error)) throw error;
         }
       }
       throw new Error("WeCom conversation generation is exhausted");
@@ -1575,6 +1590,28 @@ var ConversationManager = class {
         "DeepSeek Harness conversation availability"
       );
       const start = agent.session?.events?.length ?? 0;
+      const capture = {
+        transport: {
+          pushText() {
+          },
+          setActivity() {
+          },
+          sendQuestionText: async () => {
+          },
+          sendQuestionCard: async () => {
+          },
+          finish: async () => {
+          },
+          fail: async () => {
+          }
+        },
+        text: "",
+        activity: void 0,
+        lastEventAt: Date.now(),
+        eventTypes: [],
+        events: []
+      };
+      this.activeStreams.set(id, capture);
       const controller = new AbortController();
       const timer = setTimeout(() => {
         controller.abort(new Error(`DeepSeek Harness command timed out after ${this.config.responseTimeoutMs}ms`));
@@ -1587,11 +1624,12 @@ var ConversationManager = class {
           return { execution, response: void 0 };
         }
         await withTimeout(agent.whenIdle(), this.config.responseTimeoutMs, "DeepSeek Harness command response");
-        const events = (agent.session?.events ?? []).slice(start);
-        const response = events.some((event) => event.type === "assistant/message") ? this.finalizeReply(id, await this.collectReply(agent, events)) : (this.takeCards(id), void 0);
+        const turnEvents = capture.events.some((event) => event.type === "assistant/message") || agent.session?.events === void 0 ? capture.events : (agent.session?.events ?? []).slice(start);
+        const response = turnEvents.some((event) => event.type === "assistant/message") ? this.finalizeReply(id, await this.collectReply(agent, turnEvents)) : (this.takeCards(id), void 0);
         return { execution, response };
       } finally {
         clearTimeout(timer);
+        this.activeStreams.delete(id);
         this.activeTurns.delete(id);
       }
     });
@@ -1687,7 +1725,7 @@ var ConversationManager = class {
         text: collected.text.trim() || stream.text.trim(),
         images: collected.images
       });
-      if (reply.text === "" || reply.text === "\u5904\u7406\u5B8C\u6210\uFF0C\u4F46\u6CA1\u6709\u751F\u6210\u53EF\u53D1\u9001\u7684\u5185\u5BB9\u3002") {
+      if (reply.text === "" || reply.text === EMPTY_TURN_PLACEHOLDER) {
         reply.text += this.emptyTurnNote(stream, agent);
       }
       await transport.finish(reply);
@@ -1774,7 +1812,7 @@ var ConversationManager = class {
         text: collected.text.trim() || stream.text.trim(),
         images: collected.images
       });
-      if (reply.text === "" || reply.text === "\u5904\u7406\u5B8C\u6210\uFF0C\u4F46\u6CA1\u6709\u751F\u6210\u53EF\u53D1\u9001\u7684\u5185\u5BB9\u3002") {
+      if (reply.text === "" || reply.text === EMPTY_TURN_PLACEHOLDER) {
         reply.text += this.emptyTurnNote(stream, agent);
       }
       await transport.finish(reply);
@@ -1891,7 +1929,7 @@ var ConversationManager = class {
     } catch (error) {
       const raced = this.ctx.agents.get(sessionId);
       if (raced !== void 0) return this.borrowAgent(raced, id);
-      if (error instanceof Error && error.name === "SessionAlreadyExistsError") {
+      if (isAlreadyExists(error)) {
         this.occupied.set(id, "hidden");
         if (collision === "skip") throw error;
         return this.resumeHidden(id, sessionId, agentOptions);
@@ -1922,6 +1960,7 @@ var ConversationManager = class {
     } catch (error) {
       const raced = this.ctx.agents.get(sessionId);
       if (raced !== void 0) return this.borrowAgent(raced, id);
+      if (isNotFound(error)) this.occupied.delete(id);
       throw error;
     }
   }
@@ -2344,7 +2383,7 @@ The workspace of this conversation is ${cwd}.`;
       return { text: `\u5904\u7406\u5931\u8D25\uFF08${finalTurn.data.reason.error.code}\uFF09\uFF0C\u8BF7\u7A0D\u540E\u91CD\u8BD5\u3002`, images };
     }
     if (texts.length === 0 && images.length === 0) {
-      return { text: "\u5904\u7406\u5B8C\u6210\uFF0C\u4F46\u6CA1\u6709\u751F\u6210\u53EF\u53D1\u9001\u7684\u5185\u5BB9\u3002", images };
+      return { text: EMPTY_TURN_PLACEHOLDER, images };
     }
     return { text: texts.join("\n\n"), images };
   }
@@ -2363,7 +2402,7 @@ import {
 } from "@deepseek-ai/dsh-settings";
 
 // src/version.ts
-var PLUGIN_VERSION = "0.10.10";
+var PLUGIN_VERSION = "0.10.11";
 
 // src/settings-web.ts
 var SETTINGS_ROUTE = "/_dsh/deepseek-harness-wecom-plus/settings";
@@ -2392,7 +2431,7 @@ function normalizeWorkspaceList(value) {
   return result;
 }
 function unwrapWorkspaceInput(raw) {
-  return raw.trim().replace(/^["'“”‘’]+/u, "").replace(/["'“”‘’]+$/u, "").trim().replace(/[\\/]+$/u, "");
+  return raw.trim().replace(/^["'“”‘’]+/u, "").replace(/["'“”‘’]+$/u, "").trim().replace(/(?<![A-Za-z]:)[\\/]+$/u, "");
 }
 function workspaceDedupeKey(candidate) {
   return process.platform === "win32" ? candidate.toLowerCase() : candidate;
@@ -3153,7 +3192,7 @@ var WeComHarnessBridge = class {
     }
     const addMatch = /^add\s+(.+)$/is.exec(rest);
     if (addMatch !== null) {
-      const raw = (addMatch[1] ?? "").trim().replace(/^["'“”‘’]+/u, "").replace(/["'“”‘’]+$/u, "").trim().replace(/[\\/]+$/u, "");
+      const raw = (addMatch[1] ?? "").trim().replace(/^["'“”‘’]+/u, "").replace(/["'“”‘’]+$/u, "").trim().replace(/(?<![A-Za-z]:)[\\/]+$/u, "");
       await this.requestWorkspaceAdd(frame, message, baseId, raw);
       return;
     }

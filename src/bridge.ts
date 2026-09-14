@@ -655,13 +655,14 @@ export class WeComHarnessBridge {
     const addMatch = /^add\s+(.+)$/is.exec(rest)
     if (addMatch !== null) {
       // Explorer "copy as path" wraps values in quotes; strip straight and
-      // typographic ones plus trailing separators before anything else.
+      // typographic ones plus trailing separators before anything else. A
+      // bare drive root (“D:\”) is kept intact.
       const raw = (addMatch[1] ?? '')
         .trim()
         .replace(/^["'“”‘’]+/u, '')
         .replace(/["'“”‘’]+$/u, '')
         .trim()
-        .replace(/[\\/]+$/u, '')
+        .replace(/(?<![A-Za-z]:)[\\/]+$/u, '')
       await this.requestWorkspaceAdd(frame, message, baseId, raw)
       return
     }

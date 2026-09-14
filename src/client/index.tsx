@@ -56,7 +56,7 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 
 /** Workspace path equality for UI checks: trailing separators dropped, case-insensitive for Windows-style paths. */
 function sameWorkspacePath(a: string, b: string): boolean {
-  const normalize = (value: string): string => value.trim().replace(/[\\/]+$/u, '')
+  const normalize = (value: string): string => value.trim().replace(/(?<![A-Za-z]:)[\\/]+$/u, '')
   const left = normalize(a)
   const right = normalize(b)
   const windows = /^(?:[A-Za-z]:[\\/]|\\\\)/.test(left) || /^(?:[A-Za-z]:[\\/]|\\\\)/.test(right)
@@ -452,7 +452,7 @@ function LoadedSettings({ controller }: SettingsInjected) {
       .replace(/^["'“”‘’]+/u, '')
       .replace(/["'“”‘’]+$/u, '')
       .trim()
-      .replace(/[\\/]+$/u, '')
+      .replace(/(?<![A-Za-z]:)[\\/]+$/u, '')
     if (candidate.length === 0) return
     // Server-side is authoritative; this mirror gives instant feedback.
     if (!/^(?:[A-Za-z]:[\\/]|\\\\|\/)/u.test(candidate)) {

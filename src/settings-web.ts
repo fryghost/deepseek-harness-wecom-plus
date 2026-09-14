@@ -137,14 +137,14 @@ export function normalizeWorkspaceList(value: unknown): string[] {
   return result
 }
 
-/** Strip wrapping quotes (straight and typographic) and trailing separators. */
+/** Strip wrapping quotes (straight and typographic) and trailing separators (a bare drive root is kept intact). */
 export function unwrapWorkspaceInput(raw: string): string {
   return raw
     .trim()
     .replace(/^["'“”‘’]+/u, '')
     .replace(/["'“”‘’]+$/u, '')
     .trim()
-    .replace(/[\\/]+$/u, '')
+    .replace(/(?<![A-Za-z]:)[\\/]+$/u, '')
 }
 
 function workspaceDedupeKey(candidate: string): string {

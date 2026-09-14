@@ -31,7 +31,7 @@ var import_react = require("react");
 var import_jsx_runtime = require("react/jsx-runtime");
 var ROUTE = "/_dsh/deepseek-harness-wecom-plus/settings";
 function sameWorkspacePath(a, b) {
-  const normalize = (value) => value.trim().replace(/[\\/]+$/u, "");
+  const normalize = (value) => value.trim().replace(/(?<![A-Za-z]:)[\\/]+$/u, "");
   const left = normalize(a);
   const right = normalize(b);
   const windows = /^(?:[A-Za-z]:[\\/]|\\\\)/.test(left) || /^(?:[A-Za-z]:[\\/]|\\\\)/.test(right);
@@ -323,7 +323,7 @@ function LoadedSettings({ controller }) {
   const busy = state.action !== void 0;
   const channel = snapshot.channel;
   const addWorkspace = () => {
-    const candidate = wsDraft.trim().replace(/^["'“”‘’]+/u, "").replace(/["'“”‘’]+$/u, "").trim().replace(/[\\/]+$/u, "");
+    const candidate = wsDraft.trim().replace(/^["'“”‘’]+/u, "").replace(/["'“”‘’]+$/u, "").trim().replace(/(?<![A-Za-z]:)[\\/]+$/u, "");
     if (candidate.length === 0) return;
     if (!/^(?:[A-Za-z]:[\\/]|\\\\|\/)/u.test(candidate)) {
       setWsError("\u8BF7\u8F93\u5165\u672C\u673A\u7EDD\u5BF9\u8DEF\u5F84\uFF08\u53EF\u4ECE\u8D44\u6E90\u7BA1\u7406\u5668\u5730\u5740\u680F\u76F4\u63A5\u590D\u5236\uFF09\uFF0C\u4F8B\u5982 D:projectsdemo\u3002");

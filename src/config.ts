@@ -127,8 +127,11 @@ export const Config: z<Config> = z.object({
   // Turn INACTIVITY limit: a running turn is cancelled only after this much
   // time with no session events (text deltas, tool calls, step boundaries).
   // A long turn that keeps producing events is never killed, no matter how
-  // long it runs in total.
-  responseTimeoutMs: z.number().step(1).min(1).default(300_000),
+  // long it runs in total. NOTE: since dsh 0.1.5-rc.2 no events are emitted
+  // between request/header and assistant/message, so on rc.2+ this limit
+  // effectively bounds the whole silent generation — raise it for
+  // long-running tasks.
+  responseTimeoutMs: z.number().step(1).min(1).default(900_000),
   // Streaming-bubble heartbeat: when nothing streams for this long, re-send a
   // frame with animated dots and elapsed time so the bubble visibly stays
   // alive during silent phases (long tool executions, model thinking). 0 disables.

@@ -460,7 +460,7 @@ function LoadedSettings({ controller }: SettingsInjected) {
       setWsError('请输入本机绝对路径（可从资源管理器地址栏直接复制），例如 D:\projects\demo。')
       return
     }
-    if (sameWorkspacePath(candidate, snapshot.defaultWorkspace)
+    if (sameWorkspacePath(candidate, draft.cwd)
       || draft.workspaces.some(path => sameWorkspacePath(path, candidate))) {
       setWsError('该路径已在候选列表中。')
       return
@@ -482,7 +482,7 @@ function LoadedSettings({ controller }: SettingsInjected) {
   }
 
   const addableHostWorkspaces = (snapshot.hostWorkspaces ?? []).filter(workspace =>
-    !sameWorkspacePath(workspace.path, snapshot.defaultWorkspace)
+    !sameWorkspacePath(workspace.path, draft.cwd)
     && !draft.workspaces.some(path => sameWorkspacePath(path, workspace.path)))
 
   return (
@@ -602,28 +602,32 @@ function LoadedSettings({ controller }: SettingsInjected) {
           {draft.cwd.length > 0 ? (
             <li>
               <code>{draft.cwd}</code>
-              <span className="wc-workspace-tag">默认</span>
+              <span className="wc-workspace-actions">
+                <span className="wc-workspace-tag">默认</span>
+              </span>
             </li>
           ) : null}
           {draft.workspaces.map((path, index) => (
             <li key={path}>
               <code>{path}</code>
-              <button
-                type="button"
-                className="wc-button"
-                disabled={busy}
-                onClick={() => setDefaultWorkspace(path)}
-              >
-                设为默认
-              </button>
-              <button
-                type="button"
-                className="wc-button"
-                disabled={busy}
-                onClick={() => update('workspaces', draft.workspaces.filter((_, item) => item !== index))}
-              >
-                删除
-              </button>
+              <span className="wc-workspace-actions">
+                <button
+                  type="button"
+                  className="wc-button"
+                  disabled={busy}
+                  onClick={() => setDefaultWorkspace(path)}
+                >
+                  设为默认
+                </button>
+                <button
+                  type="button"
+                  className="wc-button"
+                  disabled={busy}
+                  onClick={() => update('workspaces', draft.workspaces.filter((_, item) => item !== index))}
+                >
+                  删除
+                </button>
+              </span>
             </li>
           ))}
         </ul>
@@ -729,9 +733,10 @@ const CSS = `
 .wc-checklist{display:grid;gap:6px;margin:0;padding:0 0 0 2px;list-style:none;font-size:var(--wc-fs-sm);color:var(--dsw-alias-fg-muted,#77736d)}
 .wc-checklist code{background:var(--dsw-alias-bg-layer-2,#f7f5f1);padding:1px 6px;border-radius:6px;font-size:var(--wc-fs-xs)}
 .wc-workspace-list{display:grid;gap:6px;margin:0;padding:0;list-style:none}
-.wc-workspace-list li{display:flex;align-items:center;justify-content:space-between;gap:10px}
-.wc-workspace-list code{background:var(--dsw-alias-bg-layer-2,#f7f5f1);padding:4px 8px;border-radius:7px;font-size:var(--wc-fs-xs);word-break:break-all}
-.wc-workspace-tag{flex:none;font-size:var(--wc-fs-xs);color:var(--dsw-alias-fg-muted,#77736d)}
+.wc-workspace-list li{display:flex;align-items:center;gap:10px}
+.wc-workspace-list code{flex:1;min-width:0;background:var(--dsw-alias-bg-layer-2,#f7f5f1);padding:4px 8px;border-radius:7px;font-size:var(--wc-fs-xs);word-break:break-all}
+.wc-workspace-actions{display:flex;align-items:center;gap:6px;flex:none}
+.wc-workspace-tag{flex:none;font-size:var(--wc-fs-xs);color:#6758d4;font-weight:700}
 .wc-workspace-pick{display:flex;flex-wrap:wrap;align-items:center;gap:8px}
 .wc-panel-note{margin:0;font-size:var(--wc-fs-xs);line-height:1.45;color:var(--dsw-alias-fg-muted,#77736d)}
 @media(max-width:720px){.wc-settings-header{display:grid}.wc-release{width:auto;min-width:0}.wc-form-grid{grid-template-columns:1fr}.wc-panel-title{flex-direction:column}.wc-release span{white-space:normal;flex-wrap:wrap}}

@@ -329,7 +329,7 @@ function LoadedSettings({ controller }) {
       setWsError("\u8BF7\u8F93\u5165\u672C\u673A\u7EDD\u5BF9\u8DEF\u5F84\uFF08\u53EF\u4ECE\u8D44\u6E90\u7BA1\u7406\u5668\u5730\u5740\u680F\u76F4\u63A5\u590D\u5236\uFF09\uFF0C\u4F8B\u5982 D:projectsdemo\u3002");
       return;
     }
-    if (sameWorkspacePath(candidate, snapshot.defaultWorkspace) || draft.workspaces.some((path) => sameWorkspacePath(path, candidate))) {
+    if (sameWorkspacePath(candidate, draft.cwd) || draft.workspaces.some((path) => sameWorkspacePath(path, candidate))) {
       setWsError("\u8BE5\u8DEF\u5F84\u5DF2\u5728\u5019\u9009\u5217\u8868\u4E2D\u3002");
       return;
     }
@@ -344,7 +344,7 @@ function LoadedSettings({ controller }) {
     update("workspaces", nextExtras);
     update("cwd", path);
   };
-  const addableHostWorkspaces = (snapshot.hostWorkspaces ?? []).filter((workspace) => !sameWorkspacePath(workspace.path, snapshot.defaultWorkspace) && !draft.workspaces.some((path) => sameWorkspacePath(path, workspace.path)));
+  const addableHostWorkspaces = (snapshot.hostWorkspaces ?? []).filter((workspace) => !sameWorkspacePath(workspace.path, draft.cwd) && !draft.workspaces.some((path) => sameWorkspacePath(path, workspace.path)));
   return /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", { className: "wc-settings", children: [
     /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("header", { className: "wc-settings-header", children: [
       /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", { children: [
@@ -447,30 +447,32 @@ function LoadedSettings({ controller }) {
       /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("ul", { className: "wc-workspace-list", children: [
         draft.cwd.length > 0 ? /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("li", { children: [
           /* @__PURE__ */ (0, import_jsx_runtime.jsx)("code", { children: draft.cwd }),
-          /* @__PURE__ */ (0, import_jsx_runtime.jsx)("span", { className: "wc-workspace-tag", children: "\u9ED8\u8BA4" })
+          /* @__PURE__ */ (0, import_jsx_runtime.jsx)("span", { className: "wc-workspace-actions", children: /* @__PURE__ */ (0, import_jsx_runtime.jsx)("span", { className: "wc-workspace-tag", children: "\u9ED8\u8BA4" }) })
         ] }) : null,
         draft.workspaces.map((path, index) => /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("li", { children: [
           /* @__PURE__ */ (0, import_jsx_runtime.jsx)("code", { children: path }),
-          /* @__PURE__ */ (0, import_jsx_runtime.jsx)(
-            "button",
-            {
-              type: "button",
-              className: "wc-button",
-              disabled: busy,
-              onClick: () => setDefaultWorkspace(path),
-              children: "\u8BBE\u4E3A\u9ED8\u8BA4"
-            }
-          ),
-          /* @__PURE__ */ (0, import_jsx_runtime.jsx)(
-            "button",
-            {
-              type: "button",
-              className: "wc-button",
-              disabled: busy,
-              onClick: () => update("workspaces", draft.workspaces.filter((_, item) => item !== index)),
-              children: "\u5220\u9664"
-            }
-          )
+          /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("span", { className: "wc-workspace-actions", children: [
+            /* @__PURE__ */ (0, import_jsx_runtime.jsx)(
+              "button",
+              {
+                type: "button",
+                className: "wc-button",
+                disabled: busy,
+                onClick: () => setDefaultWorkspace(path),
+                children: "\u8BBE\u4E3A\u9ED8\u8BA4"
+              }
+            ),
+            /* @__PURE__ */ (0, import_jsx_runtime.jsx)(
+              "button",
+              {
+                type: "button",
+                className: "wc-button",
+                disabled: busy,
+                onClick: () => update("workspaces", draft.workspaces.filter((_, item) => item !== index)),
+                children: "\u5220\u9664"
+              }
+            )
+          ] })
         ] }, path))
       ] }),
       addableHostWorkspaces.length > 0 ? /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", { className: "wc-workspace-pick", children: [
@@ -595,9 +597,10 @@ var CSS = `
 .wc-checklist{display:grid;gap:6px;margin:0;padding:0 0 0 2px;list-style:none;font-size:var(--wc-fs-sm);color:var(--dsw-alias-fg-muted,#77736d)}
 .wc-checklist code{background:var(--dsw-alias-bg-layer-2,#f7f5f1);padding:1px 6px;border-radius:6px;font-size:var(--wc-fs-xs)}
 .wc-workspace-list{display:grid;gap:6px;margin:0;padding:0;list-style:none}
-.wc-workspace-list li{display:flex;align-items:center;justify-content:space-between;gap:10px}
-.wc-workspace-list code{background:var(--dsw-alias-bg-layer-2,#f7f5f1);padding:4px 8px;border-radius:7px;font-size:var(--wc-fs-xs);word-break:break-all}
-.wc-workspace-tag{flex:none;font-size:var(--wc-fs-xs);color:var(--dsw-alias-fg-muted,#77736d)}
+.wc-workspace-list li{display:flex;align-items:center;gap:10px}
+.wc-workspace-list code{flex:1;min-width:0;background:var(--dsw-alias-bg-layer-2,#f7f5f1);padding:4px 8px;border-radius:7px;font-size:var(--wc-fs-xs);word-break:break-all}
+.wc-workspace-actions{display:flex;align-items:center;gap:6px;flex:none}
+.wc-workspace-tag{flex:none;font-size:var(--wc-fs-xs);color:#6758d4;font-weight:700}
 .wc-workspace-pick{display:flex;flex-wrap:wrap;align-items:center;gap:8px}
 .wc-panel-note{margin:0;font-size:var(--wc-fs-xs);line-height:1.45;color:var(--dsw-alias-fg-muted,#77736d)}
 @media(max-width:720px){.wc-settings-header{display:grid}.wc-release{width:auto;min-width:0}.wc-form-grid{grid-template-columns:1fr}.wc-panel-title{flex-direction:column}.wc-release span{white-space:normal;flex-wrap:wrap}}

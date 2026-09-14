@@ -336,7 +336,8 @@ declare class SeenMessageIds {
  * to the browser; a pasted Secret goes one way — through `set-key` into the
  * DSH credentials seam, the same write path first-party pages use. Saving the
  * settings section restarts the channel live through the owning plugin's
- * settings wiring.
+ * settings wiring, and a credential write restarts it through the change hook
+ * the owning plugin passes in.
  * @module deepseek-harness-wecom-plus/settings-web
  */
 
@@ -420,8 +421,24 @@ declare class WeComWebBackend {
     private readonly status;
     private readonly cli?;
     private readonly scan?;
+    /**
+     * Restart the channel after a credential write. The bridge resolves the
+     * Secret once per start, so a pasted or cleared Secret is only visible to a
+     * fresh start: without this hook saving the Secret while the channel is
+     * dormant would never bring it up (and clearing it would leave the live
+     * connection running).
+     */
+    private readonly onCredentialChange?;
     private cliProbeCache;
-    constructor(ctx: Context, status: () => WeComChannelStatus, cli?: WeComCliService | undefined, scan?: (() => unknown) | undefined);
+    constructor(ctx: Context, status: () => WeComChannelStatus, cli?: WeComCliService | undefined, scan?: (() => unknown) | undefined, 
+    /**
+     * Restart the channel after a credential write. The bridge resolves the
+     * Secret once per start, so a pasted or cleared Secret is only visible to a
+     * fresh start: without this hook saving the Secret while the channel is
+     * dormant would never bring it up (and clearing it would leave the live
+     * connection running).
+     */
+    onCredentialChange?: (() => void) | undefined);
     private credential;
     /** Build the current settings/credential/channel snapshot without secrets. */
     snapshot(): Promise<WeComSettingsSnapshot>;
@@ -437,7 +454,7 @@ declare class WeComWebBackend {
      * credentials seam enforces writability and never lets the value back out.
      */
     private setKey;
-    /** Remove the stored Secret; an absent credential is a no-op. */
+    /** Remove the stored Secret; an absent credential is a no-op, then re-read it on a fresh start. */
     private clearKey;
     /** Handle the exact Settings route. */
     handle(req: IncomingMessage, res: ServerResponse): Promise<void>;

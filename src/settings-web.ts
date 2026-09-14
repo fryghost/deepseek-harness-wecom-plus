@@ -5,7 +5,8 @@
  * to the browser; a pasted Secret goes one way — through `set-key` into the
  * DSH credentials seam, the same write path first-party pages use. Saving the
  * settings section restarts the channel live through the owning plugin's
- * settings wiring.
+ * settings wiring, and a credential write restarts it through the change hook
+ * the owning plugin passes in.
  * @module deepseek-harness-wecom-plus/settings-web
  */
 
@@ -288,6 +289,14 @@ export class WeComWebBackend {
     private readonly status: () => WeComChannelStatus,
     private readonly cli?: WeComCliService,
     private readonly scan?: () => unknown,
+    /**
+     * Restart the channel after a credential write. The bridge resolves the
+     * Secret once per start, so a pasted or cleared Secret is only visible to a
+     * fresh start: without this hook saving the Secret while the channel is
+     * dormant would never bring it up (and clearing it would leave the live
+     * connection running).
+     */
+    private readonly onCredentialChange?: () => void,
   ) {}
 
   private async credential(config: Config): Promise<{ configured: boolean; source?: string; writable: boolean }> {
@@ -384,13 +393,15 @@ export class WeComWebBackend {
   private async setKey(value: string): Promise<WeComSettingsSnapshot> {
     const config = descriptorOf(this.ctx).value as unknown as Config
     await this.ctx.credentials.set(credentialRef(config.secretRef), value)
+    this.onCredentialChange?.()
     return this.snapshot()
   }
 
-  /** Remove the stored Secret; an absent credential is a no-op. */
+  /** Remove the stored Secret; an absent credential is a no-op, then re-read it on a fresh start. */
   private async clearKey(): Promise<WeComSettingsSnapshot> {
     const config = descriptorOf(this.ctx).value as unknown as Config
     await this.ctx.credentials.unset(credentialRef(config.secretRef))
+    this.onCredentialChange?.()
     return this.snapshot()
   }
 

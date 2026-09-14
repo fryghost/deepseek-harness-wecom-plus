@@ -50,6 +50,7 @@ var WeComSettingsController = class {
   state = { status: "idle" };
   listeners = /* @__PURE__ */ new Set();
   generation = 0;
+  statusTimers = [];
   subscribe = (listener) => {
     this.listeners.add(listener);
     return () => {
@@ -77,6 +78,45 @@ var WeComSettingsController = class {
     if (this.state.status === "idle" || this.state.action === "save") return;
     void this.load();
   }
+  /**
+   * Every mutating action restarts the channel on the Host, so the channel
+   * state carried by that response is a transient snapshot: the old bridge is
+   * torn down (its conversation drain is bounded at 10s) and the new one is
+   * still authenticating. Re-read the snapshot until it settles, otherwise the
+   * page keeps showing that transient state — which is how a healthy channel
+   * ends up displayed as "未激活".
+   */
+  scheduleStatusPoll() {
+    this.clearStatusPoll();
+    for (const delay of [1e3, 3e3, 6e3, 1e4]) {
+      this.statusTimers.push(setTimeout(() => {
+        void this.refreshStatus();
+      }, delay));
+    }
+  }
+  clearStatusPoll() {
+    for (const timer of this.statusTimers) clearTimeout(timer);
+    this.statusTimers = [];
+  }
+  /** Re-read the snapshot in place: the visible message and any draft survive. */
+  async refreshStatus() {
+    if (this.state.status !== "ready" || this.state.action !== void 0) return;
+    if (this.state.snapshot?.channel.state === "connected") {
+      this.clearStatusPoll();
+      return;
+    }
+    const generation = ++this.generation;
+    try {
+      const snapshot = await apiRequest();
+      if (generation !== this.generation) return;
+      this.set({ ...this.state, snapshot });
+    } catch {
+    }
+  }
+  /** Release the polling timers with the client plugin that owns this controller. */
+  dispose() {
+    this.clearStatusPoll();
+  }
   async save(value, expectedRevision) {
     this.set({ ...this.state, action: "save", error: void 0, message: void 0 });
     try {
@@ -86,6 +126,7 @@ var WeComSettingsController = class {
         body: JSON.stringify({ action: "save", expectedRevision, value })
       });
       this.set({ status: "ready", snapshot, message: "saved", action: void 0 });
+      this.scheduleStatusPoll();
     } catch (error) {
       this.set({ ...this.state, action: void 0, error: error instanceof Error ? error.message : String(error) });
     }
@@ -102,6 +143,7 @@ var WeComSettingsController = class {
         body: JSON.stringify({ action: "set-key", value: trimmed })
       });
       this.set({ status: "ready", snapshot, message: "keySaved", action: void 0 });
+      this.scheduleStatusPoll();
     } catch (error) {
       this.set({ ...this.state, action: void 0, error: error instanceof Error ? error.message : String(error) });
     }
@@ -115,6 +157,7 @@ var WeComSettingsController = class {
         body: JSON.stringify({ action: "clear-key" })
       });
       this.set({ status: "ready", snapshot, message: "keyCleared", action: void 0 });
+      this.scheduleStatusPoll();
     } catch (error) {
       this.set({ ...this.state, action: void 0, error: error instanceof Error ? error.message : String(error) });
     }
@@ -654,6 +697,7 @@ function apply(ctx) {
     });
     return () => {
       dispose();
+      controller.dispose();
     };
   }, "deepseek-harness-wecom-plus: Settings invalidations");
   ctx.slots.inject("settings.section", () => ctx.slots.register({

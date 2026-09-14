@@ -2593,16 +2593,18 @@ function publicMessage(error) {
   return String(error);
 }
 var WeComWebBackend = class {
-  constructor(ctx, status, cli, scan) {
+  constructor(ctx, status, cli, scan, onCredentialChange) {
     this.ctx = ctx;
     this.status = status;
     this.cli = cli;
     this.scan = scan;
+    this.onCredentialChange = onCredentialChange;
   }
   ctx;
   status;
   cli;
   scan;
+  onCredentialChange;
   cliProbeCache;
   async credential(config) {
     const info = await this.ctx.credentials.describe(credentialRef(config.secretRef));
@@ -2693,12 +2695,14 @@ var WeComWebBackend = class {
   async setKey(value) {
     const config = descriptorOf(this.ctx).value;
     await this.ctx.credentials.set(credentialRef(config.secretRef), value);
+    this.onCredentialChange?.();
     return this.snapshot();
   }
-  /** Remove the stored Secret; an absent credential is a no-op. */
+  /** Remove the stored Secret; an absent credential is a no-op, then re-read it on a fresh start. */
   async clearKey() {
     const config = descriptorOf(this.ctx).value;
     await this.ctx.credentials.unset(credentialRef(config.secretRef));
+    this.onCredentialChange?.();
     return this.snapshot();
   }
   /** Handle the exact Settings route. */
@@ -4054,12 +4058,13 @@ async function apply(ctx, config) {
   let lastConfig;
   let lastCwd;
   let disposed = false;
+  let restartsInFlight = 0;
   const stopBridge = async () => {
     const previous = bridge;
     bridge = void 0;
     if (previous !== void 0) await previous.stop();
   };
-  const restartBridge = async () => {
+  const restartBridge = async (force = false) => {
     if (disposed) return;
     let resolved;
     try {
@@ -4071,31 +4076,44 @@ async function apply(ctx, config) {
     const fingerprint = JSON.stringify(resolved);
     const previousCwd = lastConfig?.cwd;
     const wasRunning = bridge !== void 0;
-    if (bridge !== void 0 && fingerprint === lastResolved) return;
-    await stopBridge();
-    lastResolved = fingerprint;
-    lastConfig = resolved;
-    const next = new WeComHarnessBridge(ctx, resolved, void 0, cli);
-    bridge = next;
+    if (!force && bridge !== void 0 && fingerprint === lastResolved) return;
+    restartsInFlight += 1;
     try {
-      await next.start();
-    } catch (error) {
-      log.error("WeCom channel failed to start and stays inactive: %s", String(error));
-      return;
-    }
-    if (wasRunning && previousCwd !== void 0 && resolved.cwd !== previousCwd) {
+      await stopBridge();
+      lastResolved = fingerprint;
+      lastConfig = resolved;
+      const next = new WeComHarnessBridge(ctx, resolved, void 0, cli);
+      bridge = next;
       try {
-        await next.retargetAll(resolved.cwd);
+        await next.start();
       } catch (error) {
-        log.error("WeCom default-workspace retarget failed: %s", String(error));
+        log.error("WeCom channel failed to start and stays inactive: %s", String(error));
+        return;
       }
+      if (wasRunning && previousCwd !== void 0 && resolved.cwd !== previousCwd) {
+        try {
+          await next.retargetAll(resolved.cwd);
+        } catch (error) {
+          log.error("WeCom default-workspace retarget failed: %s", String(error));
+        }
+      }
+    } finally {
+      restartsInFlight -= 1;
     }
   };
-  const scheduleRestart = () => {
-    restarting = (restarting ?? Promise.resolve()).then(restartBridge, restartBridge);
+  const scheduleRestart = (force = false) => {
+    restarting = (restarting ?? Promise.resolve()).then(() => restartBridge(force), () => restartBridge(force));
     restarting.catch(() => void 0);
   };
-  installWeComSettingsWeb(ctx, new WeComWebBackend(ctx, () => bridge?.status() ?? { state: "inactive" }, cli, () => bridge?.scan()));
+  const channelStatus = () => {
+    const live = bridge?.status();
+    if (live !== void 0) return live;
+    return restartsInFlight > 0 ? { state: "connecting" } : { state: "inactive" };
+  };
+  installWeComSettingsWeb(
+    ctx,
+    new WeComWebBackend(ctx, channelStatus, cli, () => bridge?.scan(), () => scheduleRestart(true))
+  );
   installSettingsSection(ctx, SETTINGS_NS, Config, Config(config), {
     setSource: (source) => {
       current = source;

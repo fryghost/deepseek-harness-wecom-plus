@@ -87,6 +87,7 @@ export class WeComSettingsController {
   private state: SettingsState = { status: 'idle' }
   private listeners = new Set<() => void>()
   private generation = 0
+  private statusTimers: Array<ReturnType<typeof setTimeout>> = []
 
   subscribe = (listener: () => void): (() => void) => {
     this.listeners.add(listener)
@@ -118,6 +119,49 @@ export class WeComSettingsController {
     void this.load()
   }
 
+  /**
+   * Every mutating action restarts the channel on the Host, so the channel
+   * state carried by that response is a transient snapshot: the old bridge is
+   * torn down (its conversation drain is bounded at 10s) and the new one is
+   * still authenticating. Re-read the snapshot until it settles, otherwise the
+   * page keeps showing that transient state — which is how a healthy channel
+   * ends up displayed as "未激活".
+   */
+  private scheduleStatusPoll(): void {
+    this.clearStatusPoll()
+    for (const delay of [1_000, 3_000, 6_000, 10_000]) {
+      this.statusTimers.push(setTimeout(() => { void this.refreshStatus() }, delay))
+    }
+  }
+
+  private clearStatusPoll(): void {
+    for (const timer of this.statusTimers) clearTimeout(timer)
+    this.statusTimers = []
+  }
+
+  /** Re-read the snapshot in place: the visible message and any draft survive. */
+  private async refreshStatus(): Promise<void> {
+    // A save in flight owns the state, and a connected channel needs no polling.
+    if (this.state.status !== 'ready' || this.state.action !== undefined) return
+    if (this.state.snapshot?.channel.state === 'connected') {
+      this.clearStatusPoll()
+      return
+    }
+    const generation = ++this.generation
+    try {
+      const snapshot = await apiRequest<Snapshot>()
+      if (generation !== this.generation) return
+      this.set({ ...this.state, snapshot })
+    } catch {
+      // Transient backend hiccup: the remaining polls re-read it.
+    }
+  }
+
+  /** Release the polling timers with the client plugin that owns this controller. */
+  dispose(): void {
+    this.clearStatusPoll()
+  }
+
   async save(value: UserSettings, expectedRevision: number): Promise<void> {
     this.set({ ...this.state, action: 'save', error: undefined, message: undefined })
     try {
@@ -130,6 +174,7 @@ export class WeComSettingsController {
       // first successful save and every later edit button is dead until the
       // dialog is remounted.
       this.set({ status: 'ready', snapshot, message: 'saved', action: undefined })
+      this.scheduleStatusPoll()
     } catch (error) {
       this.set({ ...this.state, action: undefined, error: error instanceof Error ? error.message : String(error) })
     }
@@ -147,6 +192,7 @@ export class WeComSettingsController {
         body: JSON.stringify({ action: 'set-key', value: trimmed }),
       })
       this.set({ status: 'ready', snapshot, message: 'keySaved', action: undefined })
+      this.scheduleStatusPoll()
     } catch (error) {
       this.set({ ...this.state, action: undefined, error: error instanceof Error ? error.message : String(error) })
     }
@@ -161,6 +207,7 @@ export class WeComSettingsController {
         body: JSON.stringify({ action: 'clear-key' }),
       })
       this.set({ status: 'ready', snapshot, message: 'keyCleared', action: undefined })
+      this.scheduleStatusPoll()
     } catch (error) {
       this.set({ ...this.state, action: undefined, error: error instanceof Error ? error.message : String(error) })
     }
@@ -789,7 +836,7 @@ export function apply(ctx: ClientContext): void {
 
   ctx.effect(() => {
     const dispose = ctx.on('connection/reset', () => { controller.refreshIfLoaded() })
-    return () => { dispose() }
+    return () => { dispose(); controller.dispose() }
   }, 'deepseek-harness-wecom-plus: Settings invalidations')
 
   ctx.slots.inject('settings.section', () => ctx.slots.register({

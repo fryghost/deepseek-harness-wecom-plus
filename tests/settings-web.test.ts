@@ -35,7 +35,12 @@ function mockRequest(method: string, body?: unknown): never {
   } as never
 }
 
-function backend(value: unknown = testConfig(), writable = true, registry?: { list(): Array<{ path: string; title: string }> }) {
+function backend(
+  value: unknown = testConfig(),
+  writable = true,
+  registry?: { list(): Array<{ path: string; title: string }> },
+  onCredentialChange?: () => void,
+) {
   const update = vi.fn(async () => undefined)
   const set = vi.fn(async () => undefined)
   const unset = vi.fn(async () => undefined)
@@ -53,7 +58,7 @@ function backend(value: unknown = testConfig(), writable = true, registry?: { li
       unset,
     },
   } as never
-  const instance = new WeComWebBackend(ctx, () => ({ state: 'inactive' }))
+  const instance = new WeComWebBackend(ctx, () => ({ state: 'inactive' }), undefined, undefined, onCredentialChange)
   return { instance, update, set, unset }
 }
 
@@ -143,6 +148,22 @@ describe('WeCom settings web backend', () => {
     await instance.handle(mockRequest('POST', { action: 'clear-key' }), clearRes)
     expect(unset).toHaveBeenCalledWith(credentialRef('WECOM_BOT_SECRET'))
     expect(clearCaptured.status).toBe(200)
+  })
+
+  it('asks for a channel restart after the Secret is written or cleared', async () => {
+    // The bridge resolves the Secret once per start, so a credential write is
+    // only visible to a fresh start — and it must happen after the write.
+    const order: string[] = []
+    const { instance, set, unset } = backend(undefined, true, undefined, () => { order.push('restart') })
+    set.mockImplementation(async () => { order.push('set') })
+    unset.mockImplementation(async () => { order.push('unset') })
+
+    const { res: setRes } = mockResponse()
+    await instance.handle(mockRequest('POST', { action: 'set-key', value: 'secret-1' }), setRes)
+    const { res: clearRes } = mockResponse()
+    await instance.handle(mockRequest('POST', { action: 'clear-key' }), clearRes)
+
+    expect(order).toEqual(['set', 'restart', 'unset', 'restart'])
   })
 
   it('reports conflicts and rejected writes as JSON errors', async () => {

@@ -6,7 +6,7 @@ import type { SettingsNamespace } from '@deepseek-ai/dsh-settings'
 import { WeComCliService } from './cli.js'
 import { WeComHarnessBridge } from './bridge.js'
 import { Config, type Config as WeComConfig } from './config.js'
-import { installWeComSettingsWeb, SETTINGS_NS, WeComWebBackend } from './settings-web.js'
+import { installWeComSettingsWeb, SETTINGS_NS, WeComWebBackend, type WeComChannelStatus } from './settings-web.js'
 
 // dsh 0.1.2-alpha.1 removed the installSettingsSection/settingsNamespace
 // helpers. The settings service itself never changed, so this inlines what
@@ -90,6 +90,10 @@ export async function apply(ctx: Context, config: WeComConfig): Promise<void> {
   let lastConfig: WeComConfig | undefined
   let lastCwd: string | undefined
   let disposed = false
+  // Restarts in flight. A restart tears the old bridge down before the new one
+  // exists, so the Settings page must report "connecting" for that window
+  // instead of the "inactive" it would otherwise read from a missing bridge.
+  let restartsInFlight = 0
 
   const stopBridge = async (): Promise<void> => {
     const previous = bridge
@@ -97,8 +101,12 @@ export async function apply(ctx: Context, config: WeComConfig): Promise<void> {
     if (previous !== undefined) await previous.stop()
   }
 
-  /** Rebuild the channel from the current settings source; failures stay dormant. */
-  const restartBridge = async (): Promise<void> => {
+  /**
+   * Rebuild the channel from the current settings source; failures stay dormant.
+   * A forced restart skips the duplicate-configuration short circuit, which is
+   * how a credential write reaches a bridge that already resolved the old one.
+   */
+  const restartBridge = async (force = false): Promise<void> => {
     // A restart queued before unload must not bring the channel back up.
     if (disposed) return
     let resolved: WeComConfig
@@ -113,37 +121,52 @@ export async function apply(ctx: Context, config: WeComConfig): Promise<void> {
     const fingerprint = JSON.stringify(resolved)
     const previousCwd = lastConfig?.cwd
     const wasRunning = bridge !== undefined
-    if (bridge !== undefined && fingerprint === lastResolved) return
-    await stopBridge()
-    lastResolved = fingerprint
-    lastConfig = resolved
-    const next = new WeComHarnessBridge(ctx, resolved, undefined, cli)
-    bridge = next
+    if (!force && bridge !== undefined && fingerprint === lastResolved) return
+    restartsInFlight += 1
     try {
-      await next.start()
-    } catch (error) {
-      log.error('WeCom channel failed to start and stays inactive: %s', String(error))
-      return
-    }
-    // A default-workspace change moves existing conversations too: for a
-    // single-user channel, switching the default IS switching the workspace.
-    if (wasRunning && previousCwd !== undefined && resolved.cwd !== previousCwd) {
+      await stopBridge()
+      lastResolved = fingerprint
+      lastConfig = resolved
+      const next = new WeComHarnessBridge(ctx, resolved, undefined, cli)
+      bridge = next
       try {
-        await next.retargetAll(resolved.cwd)
+        await next.start()
       } catch (error) {
-        log.error('WeCom default-workspace retarget failed: %s', String(error))
+        log.error('WeCom channel failed to start and stays inactive: %s', String(error))
+        return
       }
+      // A default-workspace change moves existing conversations too: for a
+      // single-user channel, switching the default IS switching the workspace.
+      if (wasRunning && previousCwd !== undefined && resolved.cwd !== previousCwd) {
+        try {
+          await next.retargetAll(resolved.cwd)
+        } catch (error) {
+          log.error('WeCom default-workspace retarget failed: %s', String(error))
+        }
+      }
+    } finally {
+      restartsInFlight -= 1
     }
   }
 
   /** Serialized restarts: a change mid-restart still lands on the latest config. */
-  const scheduleRestart = (): void => {
-    restarting = (restarting ?? Promise.resolve()).then(restartBridge, restartBridge)
+  const scheduleRestart = (force = false): void => {
+    restarting = (restarting ?? Promise.resolve()).then(() => restartBridge(force), () => restartBridge(force))
     restarting.catch(() => undefined)
   }
 
+  /** Channel fact for the Settings page: a restart in flight reads as connecting, never as unconfigured. */
+  const channelStatus = (): WeComChannelStatus => {
+    const live = bridge?.status()
+    if (live !== undefined) return live
+    return restartsInFlight > 0 ? { state: 'connecting' } : { state: 'inactive' }
+  }
+
   // Optional Web Settings route; mounts only while an httpServer is present.
-  installWeComSettingsWeb(ctx, new WeComWebBackend(ctx, () => bridge?.status() ?? { state: 'inactive' }, cli, () => bridge?.scan()))
+  installWeComSettingsWeb(
+    ctx,
+    new WeComWebBackend(ctx, channelStatus, cli, () => bridge?.scan(), () => scheduleRestart(true)),
+  )
 
   // The resolved composition entry doubles as the settings base layer; stored
   // sections override it, and every committed change restarts the channel.

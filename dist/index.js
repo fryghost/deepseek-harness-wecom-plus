@@ -1296,6 +1296,7 @@ var ConversationManager = class {
       if (active === void 0) return;
       active.lastEventAt = Date.now();
       if (active.eventTypes.length < 50) active.eventTypes.push(event.type);
+      if (active.events.length < 500) active.events.push(event);
       if (event.type === "step/start") {
         active.text = "";
         active.activity = void 0;
@@ -1650,7 +1651,7 @@ var ConversationManager = class {
     const events = agent.session?.events ?? [];
     const start = events.length;
     this.activeTurns.set(id, chatTarget(message));
-    const stream = { transport, text: "", activity: void 0, lastEventAt: Date.now(), eventTypes: [] };
+    const stream = { transport, text: "", activity: void 0, lastEventAt: Date.now(), eventTypes: [], events: [] };
     this.activeStreams.set(id, stream);
     try {
       agent.followup(createUserMessage({ content, source: { kind: "user" } }));
@@ -1662,7 +1663,9 @@ var ConversationManager = class {
         await transport.fail("\u751F\u6210\u8D85\u65F6\uFF08\u957F\u65F6\u95F4\u6CA1\u6709\u4EFB\u4F55\u8FDB\u5C55\uFF09\uFF0C\u5DF2\u53D6\u6D88\u672C\u6B21\u751F\u6210\uFF0C\u8BF7\u91CD\u65B0\u53D1\u9001\u3002");
         throw error;
       }
-      const collected = await this.collectReply(agent, (agent.session?.events ?? []).slice(start));
+      const fallbackEvents = (agent.session?.events ?? []).slice(start);
+      const turnEvents = stream.events.some((event) => event.type === "assistant/message") || agent.session?.events === void 0 ? stream.events : fallbackEvents;
+      const collected = await this.collectReply(agent, turnEvents);
       if (collected.text.trim() === "" && collected.images.length === 0) {
         console.error(
           "[wecom-plus] empty turn: streamEvents=%s streamText=%d sessionEventCount=%s sessionKeys=%s",
@@ -1744,7 +1747,7 @@ var ConversationManager = class {
     const events = agent.session?.events ?? [];
     const start = events.length;
     this.activeTurns.set(id, chatTarget(message));
-    const stream = { transport, text: "", activity: void 0, lastEventAt: Date.now(), eventTypes: [] };
+    const stream = { transport, text: "", activity: void 0, lastEventAt: Date.now(), eventTypes: [], events: [] };
     this.activeStreams.set(id, stream);
     try {
       agent.followup(createUserMessage({ content, source: { kind: "user" } }));
@@ -1756,7 +1759,9 @@ var ConversationManager = class {
         await transport.fail("\u751F\u6210\u8D85\u65F6\uFF08\u957F\u65F6\u95F4\u6CA1\u6709\u4EFB\u4F55\u8FDB\u5C55\uFF09\uFF0C\u5DF2\u53D6\u6D88\u672C\u6B21\u751F\u6210\uFF0C\u8BF7\u91CD\u65B0\u53D1\u9001\u3002");
         throw error;
       }
-      const collected = await this.collectReply(agent, (agent.session?.events ?? []).slice(start));
+      const fallbackEvents = (agent.session?.events ?? []).slice(start);
+      const turnEvents = stream.events.some((event) => event.type === "assistant/message") || agent.session?.events === void 0 ? stream.events : fallbackEvents;
+      const collected = await this.collectReply(agent, turnEvents);
       const reply = this.finalizeReply(id, {
         text: collected.text.trim() || stream.text.trim(),
         images: collected.images
@@ -2349,7 +2354,7 @@ import {
 } from "@deepseek-ai/dsh-settings";
 
 // src/version.ts
-var PLUGIN_VERSION = "0.10.8";
+var PLUGIN_VERSION = "0.10.9";
 
 // src/settings-web.ts
 var SETTINGS_ROUTE = "/_dsh/deepseek-harness-wecom-plus/settings";

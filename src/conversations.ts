@@ -124,6 +124,12 @@ interface ActiveStream {
   lastEventAt: number
   /** Bounded event-type log for empty-turn diagnostics. */
   eventTypes: string[]
+  /**
+   * Raw events captured from the session/event feed during this turn. The
+   * authoritative reply source since dsh 0.1.5-rc.2: agent.session.events
+   * was replaced by an eventsSnapshot projection and reads as undefined.
+   */
+  events: SessionEvent[]
 }
 
 /** Bound on remembered card registries; oldest tasks are evicted first. */
@@ -195,6 +201,7 @@ export class ConversationManager {
       // that emits anything at all is healthy no matter how long it runs.
       active.lastEventAt = Date.now()
       if (active.eventTypes.length < 50) active.eventTypes.push(event.type)
+      if (active.events.length < 500) active.events.push(event as SessionEvent)
       if (event.type === 'step/start') {
         // A new step (possibly after a retried request) restarts the visible text.
         active.text = ''
@@ -590,7 +597,7 @@ export class ConversationManager {
     const events = agent.session?.events ?? []
     const start = events.length
     this.activeTurns.set(id, chatTarget(message))
-    const stream: ActiveStream = { transport, text: '', activity: undefined, lastEventAt: Date.now(), eventTypes: [] }
+    const stream: ActiveStream = { transport, text: '', activity: undefined, lastEventAt: Date.now(), eventTypes: [], events: [] }
     this.activeStreams.set(id, stream)
     try {
       agent.followup(createUserMessage({ content, source: { kind: 'user' } }))
@@ -604,7 +611,16 @@ export class ConversationManager {
         await transport.fail('生成超时（长时间没有任何进展），已取消本次生成，请重新发送。')
         throw error
       }
-      const collected = await this.collectReply(agent, (agent.session?.events ?? []).slice(start))
+      // rc.2 removed agent.session.events (see ActiveStream.events): prefer
+      // the feed-captured events when they carry the turn's assistant
+      // output; otherwise slice the session log from the pre-turn offset
+      // (legacy hosts and borrowed Web agents).
+      const fallbackEvents = (agent.session?.events ?? []).slice(start)
+      const turnEvents = stream.events.some(event => event.type === 'assistant/message')
+        || agent.session?.events === undefined
+        ? stream.events
+        : fallbackEvents
+      const collected = await this.collectReply(agent, turnEvents)
       if (collected.text.trim() === '' && collected.images.length === 0) {
         // Empty-turn diagnostic: the rc.2 host changed event shapes once
         // already, so record exactly what the turn emitted before giving up.
@@ -698,7 +714,7 @@ export class ConversationManager {
     const events = agent.session?.events ?? []
     const start = events.length
     this.activeTurns.set(id, chatTarget(message))
-    const stream: ActiveStream = { transport, text: '', activity: undefined, lastEventAt: Date.now(), eventTypes: [] }
+    const stream: ActiveStream = { transport, text: '', activity: undefined, lastEventAt: Date.now(), eventTypes: [], events: [] }
     this.activeStreams.set(id, stream)
     try {
       agent.followup(createUserMessage({ content, source: { kind: 'user' } }))
@@ -710,7 +726,12 @@ export class ConversationManager {
         await transport.fail('生成超时（长时间没有任何进展），已取消本次生成，请重新发送。')
         throw error
       }
-      const collected = await this.collectReply(agent, (agent.session?.events ?? []).slice(start))
+      const fallbackEvents = (agent.session?.events ?? []).slice(start)
+      const turnEvents = stream.events.some(event => event.type === 'assistant/message')
+        || agent.session?.events === undefined
+        ? stream.events
+        : fallbackEvents
+      const collected = await this.collectReply(agent, turnEvents)
       // Same as processNow: the full collected text wins over the last step's
       // stream text so multi-step turns keep every assistant message.
       const reply = this.finalizeReply(id, {

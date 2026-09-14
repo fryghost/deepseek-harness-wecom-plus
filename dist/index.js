@@ -2402,7 +2402,7 @@ import {
 } from "@deepseek-ai/dsh-settings";
 
 // src/version.ts
-var PLUGIN_VERSION = "0.10.12";
+var PLUGIN_VERSION = "0.10.13";
 
 // src/settings-web.ts
 var SETTINGS_ROUTE = "/_dsh/deepseek-harness-wecom-plus/settings";
@@ -2932,6 +2932,23 @@ var WeComHarnessBridge = class {
         await this.acknowledgeWorkspaceConfirm(frame, body, pending, taskId, eventKey ?? "");
         return;
       }
+    }
+    if (eventKey === WORKSPACE_CONFIRM_KEY || eventKey === WORKSPACE_CANCEL_KEY) {
+      this.log.warn("WeCom workspace click %s arrived without a pending confirmation (channel restart or expiry)", body.msgid);
+      if (taskId !== void 0 && taskId.length > 0) {
+        const staleAck = buildClickAckCard({
+          original: void 0,
+          taskId,
+          eventKey: eventKey ?? "",
+          selectedLabel: eventKey === WORKSPACE_CONFIRM_KEY ? "\u5207\u6362" : "\u53D6\u6D88",
+          ackTitle: "\u5207\u6362\u5DE5\u4F5C\u533A",
+          ackSubtitle: "\u786E\u8BA4\u5DF2\u5931\u6548\uFF0C\u8BF7\u91CD\u65B0\u53D1\u9001 /ws"
+        });
+        await this.acknowledgeCardClick(frame, taskId, staleAck, false);
+        this.rememberConsumedTask(taskId);
+      }
+      await this.replyTo(body, void 0, "\u8BE5\u5DE5\u4F5C\u533A\u786E\u8BA4\u5DF2\u5931\u6548\uFF08\u53EF\u80FD\u56E0\u8BBE\u7F6E\u4FDD\u5B58\u91CD\u542F\u4E86\u901A\u9053\uFF0C\u6216\u8D85\u8FC7 2 \u5206\u949F\uFF09\uFF0C\u8BF7\u91CD\u65B0\u53D1\u9001 /ws \u540E\u518D\u786E\u8BA4\u3002");
+      return;
     }
     const questionCard = this.conversations.pendingQuestionCard(body);
     const questionLabel = this.conversations.pendingQuestionLabel(body);

@@ -345,6 +345,27 @@ export class WeComHarnessBridge {
         return
       }
     }
+    // A click on one of OUR workspace confirmation buttons whose pending is
+    // gone must not leak into the model as a message. The pending lives only
+    // in memory, so saving the settings (adding workspaces mid-confirmation!)
+    // hot-restarts the channel and wipes it; the 2-minute TTL does too.
+    if (eventKey === WORKSPACE_CONFIRM_KEY || eventKey === WORKSPACE_CANCEL_KEY) {
+      this.log.warn('WeCom workspace click %s arrived without a pending confirmation (channel restart or expiry)', body.msgid)
+      if (taskId !== undefined && taskId.length > 0) {
+        const staleAck = buildClickAckCard({
+          original: undefined,
+          taskId,
+          eventKey: eventKey ?? '',
+          selectedLabel: eventKey === WORKSPACE_CONFIRM_KEY ? '切换' : '取消',
+          ackTitle: '切换工作区',
+          ackSubtitle: '确认已失效，请重新发送 /ws',
+        })
+        await this.acknowledgeCardClick(frame, taskId, staleAck, false)
+        this.rememberConsumedTask(taskId)
+      }
+      await this.replyTo(body, undefined, '该工作区确认已失效（可能因设置保存重启了通道，或超过 2 分钟），请重新发送 /ws 后再确认。')
+      return
+    }
     // Read the pending-question facts BEFORE settling: settling removes the
     // pending entry, and the question card snapshot is needed to acknowledge
     // the click with a same-type in-place update.

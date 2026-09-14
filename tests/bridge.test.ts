@@ -518,6 +518,29 @@ describe('WeComHarnessBridge', () => {
     await bridge.stop()
   })
 
+  it('never leaks a stale workspace card click into the model', async () => {
+    const client = new FakeClient()
+    const created: Array<{ sessionId: string; cwd: string | undefined }> = []
+    const ctx = agentContext(undefined, options => created.push({
+      sessionId: String(options.sessionId),
+      cwd: options.meta?.cwd,
+    }))
+    const config = testConfig({ workspaces: ['/tmp/ws-a'] })
+    const bridge = new WeComHarnessBridge(ctx, config, () => client as never)
+    await bridge.start()
+
+    // A confirm-card click whose pending is gone — the channel hot-restarts
+    // on settings saves (adding workspaces mid-confirmation!) and the pending
+    // lives only in memory. It must degrade gracefully, not reach the model.
+    await client.cardEvent(cardClick('ev-stale', 'dshp-mu0sfv44-2d13c629', 'ws-confirm'))
+
+    const markdowns = client.sent.filter(entry => entry.msgtype === 'markdown').map(entry => entry.markdown?.content)
+    expect(markdowns.at(-1)).toContain('该工作区确认已失效')
+    expect(client.cardUpdates.length).toBe(1)
+    expect(created).toEqual([])
+    await bridge.stop()
+  })
+
   it('adds a workspace after confirmation and persists it through the settings service', async () => {
     const workspace = await mkdtemp(join(tmpdir(), 'dsh-wecom-ws-add-'))
     const client = new FakeClient()

@@ -354,6 +354,8 @@ interface WeComUserSettings {
     singlePolicy: Config['singlePolicy'];
     groupPolicy: Config['groupPolicy'];
     welcomeText: string;
+    /** The default workspace: first /ws candidate and where new conversations land. */
+    cwd: string;
     /** Extra workspace candidates selectable per conversation via `/ws`. */
     workspaces: string[];
 }

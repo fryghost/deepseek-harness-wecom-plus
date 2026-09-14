@@ -114,6 +114,7 @@ describe('WeCom settings web backend', () => {
         singlePolicy: 'allowlist',
         groupPolicy: 'disabled',
         welcomeText: '你好',
+        cwd: 'D:\\ws-default\\',
         workspaces: ['/tmp/ws-a', ' /tmp/ws-a ', ''],
       },
     }), res)
@@ -124,6 +125,7 @@ describe('WeCom settings web backend', () => {
       singlePolicy: 'allowlist',
       groupPolicy: 'disabled',
       welcomeText: '你好',
+      cwd: 'D:\\ws-default',
       workspaces: ['/tmp/ws-a'],
     }, 3)
     expect(captured.status).toBe(200)
@@ -151,7 +153,7 @@ describe('WeCom settings web backend', () => {
     await instance.handle(mockRequest('POST', {
       action: 'save',
       expectedRevision: 2,
-      value: { botId: 'x', cardMode: 'off', singlePolicy: 'open', groupPolicy: 'open', welcomeText: '', workspaces: [] },
+      value: { botId: 'x', cwd: 'D:\\ws', cardMode: 'off', singlePolicy: 'open', groupPolicy: 'open', welcomeText: '', workspaces: [] },
     }), res)
 
     expect(captured.status).toBe(400)
@@ -180,7 +182,7 @@ describe('WeCom settings web backend', () => {
     expect(() => parseRequest({
       action: 'save',
       expectedRevision: 0,
-      value: { botId: 'x', cardMode: 'off', singlePolicy: 'open', groupPolicy: 'open', welcomeText: '', workspaces: ['/tmp/a', 5] },
+      value: { botId: 'x', cwd: 'D:\\ws', cardMode: 'off', singlePolicy: 'open', groupPolicy: 'open', welcomeText: '', workspaces: ['/tmp/a', 5] },
     })).toThrow('array of strings')
     expect(() => parseRequest({ action: 'set-key', value: '  ' })).toThrow('non-empty')
     expect(() => parseRequest({ action: 'unknown' })).toThrow('unsupported action')
@@ -239,6 +241,7 @@ describe('WeCom settings web backend', () => {
         singlePolicy: 'open',
         groupPolicy: 'open',
         welcomeText: '',
+        cwd: 'D:\\ws-default',
         workspaces: ['relative/path'],
       },
     }), res)
@@ -246,6 +249,29 @@ describe('WeCom settings web backend', () => {
     expect(update).not.toHaveBeenCalled()
     expect(captured.status).toBe(400)
     expect(captured.body.error?.message).toContain('绝对路径')
+  })
+
+  it('rejects a save whose default workspace is not an absolute path', async () => {
+    const { instance, update } = backend()
+    const { res, captured } = mockResponse()
+
+    await instance.handle(mockRequest('POST', {
+      action: 'save',
+      expectedRevision: 3,
+      value: {
+        botId: 'test-bot',
+        cardMode: 'tool',
+        singlePolicy: 'open',
+        groupPolicy: 'open',
+        welcomeText: '',
+        cwd: 'relative/path',
+        workspaces: [],
+      },
+    }), res)
+
+    expect(update).not.toHaveBeenCalled()
+    expect(captured.status).toBe(400)
+    expect(captured.body.error?.message).toContain('默认工作区必须是本机绝对路径')
   })
 
   it('parses the five cli actions', () => {

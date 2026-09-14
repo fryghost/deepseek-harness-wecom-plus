@@ -48,6 +48,8 @@ export interface WeComUserSettings {
   singlePolicy: Config['singlePolicy']
   groupPolicy: Config['groupPolicy']
   welcomeText: string
+  /** The default workspace: first /ws candidate and where new conversations land. */
+  cwd: string
   /** Extra workspace candidates selectable per conversation via `/ws`. */
   workspaces: string[]
 }
@@ -117,7 +119,7 @@ interface JsonSuccess<T> {
 
 type JsonResponse<T> = JsonSuccess<T> | JsonError
 
-const USER_SETTINGS_KEYS = ['botId', 'cardMode', 'singlePolicy', 'groupPolicy', 'welcomeText'] as const
+const USER_SETTINGS_KEYS = ['botId', 'cwd', 'cardMode', 'singlePolicy', 'groupPolicy', 'welcomeText'] as const
 const USER_SETTINGS_ARRAY_KEYS = ['workspaces'] as const
 
 /** Trim, strip wrapping quotes and trailing separators, drop empties, dedupe (case-insensitively on Windows). */
@@ -179,6 +181,7 @@ function userSettingsOf(config: unknown): WeComUserSettings {
     singlePolicy: record.singlePolicy === 'allowlist' || record.singlePolicy === 'disabled' ? record.singlePolicy : 'open',
     groupPolicy: record.groupPolicy === 'allowlist' || record.groupPolicy === 'disabled' ? record.groupPolicy : 'open',
     welcomeText: typeof record.welcomeText === 'string' ? record.welcomeText : '',
+    cwd: typeof record.cwd === 'string' ? unwrapWorkspaceInput(record.cwd) : '',
     workspaces: normalizeWorkspaceList(record.workspaces),
   }
 }
@@ -366,7 +369,11 @@ export class WeComWebBackend {
     if (invalid.length > 0) {
       throw new Error(`工作区必须是本机绝对路径：${invalid.join('、')}`)
     }
-    await settings.update(SETTINGS_NS, { ...request.value, workspaces }, request.expectedRevision)
+    const cwd = unwrapWorkspaceInput(request.value.cwd)
+    if (!isWorkspacePath(cwd)) {
+      throw new Error(`默认工作区必须是本机绝对路径：${cwd || '（空）'}`)
+    }
+    await settings.update(SETTINGS_NS, { ...request.value, workspaces, cwd }, request.expectedRevision)
     return this.snapshot()
   }
 

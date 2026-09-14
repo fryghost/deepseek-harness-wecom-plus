@@ -436,10 +436,23 @@ function LoadedSettings({ controller }) {
     ] }),
     /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("section", { className: "wc-panel", children: [
       /* @__PURE__ */ (0, import_jsx_runtime.jsx)("div", { className: "wc-panel-title", children: /* @__PURE__ */ (0, import_jsx_runtime.jsx)("h3", { children: "\u5DE5\u4F5C\u533A" }) }),
-      /* @__PURE__ */ (0, import_jsx_runtime.jsx)("p", { className: "wc-panel-note", children: "\u5019\u9009\u5DE5\u4F5C\u533A\u5217\u8868\uFF1A\u5728\u4F01\u5FAE\u91CC\u53D1\u9001 /ws \u53EF\u67E5\u770B\u5E76\u7528\u7F16\u53F7\u5207\u6362\uFF08\u5207\u6362\u4F1A\u5F00\u542F\u65B0\u5BF9\u8BDD\uFF09\uFF0C\u53D1\u9001 /ws add \u8DEF\u5F84 \u4E5F\u53EF\u65B0\u589E\u3002 \u9ED8\u8BA4\u5DE5\u4F5C\u533A\u6765\u81EA\u914D\u7F6E cwd\uFF0C\u4E0D\u53EF\u5728\u6B64\u4FEE\u6539\u3002" }),
+      /* @__PURE__ */ (0, import_jsx_runtime.jsx)("p", { className: "wc-panel-note", children: "\u5019\u9009\u5DE5\u4F5C\u533A\u5217\u8868\uFF1A\u5728\u4F01\u5FAE\u91CC\u53D1\u9001 /ws \u53EF\u67E5\u770B\u5E76\u7528\u7F16\u53F7\u5207\u6362\uFF08\u5207\u6362\u4F1A\u5F00\u542F\u65B0\u5BF9\u8BDD\uFF09\uFF0C\u53D1\u9001 /ws add \u8DEF\u5F84 \u4E5F\u53EF\u65B0\u589E\u3002 \u9ED8\u8BA4\u5DE5\u4F5C\u533A\u662F /ws \u5217\u8868\u7684\u7B2C\u4E00\u9879\uFF0C\u4E5F\u662F\u65B0\u5BF9\u8BDD\u7684\u843D\u70B9\uFF1B\u4FEE\u6539\u53EA\u5F71\u54CD\u4E4B\u540E\u65B0\u5EFA\u7684\u5BF9\u8BDD\uFF0C\u5DF2\u6709\u4F1A\u8BDD\u4FDD\u6301\u539F\u5DE5\u4F5C\u533A\u3002" }),
       /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("ul", { className: "wc-workspace-list", children: [
         /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("li", { children: [
-          /* @__PURE__ */ (0, import_jsx_runtime.jsx)("code", { children: snapshot.defaultWorkspace }),
+          /* @__PURE__ */ (0, import_jsx_runtime.jsx)(
+            "input",
+            {
+              className: "wc-input",
+              type: "text",
+              "aria-label": "\u9ED8\u8BA4\u5DE5\u4F5C\u533A",
+              placeholder: "\u9ED8\u8BA4\u5DE5\u4F5C\u533A\u7EDD\u5BF9\u8DEF\u5F84\uFF0C\u5982 D:\\projects\\demo",
+              value: draft.cwd,
+              disabled: busy,
+              onChange: (event) => {
+                update("cwd", event.target.value);
+              }
+            }
+          ),
           /* @__PURE__ */ (0, import_jsx_runtime.jsx)("span", { className: "wc-workspace-tag", children: "\u9ED8\u8BA4" })
         ] }),
         draft.workspaces.map((path, index) => /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("li", { children: [

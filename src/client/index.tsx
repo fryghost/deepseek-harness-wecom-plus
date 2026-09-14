@@ -25,6 +25,7 @@ interface UserSettings {
   singlePolicy: 'open' | 'allowlist' | 'disabled'
   groupPolicy: 'open' | 'allowlist' | 'disabled'
   welcomeText: string
+  cwd: string
   workspaces: string[]
 }
 
@@ -584,11 +585,19 @@ function LoadedSettings({ controller }: SettingsInjected) {
         <div className="wc-panel-title"><h3>工作区</h3></div>
         <p className="wc-panel-note">
           候选工作区列表：在企微里发送 /ws 可查看并用编号切换（切换会开启新对话），发送 /ws add 路径 也可新增。
-          默认工作区来自配置 cwd，不可在此修改。
+          默认工作区是 /ws 列表的第一项，也是新对话的落点；修改只影响之后新建的对话，已有会话保持原工作区。
         </p>
         <ul className="wc-workspace-list">
           <li>
-            <code>{snapshot.defaultWorkspace}</code>
+            <input
+              className="wc-input"
+              type="text"
+              aria-label="默认工作区"
+              placeholder="默认工作区绝对路径，如 D:\projects\demo"
+              value={draft.cwd}
+              disabled={busy}
+              onChange={(event) => { update('cwd', event.target.value) }}
+            />
             <span className="wc-workspace-tag">默认</span>
           </li>
           {draft.workspaces.map((path, index) => (

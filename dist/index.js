@@ -2402,7 +2402,7 @@ import {
 } from "@deepseek-ai/dsh-settings";
 
 // src/version.ts
-var PLUGIN_VERSION = "0.10.11";
+var PLUGIN_VERSION = "0.10.12";
 
 // src/settings-web.ts
 var SETTINGS_ROUTE = "/_dsh/deepseek-harness-wecom-plus/settings";
@@ -2413,7 +2413,7 @@ if (!NAMESPACE_PATTERN.test(SETTINGS_NS)) {
 }
 var CLI_ACTIONS = ["cli-probe", "cli-install", "cli-authorize", "cli-auth-status", "cli-cancel-auth"];
 var SCAN_ACTIONS = ["session-scan"];
-var USER_SETTINGS_KEYS = ["botId", "cardMode", "singlePolicy", "groupPolicy", "welcomeText"];
+var USER_SETTINGS_KEYS = ["botId", "cwd", "cardMode", "singlePolicy", "groupPolicy", "welcomeText"];
 var USER_SETTINGS_ARRAY_KEYS = ["workspaces"];
 function normalizeWorkspaceList(value) {
   if (!Array.isArray(value)) return [];
@@ -2461,6 +2461,7 @@ function userSettingsOf(config) {
     singlePolicy: record.singlePolicy === "allowlist" || record.singlePolicy === "disabled" ? record.singlePolicy : "open",
     groupPolicy: record.groupPolicy === "allowlist" || record.groupPolicy === "disabled" ? record.groupPolicy : "open",
     welcomeText: typeof record.welcomeText === "string" ? record.welcomeText : "",
+    cwd: typeof record.cwd === "string" ? unwrapWorkspaceInput(record.cwd) : "",
     workspaces: normalizeWorkspaceList(record.workspaces)
   };
 }
@@ -2637,7 +2638,11 @@ var WeComWebBackend = class {
     if (invalid.length > 0) {
       throw new Error(`\u5DE5\u4F5C\u533A\u5FC5\u987B\u662F\u672C\u673A\u7EDD\u5BF9\u8DEF\u5F84\uFF1A${invalid.join("\u3001")}`);
     }
-    await settings.update(SETTINGS_NS, { ...request.value, workspaces }, request.expectedRevision);
+    const cwd = unwrapWorkspaceInput(request.value.cwd);
+    if (!isWorkspacePath(cwd)) {
+      throw new Error(`\u9ED8\u8BA4\u5DE5\u4F5C\u533A\u5FC5\u987B\u662F\u672C\u673A\u7EDD\u5BF9\u8DEF\u5F84\uFF1A${cwd || "\uFF08\u7A7A\uFF09"}`);
+    }
+    await settings.update(SETTINGS_NS, { ...request.value, workspaces, cwd }, request.expectedRevision);
     return this.snapshot();
   }
   /**

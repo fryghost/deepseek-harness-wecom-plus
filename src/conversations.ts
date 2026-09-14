@@ -171,6 +171,9 @@ const GENERATION_PROBE_LIMIT = 200
  */
 const GENERATION_VACANT_TOLERANCE = 10
 
+/** How long a channel restart waits for in-flight turns before detaching. */
+const DISPOSE_DRAIN_TIMEOUT_MS = 10_000
+
 /** One sent card plus the key → visible-label map used to resolve clicks. */
 interface CardRegistryEntry {
   card: TemplateCard
@@ -492,30 +495,66 @@ export class ConversationManager {
     this.cancel(message)
     await this.enqueue(baseId, async () => {
       const id = await this.currentSessionId(baseId)
-      this.pendingCards.delete(id)
-      const binding = this.bindings.get(id)
-      if (binding !== undefined) {
-        this.bindings.delete(id)
-        await binding.release()
-      }
       const nextCwd = cwd ?? await this.resolveWorkspace(id)
-      let generation = await this.ensureGeneration(baseId)
-      // Never target an occupied id: archived generations are invisible to
-      // both list() and inspect() on rc.2 and only surface as create
-      // refusals, so walk forward until a create succeeds.
-      for (let attempt = 0; attempt <= GENERATION_PROBE_LIMIT; attempt++) {
-        const candidate = generation + 1 + attempt
-        if (!Number.isSafeInteger(candidate)) throw new Error('WeCom conversation generation is exhausted')
-        try {
-          await this.getOrCreate(this.sessionIdForGeneration(baseId, candidate), nextCwd, cwd !== undefined, 'skip')
-          this.generations.set(baseId, candidate)
-          return
-        } catch (error) {
-          if (!isAlreadyExists(error)) throw error
-        }
-      }
-      throw new Error('WeCom conversation generation is exhausted')
+      await this.advanceToWorkspace(baseId, nextCwd, cwd !== undefined)
     })
+  }
+
+  /**
+   * Point every known conversation at `cwd` — the settings-page default
+   * workspace change moves existing conversations too, since switching the
+   * default IS how a user switches the workspace. Conversations already on
+   * `cwd` are left alone; per-base failures are contained.
+   */
+  async retargetAll(cwd: string): Promise<void> {
+    const bases = new Set<string>()
+    for (const id of this.occupied.keys()) {
+      const base = id.replace(/-n[1-9][0-9]*$/u, '')
+      if (base.startsWith('wecom-v2-')) bases.add(base)
+    }
+    for (const baseId of bases) {
+      await this.enqueue(baseId, async () => {
+        try {
+          const currentId = await this.currentSessionId(baseId)
+          const currentCwd = this.sessionCwds.get(currentId) ?? this.config.cwd
+          if (sameCanonicalPath(currentCwd, cwd)) return
+          this.cancelBase(baseId)
+          await this.advanceToWorkspace(baseId, cwd, true)
+        } catch (error) {
+          console.error('[wecom-plus] retarget %s failed: %s', baseId, String(error))
+        }
+      })
+    }
+  }
+
+  /**
+   * Create the next generation of one conversation in `nextCwd`, walking
+   * forward past ids that collide with archived/hidden records.
+   */
+  private async advanceToWorkspace(baseId: string, nextCwd: string, allowCreate: boolean): Promise<void> {
+    const id = await this.currentSessionId(baseId)
+    this.pendingCards.delete(id)
+    const binding = this.bindings.get(id)
+    if (binding !== undefined) {
+      this.bindings.delete(id)
+      await binding.release()
+    }
+    let generation = await this.ensureGeneration(baseId)
+    // Never target an occupied id: archived generations are invisible to
+    // both list() and inspect() on rc.2 and only surface as create
+    // refusals, so walk forward until a create succeeds.
+    for (let attempt = 0; attempt <= GENERATION_PROBE_LIMIT; attempt++) {
+      const candidate = generation + 1 + attempt
+      if (!Number.isSafeInteger(candidate)) throw new Error('WeCom conversation generation is exhausted')
+      try {
+        await this.getOrCreate(this.sessionIdForGeneration(baseId, candidate), nextCwd, allowCreate, 'skip')
+        this.generations.set(baseId, candidate)
+        return
+      } catch (error) {
+        if (!isAlreadyExists(error)) throw error
+      }
+    }
+    throw new Error('WeCom conversation generation is exhausted')
   }
 
   /** Execute a registered Harness command against the current WeCom session. */
@@ -580,7 +619,11 @@ export class ConversationManager {
 
   /** Cancel active work for one WeCom conversation. */
   cancel(message: WeComPeer): boolean {
-    const baseId = sessionIdFor(this.config.accountId, message)
+    return this.cancelBase(sessionIdFor(this.config.accountId, message))
+  }
+
+  /** Cancel active work for one base id (synchronous best effort). */
+  private cancelBase(baseId: string): boolean {
     // Synchronous by contract: check the base id and the cached generation
     // (the probe may not have run yet when a cancel arrives first).
     const candidates = [baseId, `${baseId}-n${this.generations.get(baseId) ?? 0}`]
@@ -593,9 +636,12 @@ export class ConversationManager {
     return false
   }
 
-  /** Dispose every bridge-owned Agent after queued message work settles. */
+  /** Dispose every bridge-owned Agent after queued work settles (bounded: a running turn must not block a channel restart). */
   async dispose(): Promise<void> {
-    await Promise.allSettled(this.queues.values())
+    await Promise.race([
+      Promise.allSettled(this.queues.values()),
+      new Promise(resolve => setTimeout(resolve, DISPOSE_DRAIN_TIMEOUT_MS)),
+    ])
     await Promise.allSettled([...this.bindings.values()].map(binding => binding.release()))
     this.disposeSessionEvents()
     this.questions.dispose()

@@ -1299,6 +1299,7 @@ var EMPTY_TURN_PLACEHOLDER = "\u5904\u7406\u5B8C\u6210\uFF0C\u4F46\u6CA1\u6709\u
 var MAX_CARD_LABEL_TASKS = 500;
 var GENERATION_PROBE_LIMIT = 200;
 var GENERATION_VACANT_TOLERANCE = 10;
+var DISPOSE_DRAIN_TIMEOUT_MS = 1e4;
 var ConversationManager = class {
   constructor(ctx, config, sendFile, sendQuestionCard, sendQuestionText) {
     this.ctx = ctx;
@@ -1555,27 +1556,61 @@ var ConversationManager = class {
     this.cancel(message);
     await this.enqueue(baseId, async () => {
       const id = await this.currentSessionId(baseId);
-      this.pendingCards.delete(id);
-      const binding = this.bindings.get(id);
-      if (binding !== void 0) {
-        this.bindings.delete(id);
-        await binding.release();
-      }
       const nextCwd = cwd ?? await this.resolveWorkspace(id);
-      let generation = await this.ensureGeneration(baseId);
-      for (let attempt = 0; attempt <= GENERATION_PROBE_LIMIT; attempt++) {
-        const candidate = generation + 1 + attempt;
-        if (!Number.isSafeInteger(candidate)) throw new Error("WeCom conversation generation is exhausted");
-        try {
-          await this.getOrCreate(this.sessionIdForGeneration(baseId, candidate), nextCwd, cwd !== void 0, "skip");
-          this.generations.set(baseId, candidate);
-          return;
-        } catch (error) {
-          if (!isAlreadyExists(error)) throw error;
-        }
-      }
-      throw new Error("WeCom conversation generation is exhausted");
+      await this.advanceToWorkspace(baseId, nextCwd, cwd !== void 0);
     });
+  }
+  /**
+   * Point every known conversation at `cwd` — the settings-page default
+   * workspace change moves existing conversations too, since switching the
+   * default IS how a user switches the workspace. Conversations already on
+   * `cwd` are left alone; per-base failures are contained.
+   */
+  async retargetAll(cwd) {
+    const bases = /* @__PURE__ */ new Set();
+    for (const id of this.occupied.keys()) {
+      const base = id.replace(/-n[1-9][0-9]*$/u, "");
+      if (base.startsWith("wecom-v2-")) bases.add(base);
+    }
+    for (const baseId of bases) {
+      await this.enqueue(baseId, async () => {
+        try {
+          const currentId = await this.currentSessionId(baseId);
+          const currentCwd = this.sessionCwds.get(currentId) ?? this.config.cwd;
+          if (sameCanonicalPath(currentCwd, cwd)) return;
+          this.cancelBase(baseId);
+          await this.advanceToWorkspace(baseId, cwd, true);
+        } catch (error) {
+          console.error("[wecom-plus] retarget %s failed: %s", baseId, String(error));
+        }
+      });
+    }
+  }
+  /**
+   * Create the next generation of one conversation in `nextCwd`, walking
+   * forward past ids that collide with archived/hidden records.
+   */
+  async advanceToWorkspace(baseId, nextCwd, allowCreate) {
+    const id = await this.currentSessionId(baseId);
+    this.pendingCards.delete(id);
+    const binding = this.bindings.get(id);
+    if (binding !== void 0) {
+      this.bindings.delete(id);
+      await binding.release();
+    }
+    let generation = await this.ensureGeneration(baseId);
+    for (let attempt = 0; attempt <= GENERATION_PROBE_LIMIT; attempt++) {
+      const candidate = generation + 1 + attempt;
+      if (!Number.isSafeInteger(candidate)) throw new Error("WeCom conversation generation is exhausted");
+      try {
+        await this.getOrCreate(this.sessionIdForGeneration(baseId, candidate), nextCwd, allowCreate, "skip");
+        this.generations.set(baseId, candidate);
+        return;
+      } catch (error) {
+        if (!isAlreadyExists(error)) throw error;
+      }
+    }
+    throw new Error("WeCom conversation generation is exhausted");
   }
   /** Execute a registered Harness command against the current WeCom session. */
   executeCommand(message, line) {
@@ -1636,7 +1671,10 @@ var ConversationManager = class {
   }
   /** Cancel active work for one WeCom conversation. */
   cancel(message) {
-    const baseId = sessionIdFor(this.config.accountId, message);
+    return this.cancelBase(sessionIdFor(this.config.accountId, message));
+  }
+  /** Cancel active work for one base id (synchronous best effort). */
+  cancelBase(baseId) {
     const candidates = [baseId, `${baseId}-n${this.generations.get(baseId) ?? 0}`];
     for (const id of candidates) {
       const agent = this.bindings.get(id)?.agent ?? this.ctx.agents.get(SessionId(id));
@@ -1646,9 +1684,12 @@ var ConversationManager = class {
     }
     return false;
   }
-  /** Dispose every bridge-owned Agent after queued message work settles. */
+  /** Dispose every bridge-owned Agent after queued work settles (bounded: a running turn must not block a channel restart). */
   async dispose() {
-    await Promise.allSettled(this.queues.values());
+    await Promise.race([
+      Promise.allSettled(this.queues.values()),
+      new Promise((resolve2) => setTimeout(resolve2, DISPOSE_DRAIN_TIMEOUT_MS))
+    ]);
     await Promise.allSettled([...this.bindings.values()].map((binding) => binding.release()));
     this.disposeSessionEvents();
     this.questions.dispose();
@@ -2402,7 +2443,7 @@ import {
 } from "@deepseek-ai/dsh-settings";
 
 // src/version.ts
-var PLUGIN_VERSION = "0.10.14";
+var PLUGIN_VERSION = "0.10.15";
 
 // src/settings-web.ts
 var SETTINGS_ROUTE = "/_dsh/deepseek-harness-wecom-plus/settings";
@@ -2799,6 +2840,10 @@ var WeComHarnessBridge = class {
   /** Read-only conversation-scan diagnostics for the Settings self-check. */
   scan() {
     return this.conversations.scanSummary();
+  }
+  /** Point every known conversation at a new default workspace (settings change). */
+  async retargetAll(cwd) {
+    await this.conversations.retargetAll(cwd);
   }
   /** Stay dormant without credentials, or authenticate and wait for WeCom readiness. */
   async start() {
@@ -4006,6 +4051,8 @@ async function apply(ctx, config) {
   let bridge;
   let restarting;
   let lastResolved;
+  let lastConfig;
+  let lastCwd;
   let disposed = false;
   const stopBridge = async () => {
     const previous = bridge;
@@ -4022,15 +4069,26 @@ async function apply(ctx, config) {
       return;
     }
     const fingerprint = JSON.stringify(resolved);
+    const previousCwd = lastConfig?.cwd;
+    const wasRunning = bridge !== void 0;
     if (bridge !== void 0 && fingerprint === lastResolved) return;
     await stopBridge();
     lastResolved = fingerprint;
+    lastConfig = resolved;
     const next = new WeComHarnessBridge(ctx, resolved, void 0, cli);
     bridge = next;
     try {
       await next.start();
     } catch (error) {
       log.error("WeCom channel failed to start and stays inactive: %s", String(error));
+      return;
+    }
+    if (wasRunning && previousCwd !== void 0 && resolved.cwd !== previousCwd) {
+      try {
+        await next.retargetAll(resolved.cwd);
+      } catch (error) {
+        log.error("WeCom default-workspace retarget failed: %s", String(error));
+      }
     }
   };
   const scheduleRestart = () => {

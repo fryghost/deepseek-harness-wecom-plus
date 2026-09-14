@@ -223,6 +223,8 @@ declare class WeComHarnessBridge {
     };
     /** Read-only conversation-scan diagnostics for the Settings self-check. */
     scan(): unknown;
+    /** Point every known conversation at a new default workspace (settings change). */
+    retargetAll(cwd: string): Promise<void>;
     /** Stay dormant without credentials, or authenticate and wait for WeCom readiness. */
     start(): Promise<void>;
     /** Stop ingress and drain owned conversations. */

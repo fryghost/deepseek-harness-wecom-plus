@@ -87,6 +87,8 @@ export async function apply(ctx: Context, config: WeComConfig): Promise<void> {
   let bridge: WeComHarnessBridge | undefined
   let restarting: Promise<void> | undefined
   let lastResolved: string | undefined
+  let lastConfig: WeComConfig | undefined
+  let lastCwd: string | undefined
   let disposed = false
 
   const stopBridge = async (): Promise<void> => {
@@ -109,15 +111,28 @@ export async function apply(ctx: Context, config: WeComConfig): Promise<void> {
     // Duplicate consecutive restarts (settings attach + explicit first start)
     // are no-ops while the channel already runs the exact same configuration.
     const fingerprint = JSON.stringify(resolved)
+    const previousCwd = lastConfig?.cwd
+    const wasRunning = bridge !== undefined
     if (bridge !== undefined && fingerprint === lastResolved) return
     await stopBridge()
     lastResolved = fingerprint
+    lastConfig = resolved
     const next = new WeComHarnessBridge(ctx, resolved, undefined, cli)
     bridge = next
     try {
       await next.start()
     } catch (error) {
       log.error('WeCom channel failed to start and stays inactive: %s', String(error))
+      return
+    }
+    // A default-workspace change moves existing conversations too: for a
+    // single-user channel, switching the default IS switching the workspace.
+    if (wasRunning && previousCwd !== undefined && resolved.cwd !== previousCwd) {
+      try {
+        await next.retargetAll(resolved.cwd)
+      } catch (error) {
+        log.error('WeCom default-workspace retarget failed: %s', String(error))
+      }
     }
   }
 

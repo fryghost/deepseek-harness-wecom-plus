@@ -196,6 +196,11 @@ export class WeComHarnessBridge {
     return this.conversations.scanSummary()
   }
 
+  /** Point every known conversation at a new default workspace (settings change). */
+  async retargetAll(cwd: string): Promise<void> {
+    await this.conversations.retargetAll(cwd)
+  }
+
   /** Stay dormant without credentials, or authenticate and wait for WeCom readiness. */
   async start(): Promise<void> {
     if (!this.config.botId.trim()) {

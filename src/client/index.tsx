@@ -596,7 +596,7 @@ function LoadedSettings({ controller }: SettingsInjected) {
         <div className="wc-panel-title"><h3>工作区</h3></div>
         <p className="wc-panel-note">
           候选工作区列表：在企微里发送 /ws 可查看并用编号切换（切换会开启新对话），发送 /ws add 路径 也可新增。
-          带「默认」标记的是 /ws 列表的第一项，也是新对话的落点；点「设为默认」可随时切换，保存后只影响之后新建的对话。
+          带「默认」标记的是 /ws 列表的第一项；点「设为默认」可切换默认，保存后会把现有企微对话也切到新默认（各自开新对话）。
         </p>
         <ul className="wc-workspace-list">
           {draft.cwd.length > 0 ? (

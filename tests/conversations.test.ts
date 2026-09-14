@@ -701,6 +701,24 @@ describe('ConversationManager', () => {
     return { ctx, created, resumed }
   }
 
+  it('moves every known conversation to a new default workspace on retargetAll', async () => {
+    const config = testConfig()
+    const message = textMessage('u-retarget', 'm-retarget')
+    const baseId = sessionIdFor(config.accountId, message)
+    const { ctx, created } = rotatingHarness(config, { persisted: [{ id: baseId }] })
+    const manager = new ConversationManager(ctx, config, vi.fn(async () => undefined), vi.fn(async () => undefined), vi.fn(async () => undefined))
+    await manager.initialize()
+
+    await manager.process(message, downloadPort, noopTransport())
+    expect(created).toEqual([])
+
+    // The settings-page default change retargets the existing conversation
+    // into a fresh generation in the new workspace.
+    await manager.retargetAll('/tmp/retargeted')
+    expect(created).toEqual([{ sessionId: `${baseId}-n1`, cwd: '/tmp/retargeted' }])
+    await manager.dispose()
+  })
+
   it('switches the workspace through a new generation and carries it across /new', async () => {
     const config = testConfig()
     const baseId = sessionIdFor(config.accountId, textMessage('u-ws', 'm-ws'))

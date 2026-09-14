@@ -352,11 +352,12 @@ describe('ConversationManager', () => {
     await manager.dispose()
   })
 
-  it('falls back to a migrating resume when create hits an occupied id', async () => {
+  it('skips an occupied generation when a switch create collides', async () => {
     const config = testConfig()
     const message = textMessage('u-collide', 'm-collide')
     const baseId = sessionIdFor(config.accountId, message)
     const occupiedId = `${baseId}-n11`
+    const nextId = `${baseId}-n12`
     const events: unknown[] = []
     const agent = {
       status: 'idle',
@@ -365,7 +366,7 @@ describe('ConversationManager', () => {
       followup: vi.fn(() => {
         events.push({
           type: 'assistant/message',
-          data: { message: { content: [{ type: 'text', text: 'Migrated reply' }] } },
+          data: { message: { content: [{ type: 'text', text: 'Fresh reply' }] } },
         })
         events.push({ type: 'turn/end', data: { reason: { kind: 'stop' } } })
       }),
@@ -375,18 +376,21 @@ describe('ConversationManager', () => {
     const register = vi.fn(() => vi.fn())
     const resumed: string[] = []
     const created: string[] = []
-    const resume = vi.fn(async (options: { resumeSessionId: unknown; setup?: (ctx: never) => Promise<void> }) => {
+    const resume = vi.fn(async (options: { resumeSessionId: unknown }) => {
       resumed.push(String(options.resumeSessionId))
+      return { agent, dispose: vi.fn(async () => undefined) }
+    })
+    const create = vi.fn(async (options: { sessionId: unknown; setup?: (ctx: never) => Promise<void> }) => {
+      const id = String(options.sessionId)
+      created.push(id)
+      if (id === occupiedId) {
+        throw Object.assign(new Error('session already exists'), { name: 'SessionAlreadyExistsError' })
+      }
       await options.setup?.(mockAgentCtx(section, register))
       return { agent, dispose: vi.fn(async () => undefined) }
     })
-    const create = vi.fn(async (options: { sessionId: unknown }) => {
-      created.push(String(options.sessionId))
-      throw Object.assign(new Error('session already exists'), { name: 'SessionAlreadyExistsError' })
-    })
-    // list() reports -n10, so the switch targets the next generation -n11;
-    // the collision there (NotFound everywhere on inspect) must degrade to a
-    // migrating resume.
+    // list() reports -n10, so the switch first targets -n11; the collision
+    // there must walk forward to -n12 instead of resuming the old session.
     const inspect = vi.fn(async () => {
       throw Object.assign(new Error('missing'), { name: 'SessionPersistenceNotFoundError' })
     })
@@ -405,8 +409,8 @@ describe('ConversationManager', () => {
     await manager.initialize()
 
     await manager.reset(message, '/tmp/ws-collide')
-    expect(created).toEqual([occupiedId])
-    expect(resumed).toEqual([occupiedId])
+    expect(created).toEqual([occupiedId, nextId])
+    expect(resumed).toEqual([])
     await manager.dispose()
   })
 

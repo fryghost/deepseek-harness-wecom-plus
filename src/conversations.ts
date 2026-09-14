@@ -473,15 +473,21 @@ export class ConversationManager {
       }
       const nextCwd = cwd ?? await this.resolveWorkspace(id)
       let generation = await this.ensureGeneration(baseId)
-      // Never target an occupied id: the probe window can miss occupancy
-      // that only surfaces as a create refusal, and getOrCreate's fallback
-      // handles that case.
-      while (this.occupied.has(`${baseId}-n${generation + 1}`)) generation++
-      if (!Number.isSafeInteger(generation + 1)) throw new Error('WeCom conversation generation is exhausted')
-      this.generations.set(baseId, generation + 1)
-      // An explicit cwd is a deliberate /ws switch: the new generation may
-      // CREATE its workspace group; a plain /new only attaches when one exists.
-      await this.getOrCreate(await this.currentSessionId(baseId), nextCwd, cwd !== undefined)
+      // Never target an occupied id: archived generations are invisible to
+      // both list() and inspect() on rc.2 and only surface as create
+      // refusals, so walk forward until a create succeeds.
+      for (let attempt = 0; attempt <= GENERATION_PROBE_LIMIT; attempt++) {
+        const candidate = generation + 1 + attempt
+        if (!Number.isSafeInteger(candidate)) throw new Error('WeCom conversation generation is exhausted')
+        try {
+          await this.getOrCreate(this.sessionIdForGeneration(baseId, candidate), nextCwd, cwd !== undefined, 'skip')
+          this.generations.set(baseId, candidate)
+          return
+        } catch (error) {
+          if (!(error instanceof Error && error.name === 'SessionAlreadyExistsError')) throw error
+        }
+      }
+      throw new Error('WeCom conversation generation is exhausted')
     })
   }
 
@@ -801,7 +807,12 @@ export class ConversationManager {
     return this.config.cwd
   }
 
-  private async getOrCreate(id: string, cwd?: string, allowCreate = false): Promise<ConversationAgentBinding> {
+  private async getOrCreate(
+    id: string,
+    cwd?: string,
+    allowCreate = false,
+    collision: 'resume' | 'skip' = 'resume',
+  ): Promise<ConversationAgentBinding> {
     const sessionId = SessionId(id)
     const existing = this.bindings.get(id)
     if (existing !== undefined && this.ctx.agents.get(sessionId) === existing.agent) return existing
@@ -812,14 +823,19 @@ export class ConversationManager {
     const pending = this.creations.get(id)
     if (pending !== undefined) return pending
 
-    const creation = this.createOrResume(id, cwd, allowCreate).finally(() => this.creations.delete(id))
+    const creation = this.createOrResume(id, cwd, allowCreate, collision).finally(() => this.creations.delete(id))
     this.creations.set(id, creation)
     const binding = await creation
     this.bindings.set(id, binding)
     return binding
   }
 
-  private async createOrResume(id: string, cwd?: string, allowCreate = false): Promise<ConversationAgentBinding> {
+  private async createOrResume(
+    id: string,
+    cwd?: string,
+    allowCreate = false,
+    collision: 'resume' | 'skip' = 'resume',
+  ): Promise<ConversationAgentBinding> {
     const sessionId = SessionId(id)
     const live = this.ctx.agents.get(sessionId)
     if (live !== undefined) return this.borrowAgent(live, id)
@@ -876,10 +892,10 @@ export class ConversationManager {
       const raced = this.ctx.agents.get(sessionId)
       if (raced !== undefined) return this.borrowAgent(raced, id)
       if (error instanceof Error && error.name === 'SessionAlreadyExistsError') {
-        // An undiscovered foreign-format record owns this id (the probe
-        // window or error identity missed it): retry as a resume — its
-        // first write open migrates and publishes it.
         this.occupied.set(id, 'hidden')
+        if (collision === 'skip') throw error
+        // A conversation message hit an undiscovered foreign-format record:
+        // retry as a resume — its first write open migrates and publishes it.
         return this.resumeHidden(id, sessionId, agentOptions)
       }
       throw error

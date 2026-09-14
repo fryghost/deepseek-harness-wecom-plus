@@ -1548,10 +1548,18 @@ var ConversationManager = class {
       }
       const nextCwd = cwd ?? await this.resolveWorkspace(id);
       let generation = await this.ensureGeneration(baseId);
-      while (this.occupied.has(`${baseId}-n${generation + 1}`)) generation++;
-      if (!Number.isSafeInteger(generation + 1)) throw new Error("WeCom conversation generation is exhausted");
-      this.generations.set(baseId, generation + 1);
-      await this.getOrCreate(await this.currentSessionId(baseId), nextCwd, cwd !== void 0);
+      for (let attempt = 0; attempt <= GENERATION_PROBE_LIMIT; attempt++) {
+        const candidate = generation + 1 + attempt;
+        if (!Number.isSafeInteger(candidate)) throw new Error("WeCom conversation generation is exhausted");
+        try {
+          await this.getOrCreate(this.sessionIdForGeneration(baseId, candidate), nextCwd, cwd !== void 0, "skip");
+          this.generations.set(baseId, candidate);
+          return;
+        } catch (error) {
+          if (!(error instanceof Error && error.name === "SessionAlreadyExistsError")) throw error;
+        }
+      }
+      throw new Error("WeCom conversation generation is exhausted");
     });
   }
   /** Execute a registered Harness command against the current WeCom session. */
@@ -1822,7 +1830,7 @@ var ConversationManager = class {
     }
     return this.config.cwd;
   }
-  async getOrCreate(id, cwd, allowCreate = false) {
+  async getOrCreate(id, cwd, allowCreate = false, collision = "resume") {
     const sessionId = SessionId(id);
     const existing = this.bindings.get(id);
     if (existing !== void 0 && this.ctx.agents.get(sessionId) === existing.agent) return existing;
@@ -1832,13 +1840,13 @@ var ConversationManager = class {
     }
     const pending = this.creations.get(id);
     if (pending !== void 0) return pending;
-    const creation = this.createOrResume(id, cwd, allowCreate).finally(() => this.creations.delete(id));
+    const creation = this.createOrResume(id, cwd, allowCreate, collision).finally(() => this.creations.delete(id));
     this.creations.set(id, creation);
     const binding = await creation;
     this.bindings.set(id, binding);
     return binding;
   }
-  async createOrResume(id, cwd, allowCreate = false) {
+  async createOrResume(id, cwd, allowCreate = false, collision = "resume") {
     const sessionId = SessionId(id);
     const live = this.ctx.agents.get(sessionId);
     if (live !== void 0) return this.borrowAgent(live, id);
@@ -1885,6 +1893,7 @@ var ConversationManager = class {
       if (raced !== void 0) return this.borrowAgent(raced, id);
       if (error instanceof Error && error.name === "SessionAlreadyExistsError") {
         this.occupied.set(id, "hidden");
+        if (collision === "skip") throw error;
         return this.resumeHidden(id, sessionId, agentOptions);
       }
       throw error;
@@ -2354,7 +2363,7 @@ import {
 } from "@deepseek-ai/dsh-settings";
 
 // src/version.ts
-var PLUGIN_VERSION = "0.10.9";
+var PLUGIN_VERSION = "0.10.10";
 
 // src/settings-web.ts
 var SETTINGS_ROUTE = "/_dsh/deepseek-harness-wecom-plus/settings";

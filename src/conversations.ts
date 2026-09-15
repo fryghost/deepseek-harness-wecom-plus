@@ -1,19 +1,3 @@
-import { realpath } from 'node:fs/promises'
-import type { Context } from '@deepseek-ai/cordis'
-import type { Agent, AgentHandle } from '@deepseek-ai/dsh-agent'
-import type {} from '@deepseek-ai/dsh-agent-default-model'
-import type {} from '@deepseek-ai/dsh-agent-presets'
-import type { CommandExecution } from '@deepseek-ai/dsh-commands'
-import { createUserMessage } from '@deepseek-ai/dsh-llm'
-import { SessionId, type SessionEvent } from '@deepseek-ai/dsh-session'
-import type {} from '@deepseek-ai/dsh-session-persistence'
-import type {} from '@deepseek-ai/dsh-system-prompt'
-import { defineTool } from '@deepseek-ai/dsh-tools'
-import {
-  UserQuestionError,
-  UserQuestionService,
-  type AskUserQuestionRequest,
-} from '@deepseek-ai/dsh-user-questions'
 import type {
   BaseMessage,
   EventMessageWith,
@@ -22,71 +6,34 @@ import type {
 } from '@wecom/aibot-node-sdk'
 import { buildTemplateCard, type CardInput } from './card.js'
 import type { Config } from './config.js'
+import { createInProcessAdapter } from './harness/dsh-rc2.js'
+import {
+  harnessSessionId,
+  type HarnessAgentScope,
+  type HarnessCommandExecution,
+  type HarnessPort,
+  type HarnessPromptSection,
+  type HarnessQuestionRequest,
+  type HarnessRuntimePort,
+  type HarnessScanSummary,
+  type HarnessSession,
+  type HarnessToolDefinition,
+  type HarnessTurnOutput,
+  type HarnessTurnPort,
+} from './harness/port.js'
 import { inboundContent, type WeComDownloadPort } from './inbound.js'
 import { resolveOutboundFile, type OutboundFile } from './outbound-file.js'
 import { WeComQuestionBridge, cardEventFacts, type QuestionCardSender, type QuestionTextSender } from './questions.js'
 import { chatTarget, sessionIdFor, withTimeout, type WeComPeer } from './util.js'
 
-/**
- * Structural surface of the host workspace registry (dsh-workspace) the
- * plugin aligns WeCom sessions with. Looked up optionally at call time; when
- * the service is absent the alignment silently no-ops.
- */
-interface WorkspaceRegistryLike {
-  list(): Array<{ path: string; attachSession(sessionId: SessionId): Promise<void> }>
-  create(path: string, title?: string): Promise<{ path: string; attachSession(sessionId: SessionId): Promise<void> }>
-}
+// Session-preset folding, the host's rejection-signal classification, session
+// generation discovery, and workspace resolution all live behind the harness
+// seam now: see ./harness/dsh-rc2.ts. They are the parts that had to change on
+// every host release (dsh 0.1.2-alpha.x deleted the preset projection helper;
+// rc.2 turned list() into a lazy index; session-v3 logs surface as refusals),
+// so they are deliberately not in product code any more.
 
-/** Registry paths are realpath-canonicalized by the host; mirror that for comparisons. */
-async function canonicalWorkspacePath(path: string): Promise<string> {
-  try {
-    return await realpath(path)
-  } catch {
-    return path
-  }
-}
-
-function sameCanonicalPath(a: string, b: string): boolean {
-  return process.platform === 'win32' ? a.toLowerCase() === b.toLowerCase() : a === b
-}
-
-/**
- * dsh 0.1.2-alpha.x turned session preset resolution into a session
- * projection (agentPresetProjectionDefinition). The fold is trivial and
- * stable: the header seeds it, agent-preset/selected events advance it.
- * Inlined here so the plugin stops importing a deleted helper.
- */
-function resolveSessionPreset(
-  header: { agentPreset?: string },
-  events: readonly SessionEvent[],
-): string | undefined {
-  let preset = header.agentPreset
-  for (const event of events) {
-    if (event.type === 'agent-preset/selected') {
-      preset = (event.data as { agentPreset: string }).agentPreset
-    }
-  }
-  return preset ?? undefined
-}
-
-/**
- * The session coordinator's stable rejection signals. peer-range hosts
- * (≥0.1.0-rc.6) throw plain errors whose name is generic — the message text
- * is the only stable signal — so match both, message first.
- */
-function isNotFound(error: unknown): boolean {
-  const message = error instanceof Error ? error.message : String(error)
-  const name = error instanceof Error ? error.name : ''
-  return name === 'SessionPersistenceNotFoundError' || /not found/u.test(message)
-}
-
-function isAlreadyExists(error: unknown): boolean {
-  const message = error instanceof Error ? error.message : String(error)
-  const name = error instanceof Error ? error.name : ''
-  return name === 'SessionAlreadyExistsError' || /already exists|already has a persisted log/u.test(message)
-}
-
-/** Sentinel produced by collectReply when a completed turn carried nothing. */
+/** Sentinel produced by replyFromOutput when a completed turn carried nothing. */
 const EMPTY_TURN_PLACEHOLDER = '处理完成，但没有生成可发送的内容。'
 
 /** Completed response from one WeCom-triggered Harness turn. */
@@ -99,7 +46,7 @@ export interface ConversationReply {
 
 /** Direct command outcome plus any model reply triggered by that command. */
 export interface ConversationCommandReply {
-  execution: CommandExecution | undefined
+  execution: HarnessCommandExecution | undefined
   response: ConversationReply | undefined
 }
 
@@ -142,34 +89,10 @@ interface ActiveStream {
   activity: string | undefined
   /** Timestamp of the latest session event; drives the inactivity watchdog. */
   lastEventAt: number
-  /** Bounded event-type log for empty-turn diagnostics. */
-  eventTypes: string[]
-  /**
-   * Raw events captured from the session/event feed during this turn. The
-   * authoritative reply source since dsh 0.1.5-rc.2: agent.session.events
-   * was replaced by an eventsSnapshot projection and reads as undefined.
-   */
-  events: SessionEvent[]
 }
 
 /** Bound on remembered card registries; oldest tasks are evicted first. */
 const MAX_CARD_LABEL_TASKS = 500
-
-/**
- * The host's sessionPersistence.list() silently skips logs stored in a
- * foreign format (SessionFormatUnsupportedError) — e.g. legacy sessions kept
- * on disk after a host session-log upgrade. Generation discovery therefore
- * probes this many generations above the newest listed one with inspect();
- * a format refusal marks the generation occupied.
- */
-const GENERATION_PROBE_LIMIT = 200
-
-/**
- * Archiving punches holes in the generation sequence (e.g. n2/n3 removed
- * while n4..n11 exist), so a probe tolerates this many consecutive vacant
- * ids before concluding the lineage has ended.
- */
-const GENERATION_VACANT_TOLERANCE = 10
 
 /** How long a channel restart waits for in-flight turns before detaching. */
 const DISPOSE_DRAIN_TIMEOUT_MS = 10_000
@@ -180,206 +103,81 @@ interface CardRegistryEntry {
   labels: Map<string, string>
 }
 
-/** One live agent plus only the lifecycle capability this manager owns. */
-interface ConversationAgentBinding {
-  agent: Agent
-  release(): Promise<void>
-}
-
 /** Owns deterministic WeCom conversation agents and their persisted resume lifecycle. */
 export class ConversationManager {
-  private readonly bindings = new Map<string, ConversationAgentBinding>()
-  private readonly creations = new Map<string, Promise<ConversationAgentBinding>>()
   private readonly queues = new Map<string, Promise<unknown>>()
   private readonly activeTurns = new Map<string, string>()
   private readonly activeStreams = new Map<string, ActiveStream>()
   private readonly pendingCards = new Map<string, TemplateCard[]>()
   private readonly cardRegistry = new Map<string, CardRegistryEntry>()
   private readonly questions: WeComQuestionBridge
-  /** Resolved current generation per WeCom base id (0 = the base session itself). */
-  private readonly generations = new Map<string, number>()
-  /** Durable per-session workspace: session meta.cwd is immutable, so switching goes through a new generation. */
-  private readonly sessionCwds = new Map<string, string>()
-  /** Occupied session ids found by probing: 'visible' (listable) or 'hidden' (foreign format; resume migrates it). */
-  private readonly occupied = new Map<string, 'visible' | 'hidden'>()
-  /** In-flight per-base generation probes. */
-  private readonly generationProbes = new Map<string, Promise<number>>()
-  /** Diagnostics: size of the last host list() snapshot (advisory only, see initialize). */
-  private lastListedCount = 0
+  /**
+   * Harness seam. Owns session discovery, generation state, host error
+   * identities, and session-preset folding — the surfaces that change on host
+   * releases. Nothing below this line probes the host directly.
+   */
+  /**
+   * Harness seam. Declared only as port interfaces, never as a concrete
+   * adapter: this module is product code and must not know which transport —
+   * in-process today, ACP tomorrow — is behind them.
+   */
+  private readonly harness: HarnessPort & HarnessTurnPort & HarnessRuntimePort
   private readonly disposeSessionEvents: () => void
 
   constructor(
-    private readonly ctx: Context,
+    host: unknown,
     private readonly config: Config,
     private readonly sendFile: ConversationFileSender,
     sendQuestionCard: QuestionCardSender,
     sendQuestionText: QuestionTextSender,
   ) {
+    this.harness = createInProcessAdapter(host, {
+      defaultCwd: config.cwd,
+      ...(config.agentPreset === undefined ? {} : { agentPreset: config.agentPreset }),
+    })
     this.questions = new WeComQuestionBridge(config, sendQuestionCard, sendQuestionText)
-    // One global feed: route the model's chunk stream to the turn that owns it.
-    this.disposeSessionEvents = ctx.on('session/event', (session, event) => {
-      const active = this.activeStreams.get(String(session.id))
-      if (active === undefined) return
-      // EVERY event counts as progress for the inactivity watchdog: a turn
-      // that emits anything at all is healthy no matter how long it runs.
-      active.lastEventAt = Date.now()
-      if (active.eventTypes.length < 50) active.eventTypes.push(event.type)
-      // Chunk events carry only deltas already accumulated into active.text;
-      // capturing them would drown the bounded buffer and truncate the
-      // turn's tail (assistant/message, turn/end) on streaming-heavy turns.
-      if (event.type !== 'assistant/chunk' && active.events.length < 500) {
-        active.events.push(event as SessionEvent)
-      }
-      if (event.type === 'step/start') {
-        // A new step (possibly after a retried request) restarts the visible text.
-        active.text = ''
-        active.activity = undefined
-        return
-      }
-      if (event.type !== 'assistant/chunk') return
-      const chunk = event.data.chunk
-      if (chunk.type === 'text-delta') {
-        active.activity = undefined
-        active.text += chunk.text
-        active.transport.pushText(chunk.text)
-      } else if (chunk.type === 'tool-call-delta' && chunk.name !== undefined) {
-        active.transport.setActivity(`正在执行工具 \`${chunk.name}\`…`)
-      }
+    // One global feed, normalized by the adapter. `activity` fires for every
+    // host event — a turn that emits anything at all is healthy no matter how
+    // long it runs — while `event` carries only the subset this channel acts
+    // on. Raw event shapes and types never reach this layer.
+    this.disposeSessionEvents = this.harness.subscribeTurns({
+      activity: (sessionId) => {
+        const active = this.activeStreams.get(sessionId)
+        if (active !== undefined) active.lastEventAt = Date.now()
+      },
+      event: (sessionId, event) => {
+        const active = this.activeStreams.get(sessionId)
+        if (active === undefined) return
+        if (event.type === 'step-start') {
+          // A new step (possibly after a retried request) restarts the visible text.
+          active.text = ''
+          active.activity = undefined
+          return
+        }
+        if (event.type === 'text-delta') {
+          active.activity = undefined
+          active.text += event.text
+          active.transport.pushText(event.text)
+          return
+        }
+        if (event.type === 'tool-start') {
+          active.transport.setActivity(`正在执行工具 \`${event.name}\`…`)
+        }
+      },
     })
   }
 
   /**
-   * Advisory only since v0.10.5: the host's list() no longer guarantees a
-   * full disk scan (dsh 0.1.5-rc.2 serves a lazily-populated index), and it
-   * has always skipped foreign-format logs — so the generation truth comes
-   * from per-id inspect() probing at conversation time (ensureGeneration),
-   * never from this snapshot.
+   * Advisory startup scan. The adapter owns the host call, its tolerance for
+   * a lazily-populated index, and its diagnostics.
    */
   async initialize(): Promise<void> {
-    try {
-      const headers = await this.ctx.sessionPersistence.list()
-      this.lastListedCount = headers.length
-    } catch (error) {
-      this.lastListedCount = -1
-      console.error('[wecom-plus] advisory session list failed: %s', String(error))
-    }
-    console.error(
-      '[wecom-plus] session scan: listed=%d (advisory; generations resolve per conversation via inspect)',
-      this.lastListedCount,
-    )
+    await this.harness.initialize()
   }
 
   /** What the generation scan currently sees; surfaced by the session-scan action. */
-  scanSummary(): {
-    listedCount: number
-    occupied: Record<string, 'visible' | 'hidden'>
-    generations: Record<string, number>
-  } {
-    return {
-      listedCount: this.lastListedCount,
-      occupied: Object.fromEntries(this.occupied),
-      generations: Object.fromEntries(this.generations),
-    }
-  }
-
-  /** Inspect one candidate id; a missing inspect capability counts as not-found. */
-  private async inspectCandidate(id: string): Promise<{
-    meta: { cwd?: unknown; agentPreset?: string }
-    events?: readonly SessionEvent[]
-  }> {
-    const persistence = this.ctx.sessionPersistence as unknown as {
-      inspect?: (id: SessionId) => Promise<{
-        meta: { cwd?: unknown; agentPreset?: string }
-        events?: readonly SessionEvent[]
-      }>
-    }
-    if (typeof persistence?.inspect !== 'function') {
-      throw Object.assign(new Error('session persistence cannot inspect'), { name: 'SessionPersistenceNotFoundError' })
-    }
-    return persistence.inspect(SessionId(id))
-  }
-
-  /** Classify one candidate id: 'visible', 'hidden' (occupied; a resume migrates it), or 'vacant'. */
-  private async probeOne(id: string): Promise<'visible' | 'hidden' | 'vacant'> {
-    try {
-      const inspected = await this.inspectCandidate(id)
-      this.occupied.set(id, 'visible')
-      const cwd = inspected.meta?.cwd
-      if (typeof cwd === 'string' && cwd.length > 0) this.sessionCwds.set(id, cwd)
-      return 'visible'
-    } catch (error) {
-      if (isNotFound(error)) return 'vacant'
-      // Any other refusal means the id is occupied — the host rejects
-      // foreign formats under several error identities (format refusal,
-      // migration guard, corruption guard), so this deliberately does not
-      // depend on one exact error name. A wrongly-hidden vacant id self-
-      // heals: resumeHidden clears the marker when resume reports the
-      // session missing, and the next message creates fresh.
-      this.occupied.set(id, 'hidden')
-      return 'hidden'
-    }
-  }
-
-  private async probeGenerations(baseId: string): Promise<number> {
-    let highest = 0
-    let vacantRun = 0
-    // Generation 0 is the base session itself; it may be vacant while -nK
-    // records exist, so its absence does not end the probe.
-    await this.probeOne(baseId)
-    for (let generation = 1; generation <= GENERATION_PROBE_LIMIT; generation++) {
-      const state = await this.probeOne(`${baseId}-n${generation}`)
-      if (state === 'vacant') {
-        vacantRun++
-        if (vacantRun >= GENERATION_VACANT_TOLERANCE) break
-        continue
-      }
-      vacantRun = 0
-      highest = generation
-    }
-    return highest
-  }
-
-  /**
-   * Resolve the conversation's current generation by probing the host per
-   * id. inspect() reads the disk directly, so it stays authoritative no
-   * matter what list() indexes or skips.
-   */
-  private async ensureGeneration(baseId: string): Promise<number> {
-    const cached = this.generations.get(baseId)
-    if (cached !== undefined) return cached
-    const pending = this.generationProbes.get(baseId)
-    if (pending !== undefined) return pending
-    const probe = this.probeGenerations(baseId)
-      .then(probed => Promise.all([probed, this.listedGeneration(baseId)]))
-      .then(([probed, listed]) => Math.max(probed, listed))
-      .finally(() => this.generationProbes.delete(baseId))
-    this.generationProbes.set(baseId, probe)
-    const generation = await probe
-    this.generations.set(baseId, generation)
-    return generation
-  }
-
-  /**
-   * Cross-check against the host's list(). Advisory only (rc.2 serves a
-   * lazily-populated index), but once warm it catches ids the probe window
-   * or a refusal identity might have missed.
-   */
-  private async listedGeneration(baseId: string): Promise<number> {
-    try {
-      const headers = await this.ctx.sessionPersistence.list()
-      this.lastListedCount = headers.length
-      const prefix = `${baseId}-n`
-      let max = 0
-      for (const header of headers) {
-        const id = String(header.id)
-        if (!id.startsWith(prefix)) continue
-        const candidate = Number(id.slice(prefix.length))
-        if (Number.isSafeInteger(candidate)) max = Math.max(max, candidate)
-      }
-      return max
-    } catch {
-      return 0
-    }
+  scanSummary(): HarnessScanSummary {
+    return this.harness.scanSummary()
   }
 
   /** Process one inbound message after earlier work in the same WeCom conversation. */
@@ -495,7 +293,7 @@ export class ConversationManager {
     this.cancel(message)
     await this.enqueue(baseId, async () => {
       const id = await this.currentSessionId(baseId)
-      const nextCwd = cwd ?? await this.resolveWorkspace(id)
+      const nextCwd = cwd ?? await this.harness.workspaceOf(harnessSessionId(id))
       await this.advanceToWorkspace(baseId, nextCwd, cwd !== undefined)
     })
   }
@@ -508,7 +306,7 @@ export class ConversationManager {
    */
   async retargetAll(cwd: string): Promise<void> {
     const bases = new Set<string>()
-    for (const id of this.occupied.keys()) {
+    for (const id of this.harness.occupiedIds()) {
       const base = id.replace(/-n[1-9][0-9]*$/u, '')
       if (base.startsWith('wecom-v2-')) bases.add(base)
     }
@@ -516,8 +314,8 @@ export class ConversationManager {
       await this.enqueue(baseId, async () => {
         try {
           const currentId = await this.currentSessionId(baseId)
-          const currentCwd = this.sessionCwds.get(currentId) ?? this.config.cwd
-          if (sameCanonicalPath(currentCwd, cwd)) return
+          const currentCwd = this.harness.cachedWorkspace(currentId) ?? this.config.cwd
+          if (this.harness.sameWorkspacePath(currentCwd, cwd)) return
           this.cancelBase(baseId)
           await this.advanceToWorkspace(baseId, cwd, true)
         } catch (error) {
@@ -534,24 +332,20 @@ export class ConversationManager {
   private async advanceToWorkspace(baseId: string, nextCwd: string, allowCreate: boolean): Promise<void> {
     const id = await this.currentSessionId(baseId)
     this.pendingCards.delete(id)
-    const binding = this.bindings.get(id)
-    if (binding !== undefined) {
-      this.bindings.delete(id)
-      await binding.release()
-    }
-    let generation = await this.ensureGeneration(baseId)
+    await this.harness.releaseById(id)
+    let generation = await this.harness.currentGeneration(baseId)
     // Never target an occupied id: archived generations are invisible to
     // both list() and inspect() on rc.2 and only surface as create
     // refusals, so walk forward until a create succeeds.
-    for (let attempt = 0; attempt <= GENERATION_PROBE_LIMIT; attempt++) {
+    for (let attempt = 0; attempt <= this.harness.generationLimit; attempt++) {
       const candidate = generation + 1 + attempt
       if (!Number.isSafeInteger(candidate)) throw new Error('WeCom conversation generation is exhausted')
       try {
-        await this.getOrCreate(this.sessionIdForGeneration(baseId, candidate), nextCwd, allowCreate, 'skip')
-        this.generations.set(baseId, candidate)
+        await this.sessionFor(this.sessionIdForGeneration(baseId, candidate), nextCwd, allowCreate, 'skip')
+        this.harness.setGeneration(baseId, candidate)
         return
       } catch (error) {
-        if (!isAlreadyExists(error)) throw error
+        if (!this.harness.isCollision(error)) throw error
       }
     }
     throw new Error('WeCom conversation generation is exhausted')
@@ -562,17 +356,16 @@ export class ConversationManager {
     const baseId = sessionIdFor(this.config.accountId, message)
     return this.enqueue(baseId, async () => {
       const id = await this.currentSessionId(baseId)
-      const binding = await this.getOrCreate(id)
-      const agent = binding.agent
+      const session = await this.sessionFor(id)
       await withTimeout(
-        agent.whenIdle(),
+        session.whenIdle(),
         this.config.responseTimeoutMs,
         'DeepSeek Harness conversation availability',
       )
-      const start = agent.session?.events?.length ?? 0
-      // rc.2 removed agent.session.events: capture the command's events from
-      // the same feed the turn path uses, so command-triggered model output
-      // is not silently lost.
+      // rc.2 removed agent.session.events: the adapter captures the command's
+      // events from the same feed the turn path uses, so command-triggered
+      // model output is not silently lost.
+      this.harness.beginTurn(session.agent)
       const capture: ActiveStream = {
         transport: {
           pushText() {},
@@ -585,8 +378,6 @@ export class ConversationManager {
         text: '',
         activity: undefined,
         lastEventAt: Date.now(),
-        eventTypes: [],
-        events: [],
       }
       this.activeStreams.set(id, capture)
       const controller = new AbortController()
@@ -595,22 +386,20 @@ export class ConversationManager {
       }, this.config.responseTimeoutMs)
       this.activeTurns.set(id, chatTarget(message))
       try {
-        const execution = await this.ctx.commands.execute(agent, line, controller.signal)
+        const execution = await this.harness.executeCommand(session.agent, line, controller.signal)
         if (execution === undefined) {
           this.takeCards(id)
           return { execution, response: undefined }
         }
-        await withTimeout(agent.whenIdle(), this.config.responseTimeoutMs, 'DeepSeek Harness command response')
-        const turnEvents = capture.events.some(event => event.type === 'assistant/message')
-          || agent.session?.events === undefined
-          ? capture.events
-          : (agent.session?.events ?? []).slice(start)
-        const response = turnEvents.some(event => event.type === 'assistant/message')
-          ? this.finalizeReply(id, await this.collectReply(agent, turnEvents))
+        await withTimeout(session.whenIdle(), this.config.responseTimeoutMs, 'DeepSeek Harness command response')
+        const output = await this.harness.collectTurnOutput(session.agent)
+        const response = output.texts.length > 0 || output.images.length > 0
+          ? this.finalizeReply(id, this.replyFromOutput(output))
           : (this.takeCards(id), undefined)
         return { execution, response }
       } finally {
         clearTimeout(timer)
+        this.harness.endTurn(session.agent)
         this.activeStreams.delete(id)
         this.activeTurns.delete(id)
       }
@@ -624,16 +413,9 @@ export class ConversationManager {
 
   /** Cancel active work for one base id (synchronous best effort). */
   private cancelBase(baseId: string): boolean {
-    // Synchronous by contract: check the base id and the cached generation
-    // (the probe may not have run yet when a cancel arrives first).
-    const candidates = [baseId, `${baseId}-n${this.generations.get(baseId) ?? 0}`]
-    for (const id of candidates) {
-      const agent = this.bindings.get(id)?.agent ?? this.ctx.agents.get(SessionId(id))
-      if (agent === undefined || agent.status === 'idle') continue
-      agent.cancel({ kind: 'user' })
-      return true
-    }
-    return false
+    // Synchronous by contract: the adapter checks the base id and the cached
+    // generation itself, because a cancel may arrive before the probe has run.
+    return this.harness.cancelConversation(baseId)
   }
 
   /** Dispose every bridge-owned Agent after queued work settles (bounded: a running turn must not block a channel restart). */
@@ -642,17 +424,13 @@ export class ConversationManager {
       Promise.allSettled(this.queues.values()),
       new Promise(resolve => setTimeout(resolve, DISPOSE_DRAIN_TIMEOUT_MS)),
     ])
-    await Promise.allSettled([...this.bindings.values()].map(binding => binding.release()))
     this.disposeSessionEvents()
     this.questions.dispose()
-    this.bindings.clear()
     this.activeTurns.clear()
     this.activeStreams.clear()
     this.pendingCards.clear()
     this.cardRegistry.clear()
-    this.sessionCwds.clear()
-    this.occupied.clear()
-    this.generationProbes.clear()
+    this.harness.dispose()
   }
 
   private enqueue<T>(baseId: string, operation: () => Promise<T>): Promise<T> {
@@ -671,17 +449,18 @@ export class ConversationManager {
   }
 
   private sessionIdForGeneration(baseId: string, generation: number): string {
-    return generation === 0 ? baseId : `${baseId}-n${generation}`
+    return String(this.harness.sessionIdFor(baseId, generation))
   }
 
   /** Current session id, resolving the generation via per-id probing. */
   private async currentSessionId(baseId: string): Promise<string> {
-    return this.sessionIdForGeneration(baseId, await this.ensureGeneration(baseId))
+    return String(await this.harness.currentSession(baseId))
   }
 
   /** Human-readable dump of why a completed turn produced nothing. */
-  private emptyTurnNote(stream: ActiveStream, agent: Agent): string {
-    const note = `（诊断：流事件[${stream.eventTypes.join(',') || '无'}] 流文本${stream.text.length}字 会话事件${String(agent.session?.events?.length)} session字段[${Object.keys(agent.session ?? {}).join(',') || '无'}]）`
+  private emptyTurnNote(stream: ActiveStream, session: HarnessSession): string {
+    const facts = this.harness.turnDiagnostics(session.agent)
+    const note = `（诊断：流事件[${facts.eventTypes.join(',') || '无'}] 流文本${stream.text.length}字 会话事件${String(facts.eventCount)} session字段[${facts.sessionKeys.join(',') || '无'}]）`
     console.error('[wecom-plus] empty turn: %s', note)
     return note
   }
@@ -692,46 +471,43 @@ export class ConversationManager {
     client: WeComDownloadPort,
     transport: TurnTransport,
   ): Promise<ConversationReply> {
-    const binding = await this.getOrCreate(id)
-    const agent = binding.agent
-    const content = await inboundContent(this.ctx, this.config, client, message, await this.includeImages(agent))
-    await withTimeout(agent.whenIdle(), this.config.responseTimeoutMs, 'DeepSeek Harness conversation availability')
-    const events = agent.session?.events ?? []
-    const start = events.length
+    const session = await this.sessionFor(id)
+    const content = await inboundContent(
+      { attachments: this.harness.attachments() },
+      this.config,
+      client,
+      message,
+      await this.includeImages(session),
+    )
+    await withTimeout(session.whenIdle(), this.config.responseTimeoutMs, 'DeepSeek Harness conversation availability')
+    this.harness.beginTurn(session.agent)
     this.activeTurns.set(id, chatTarget(message))
-    const stream: ActiveStream = { transport, text: '', activity: undefined, lastEventAt: Date.now(), eventTypes: [], events: [] }
+    const stream: ActiveStream = { transport, text: '', activity: undefined, lastEventAt: Date.now() }
     this.activeStreams.set(id, stream)
     try {
-      agent.followup(createUserMessage({ content, source: { kind: 'user' } }))
+      session.send(content)
       try {
-        await this.awaitTurnCompletion(agent, stream)
+        await this.awaitTurnCompletion(session, stream)
       } catch (error) {
         // A wedged turn blocks the conversation queue forever; cancel it and
         // say so through the live stream instead of a silent error card.
-        agent.cancel({ kind: 'user' })
-        await agent.whenIdle()
+        session.cancel()
+        await session.whenIdle()
         await transport.fail('生成超时（长时间没有任何进展），已取消本次生成，请重新发送。')
         throw error
       }
-      // rc.2 removed agent.session.events (see ActiveStream.events): prefer
-      // the feed-captured events when they carry the turn's assistant
-      // output; otherwise slice the session log from the pre-turn offset
-      // (legacy hosts and borrowed Web agents).
-      const fallbackEvents = (agent.session?.events ?? []).slice(start)
-      const turnEvents = stream.events.some(event => event.type === 'assistant/message')
-        || agent.session?.events === undefined
-        ? stream.events
-        : fallbackEvents
-      const collected = await this.collectReply(agent, turnEvents)
+      const output = await this.harness.collectTurnOutput(session.agent)
+      const collected = this.replyFromOutput(output)
       if (collected.text.trim() === '' && collected.images.length === 0) {
         // Empty-turn diagnostic: the rc.2 host changed event shapes once
         // already, so record exactly what the turn emitted before giving up.
+        const facts = this.harness.turnDiagnostics(session.agent)
         console.error(
           '[wecom-plus] empty turn: streamEvents=%s streamText=%d sessionEventCount=%s sessionKeys=%s',
-          JSON.stringify(stream.eventTypes),
+          JSON.stringify(facts.eventTypes),
           stream.text.length,
-          String(agent.session?.events?.length),
-          JSON.stringify(Object.keys(agent.session ?? {})),
+          String(facts.eventCount),
+          JSON.stringify(facts.sessionKeys),
         )
       }
       const reply = this.finalizeReply(id, {
@@ -739,11 +515,12 @@ export class ConversationManager {
         images: collected.images,
       })
       if (reply.text === '' || reply.text === EMPTY_TURN_PLACEHOLDER) {
-        reply.text += this.emptyTurnNote(stream, agent)
+        reply.text += this.emptyTurnNote(stream, session)
       }
       await transport.finish(reply)
       return reply
     } finally {
+      this.harness.endTurn(session.agent)
       this.activeStreams.delete(id)
       this.activeTurns.delete(id)
     }
@@ -757,7 +534,7 @@ export class ConversationManager {
    * emitting entirely — is cancelled, so the conversation queue cannot wedge
    * forever without killing legitimately long work.
    */
-  private awaitTurnCompletion(agent: Agent, stream: ActiveStream): Promise<void> {
+  private awaitTurnCompletion(session: HarnessSession, stream: ActiveStream): Promise<void> {
     return new Promise((resolve, reject) => {
       let settled = false
       let timer: ReturnType<typeof setTimeout> | undefined
@@ -768,7 +545,7 @@ export class ConversationManager {
         if (outcome === true) resolve()
         else reject(outcome)
       }
-      void agent.whenIdle().then(
+      void session.whenIdle().then(
         () => settle(true),
         error => settle(error instanceof Error ? error : new Error(String(error))),
       )
@@ -776,7 +553,7 @@ export class ConversationManager {
         const remaining = stream.lastEventAt + this.config.responseTimeoutMs - Date.now()
         timer = setTimeout(() => {
           if (settled) return
-          if (agent.status === 'idle') return settle(true)
+          if (session.isIdle()) return settle(true)
           // Events may have arrived after this timer was armed; re-check and
           // re-arm for the remaining window instead of trusting the deadline.
           const idleFor = Date.now() - stream.lastEventAt
@@ -794,16 +571,15 @@ export class ConversationManager {
     selectedLabel: string | undefined,
     transport: TurnTransport,
   ): Promise<ConversationReply> {
-    const binding = await this.getOrCreate(id)
-    const agent = binding.agent
-    const scope = message.chattype === 'group' ? 'WeCom group' : 'WeCom private chat'
+    const session = await this.sessionFor(id)
+    const channelScope = message.chattype === 'group' ? 'WeCom group' : 'WeCom private chat'
     const facts = cardEventFacts(message.event)
     const taskId = facts.taskId?.trim() || '（无）'
     const eventKey = facts.eventKey?.trim() || '（无）'
     const content = [{
       type: 'text' as const,
       text: [
-        `[${scope} template card button click from WeCom user ${message.from.userid}]`,
+        `[${channelScope} template card button click from WeCom user ${message.from.userid}]`,
         `task_id: ${taskId}`,
         `event_key: ${eventKey}`,
         ...(selectedLabel === undefined ? [] : [`selected option: ${selectedLabel}`]),
@@ -812,28 +588,22 @@ export class ConversationManager {
         + 'Answer the click in your reply.',
       ].join('\n'),
     }]
-    await withTimeout(agent.whenIdle(), this.config.responseTimeoutMs, 'DeepSeek Harness conversation availability')
-    const events = agent.session?.events ?? []
-    const start = events.length
+    await withTimeout(session.whenIdle(), this.config.responseTimeoutMs, 'DeepSeek Harness conversation availability')
+    this.harness.beginTurn(session.agent)
     this.activeTurns.set(id, chatTarget(message))
-    const stream: ActiveStream = { transport, text: '', activity: undefined, lastEventAt: Date.now(), eventTypes: [], events: [] }
+    const stream: ActiveStream = { transport, text: '', activity: undefined, lastEventAt: Date.now() }
     this.activeStreams.set(id, stream)
     try {
-      agent.followup(createUserMessage({ content, source: { kind: 'user' } }))
+      session.send(content)
       try {
-        await this.awaitTurnCompletion(agent, stream)
+        await this.awaitTurnCompletion(session, stream)
       } catch (error) {
-        agent.cancel({ kind: 'user' })
-        await agent.whenIdle()
+        session.cancel()
+        await session.whenIdle()
         await transport.fail('生成超时（长时间没有任何进展），已取消本次生成，请重新发送。')
         throw error
       }
-      const fallbackEvents = (agent.session?.events ?? []).slice(start)
-      const turnEvents = stream.events.some(event => event.type === 'assistant/message')
-        || agent.session?.events === undefined
-        ? stream.events
-        : fallbackEvents
-      const collected = await this.collectReply(agent, turnEvents)
+      const collected = this.replyFromOutput(await this.harness.collectTurnOutput(session.agent))
       // Same as processNow: the full collected text wins over the last step's
       // stream text so multi-step turns keep every assistant message.
       const reply = this.finalizeReply(id, {
@@ -841,11 +611,12 @@ export class ConversationManager {
         images: collected.images,
       })
       if (reply.text === '' || reply.text === EMPTY_TURN_PLACEHOLDER) {
-        reply.text += this.emptyTurnNote(stream, agent)
+        reply.text += this.emptyTurnNote(stream, session)
       }
       await transport.finish(reply)
       return reply
     } finally {
+      this.harness.endTurn(session.agent)
       this.activeStreams.delete(id)
       this.activeTurns.delete(id)
     }
@@ -870,190 +641,36 @@ export class ConversationManager {
     return cards
   }
 
-  private async includeImages(agent: Agent): Promise<boolean> {
+  /** Product policy decides whether images are wanted; the adapter knows whether they are possible. */
+  private async includeImages(session: HarnessSession): Promise<boolean> {
     if (this.config.imageInputMode === 'always') return true
     if (this.config.imageInputMode === 'never') return false
-    const { provider, model } = agent.options
-    if (provider === undefined || model === undefined) return false
-    const info = await this.ctx.llm.resolveModelInfo(provider, model)
-    return info.inputModalities?.includes('image') ?? false
+    return this.harness.supportsImageInput(session.agent)
   }
 
-  /** Current workspace of one WeCom conversation (cache → persistence → default). */
+  /** Current workspace of one WeCom conversation (cache → host → default). */
   async workspaceOf(message: WeComPeer): Promise<string> {
     const baseId = sessionIdFor(this.config.accountId, message)
-    return this.resolveWorkspace(await this.currentSessionId(baseId))
-  }
-
-  private async resolveWorkspace(id: string): Promise<string> {
-    const cached = this.sessionCwds.get(id)
-    if (cached !== undefined) return cached
-    if (this.occupied.get(id) === 'visible') {
-      try {
-        const inspected = await this.inspectCandidate(id)
-        const cwd = inspected.meta?.cwd
-        if (typeof cwd === 'string' && cwd.length > 0) {
-          this.sessionCwds.set(id, cwd)
-          return cwd
-        }
-      } catch {
-        // An unreadable session falls back to the default workspace below.
-      }
-    }
-    return this.config.cwd
-  }
-
-  private async getOrCreate(
-    id: string,
-    cwd?: string,
-    allowCreate = false,
-    collision: 'resume' | 'skip' = 'resume',
-  ): Promise<ConversationAgentBinding> {
-    const sessionId = SessionId(id)
-    const existing = this.bindings.get(id)
-    if (existing !== undefined && this.ctx.agents.get(sessionId) === existing.agent) return existing
-    if (existing !== undefined) {
-      this.bindings.delete(id)
-      await existing.release()
-    }
-    const pending = this.creations.get(id)
-    if (pending !== undefined) return pending
-
-    const creation = this.createOrResume(id, cwd, allowCreate, collision).finally(() => this.creations.delete(id))
-    this.creations.set(id, creation)
-    const binding = await creation
-    this.bindings.set(id, binding)
-    return binding
-  }
-
-  private async createOrResume(
-    id: string,
-    cwd?: string,
-    allowCreate = false,
-    collision: 'resume' | 'skip' = 'resume',
-  ): Promise<ConversationAgentBinding> {
-    const sessionId = SessionId(id)
-    const live = this.ctx.agents.get(sessionId)
-    if (live !== undefined) return this.borrowAgent(live, id)
-
-    const current = this.ctx.agentDefaultModel.currentSelection()
-    const agentOptions = { provider: current.provider, model: current.model }
-    if (this.occupied.get(id) === 'visible') {
-      const inspected = await this.inspectCandidate(id)
-      const agentPreset = resolveSessionPreset(inspected.meta, inspected.events ?? [])
-        ?? this.resolveAgentPreset()
-      const inspectedCwd = inspected.meta?.cwd
-      let resumedCwd: string | undefined
-      if (typeof inspectedCwd === 'string' && inspectedCwd.length > 0) {
-        resumedCwd = inspectedCwd
-        this.sessionCwds.set(id, resumedCwd)
-      }
-      try {
-        const handle = await this.ctx.agents.resume({
-          resumeSessionId: sessionId,
-          agentOptions,
-          setup: agentCtx => this.setupAgent(agentCtx, agentPreset, id),
-        })
-        // Migrate pre-alignment sessions: an existing workspace group for the
-        // session's cwd adopts it; without one the session stays Ungrouped.
-        if (resumedCwd !== undefined) void this.alignWorkspace(id, resumedCwd, false)
-        return this.ownAgent(handle)
-      } catch (error) {
-        const raced = this.ctx.agents.get(sessionId)
-        if (raced !== undefined) return this.borrowAgent(raced, id)
-        throw error
-      }
-    }
-
-    // A hidden id is occupied by a foreign-format log the host's list()
-    // skips. Its first write open migrates and publishes it, so resume —
-    // never create — is the only safe move for such an id.
-    if (this.occupied.get(id) === 'hidden') {
-      return this.resumeHidden(id, sessionId, agentOptions)
-    }
-
-    const agentPreset = this.resolveAgentPreset()
-    // An explicit cwd comes from a `/ws` workspace switch; new sessions
-    // otherwise start in the configured default workspace.
-    const createdCwd = cwd ?? this.config.cwd
-    let handle: AgentHandle
-    try {
-      handle = await this.ctx.agents.create({
-        sessionId,
-        meta: { cwd: createdCwd, agentPreset },
-        agentOptions,
-        setup: agentCtx => this.setupAgent(agentCtx, agentPreset, id),
-      })
-    } catch (error) {
-      const raced = this.ctx.agents.get(sessionId)
-      if (raced !== undefined) return this.borrowAgent(raced, id)
-      if (isAlreadyExists(error)) {
-        this.occupied.set(id, 'hidden')
-        if (collision === 'skip') throw error
-        // A conversation message hit an undiscovered foreign-format record:
-        // retry as a resume — its first write open migrates and publishes it.
-        return this.resumeHidden(id, sessionId, agentOptions)
-      }
-      throw error
-    }
-    this.occupied.set(id, 'visible')
-    this.sessionCwds.set(id, createdCwd)
-    // Sidebar grouping: an explicit /ws switch may create the workspace
-    // group; ordinary sessions only attach when a matching group exists.
-    void this.alignWorkspace(id, createdCwd, allowCreate)
-    return this.ownAgent(handle)
-  }
-
-  /** Resume a session occupied by a foreign-format log; migrating it on open. */
-  private async resumeHidden<A extends { provider?: string; model?: string }>(
-    id: string,
-    sessionId: SessionId,
-    agentOptions: A,
-  ): Promise<ConversationAgentBinding> {
-    try {
-      const handle = await this.ctx.agents.resume({
-        resumeSessionId: sessionId,
-        agentOptions,
-        setup: agentCtx => this.setupAgent(agentCtx, this.resolveAgentPreset(), id),
-      })
-      this.occupied.set(id, 'visible')
-      try {
-        const migrated = await this.inspectCandidate(id)
-        const migratedCwd = migrated.meta.cwd
-        if (typeof migratedCwd === 'string' && migratedCwd.length > 0) this.sessionCwds.set(id, migratedCwd)
-      } catch {
-        // Migrated but the header stayed unreadable: the default-workspace
-        // fallback still applies.
-      }
-      return this.ownAgent(handle)
-    } catch (error) {
-      const raced = this.ctx.agents.get(sessionId)
-      if (raced !== undefined) return this.borrowAgent(raced, id)
-      // A resume that reports the session missing means the hidden marker
-      // was wrong (transient probe failure): clear it so a later probe can
-      // reclassify the id, and surface the error for this turn.
-      if (isNotFound(error)) this.occupied.delete(id)
-      throw error
-    }
+    return this.harness.workspaceOf(await this.harness.currentSession(baseId))
   }
 
   /**
-   * Best-effort sidebar grouping: attach the session to the host workspace
-   * record for its cwd, creating that record only when `allowCreate` (an
-   * explicit /ws switch). Never throws: grouping must not break messaging.
+   * Resolve the conversation's session. Creation, resumption, collision
+   * handling, and workspace alignment all live behind the harness seam; this
+   * only supplies the channel's own per-session wiring.
    */
-  private async alignWorkspace(id: string, cwd: string, allowCreate: boolean): Promise<void> {
-    try {
-      const registry = (this.ctx as { get?(name: string): unknown }).get?.('workspaceRegistry') as WorkspaceRegistryLike | undefined
-      if (registry === undefined) return
-      const canonical = await canonicalWorkspacePath(cwd)
-      const existing = registry.list().find(workspace => sameCanonicalPath(workspace.path, canonical))
-      const workspace = existing ?? (allowCreate ? await registry.create(cwd) : undefined)
-      if (workspace === undefined) return
-      await workspace.attachSession(SessionId(id))
-    } catch (error) {
-      console.error('[wecom-plus] workspace alignment skipped: %s', String(error))
-    }
+  private async sessionFor(
+    id: string,
+    cwd?: string,
+    allowCreate = false,
+    collision: 'resume' | 'skip' = 'resume',
+  ): Promise<HarnessSession> {
+    return this.harness.ensureSession(id, {
+      allowCreate,
+      collision,
+      setup: scope => this.setupAgent(scope, id),
+      ...(cwd === undefined ? {} : { cwd }),
+    })
   }
 
   /**
@@ -1062,50 +679,18 @@ export class ConversationManager {
    * before any session lands in it. Never throws.
    */
   async ensureWorkspaceRecord(cwd: string): Promise<void> {
-    try {
-      const registry = (this.ctx as { get?(name: string): unknown }).get?.('workspaceRegistry') as WorkspaceRegistryLike | undefined
-      if (registry === undefined) return
-      const canonical = await canonicalWorkspacePath(cwd)
-      const existing = registry.list().find(workspace => sameCanonicalPath(workspace.path, canonical))
-      if (existing === undefined) await registry.create(cwd)
-    } catch (error) {
-      console.error('[wecom-plus] workspace record creation skipped: %s', String(error))
-    }
+    await this.harness.ensureWorkspaceRecord(cwd)
   }
 
-  private ownAgent(handle: AgentHandle): ConversationAgentBinding {
-    return { agent: handle.agent, release: () => handle.dispose() }
-  }
-
-  private borrowAgent(agent: Agent, id: string): ConversationAgentBinding {
-    const disposeInstructions = this.registerWeComInstructions(agent.ctx, id)
-    const disposeFileTool = this.registerFileTool(agent.ctx, id)
-    const disposeCardTool = this.registerCardTool(agent.ctx, id)
-    const disposeQuestions = this.registerAskTool(agent.ctx, id)
-    let released = false
-    return {
-      agent,
-      release: async () => {
-        if (released) return
-        released = true
-        disposeQuestions()
-        disposeCardTool()
-        disposeFileTool()
-        disposeInstructions()
-      },
-    }
-  }
-
-  private resolveAgentPreset(): string {
-    return this.config.agentPreset ?? this.ctx.agentPresets.defaultId
-  }
-
-  private async setupAgent(agentCtx: Context, agentPreset: string, id: string): Promise<void> {
-    await this.ctx.agentPresets.mount(agentCtx, agentPreset)
-    this.registerWeComInstructions(agentCtx, id)
-    this.registerFileTool(agentCtx, id)
-    this.registerCardTool(agentCtx, id)
-    this.registerAskTool(agentCtx, id)
+  /**
+   * Install the channel's prompt section and tools on one session scope. The
+   * agent preset is mounted by the adapter, which resolved it.
+   */
+  private async setupAgent(scope: HarnessAgentScope, id: string): Promise<void> {
+    this.registerWeComInstructions(scope, id)
+    this.registerFileTool(scope, id)
+    this.registerCardTool(scope, id)
+    this.registerAskTool(scope, id)
   }
 
   /**
@@ -1115,12 +700,11 @@ export class ConversationManager {
    * - WeCom-initiated turns present the question as Markdown + template card
    *   and settle it from card clicks or chat replies;
    * - any other turn (the user continued this same session from the Web UI)
-   *   delegates to the shared userQuestions service, so the Web question panel
+   *   delegates to the host's question service, so the Web question panel
    *   behaves exactly as before.
    */
-  private registerAskTool(agentCtx: Context, id: string): () => void {
-    const userQuestions = agentCtx.get('userQuestions') as Context['userQuestions'] | undefined
-    return agentCtx.tools.register(defineTool({
+  private registerAskTool(scope: HarnessAgentScope, id: string): () => void {
+    return scope.registerTool({
       name: 'ask_user_question',
       description: 'Ask the user a concise question when you need confirmation, a choice, or missing '
         + 'information before proceeding. Send one or more questions, each with a stable id that will be echoed '
@@ -1187,8 +771,14 @@ export class ConversationManager {
       },
       execute: async (args, exec) => {
         exec.signal.throwIfAborted()
-        const request: AskUserQuestionRequest = {
-          questions: args.questions.map(question => ({
+        const request: HarnessQuestionRequest = {
+          questions: args.questions.map((question: {
+            id: string
+            question: string
+            header?: string
+            options?: Array<{ label: string; description?: string }>
+            multi_select?: boolean
+          }) => ({
             id: question.id,
             question: question.question,
             ...(question.header === undefined ? {} : { header: question.header }),
@@ -1198,10 +788,7 @@ export class ConversationManager {
           signal: exec.signal,
         }
         const result = this.activeTurns.get(id) === undefined
-          ? await requireUserQuestions(userQuestions).ask({
-            ...request,
-            ...(exec.agent === undefined ? {} : { agent: exec.agent }),
-          })
+          ? await scope.askHost(request)
           : await this.questions.present(
             request,
             this.activeTurns.get(id) as string,
@@ -1221,27 +808,28 @@ export class ConversationManager {
           })),
         }
       },
-    }))
+    })
   }
 
-  private registerWeComInstructions(agentCtx: Context, id: string): () => void {
-    return agentCtx.systemPrompt.section({
+  private registerWeComInstructions(scope: HarnessAgentScope, id: string): () => void {
+    const section: HarnessPromptSection = {
       name: 'channel:wecom',
       order: 190,
       text: () => {
         if (!this.activeTurns.has(id)) return ''
         // The workspace follows the session (it may have been switched via
         // /ws and survives restarts through the session header).
-        const cwd = this.sessionCwds.get(id)
+        const cwd = this.harness.cachedWorkspace(id)
         return cwd === undefined
           ? this.config.systemPrompt
           : `${this.config.systemPrompt}\nThe workspace of this conversation is ${cwd}.`
       },
-    })
+    }
+    return scope.appendSystemPrompt(section)
   }
 
-  private registerFileTool(agentCtx: Context, id: string): () => void {
-    return agentCtx.tools.register(defineTool({
+  private registerFileTool(scope: HarnessAgentScope, id: string): () => void {
+    const definition: HarnessToolDefinition = {
       name: 'wecom_send_file',
       description: 'Send one existing regular file from the configured workspace to the user who initiated the current WeCom turn. '
         + 'Use this when the WeCom user asks to receive or download a local file. The path may be absolute or relative to the workspace; '
@@ -1273,7 +861,11 @@ export class ConversationManager {
           throw new Error('wecom_send_file: no active WeCom turn; this tool cannot send files from another channel')
         }
         exec.signal.throwIfAborted()
-        const file = await resolveOutboundFile(await this.resolveWorkspace(id), args.path, this.config.maxOutboundFileBytes)
+        const file = await resolveOutboundFile(
+          await this.harness.workspaceOf(harnessSessionId(id)),
+          args.path,
+          this.config.maxOutboundFileBytes,
+        )
         exec.signal.throwIfAborted()
         await this.sendFile(target, file)
         return { name: file.name, bytes: file.bytes }
@@ -1285,11 +877,12 @@ export class ConversationManager {
         rawInput: args.path,
         locations: [{ path: args.path }],
       }),
-    }))
+    }
+    return scope.registerTool(definition)
   }
 
-  private registerCardTool(agentCtx: Context, id: string): () => void {
-    return agentCtx.tools.register(defineTool({
+  private registerCardTool(scope: HarnessAgentScope, id: string): () => void {
+    const definition: HarnessToolDefinition = {
       name: 'wecom_send_card',
       description: 'Send one WeCom template card to the user who initiated the current WeCom turn. '
         + 'The card is delivered as a second message right after the main Markdown reply, so one turn becomes '
@@ -1431,7 +1024,7 @@ export class ConversationManager {
           ...(args.buttons === undefined ? {} : { buttons: args.buttons as Exclude<CardInput['buttons'], undefined> }),
           ...(args.options === undefined ? {} : { options: args.options as Exclude<CardInput['options'], undefined> }),
           ...(args.selects === undefined ? {} : {
-            selects: args.selects.map(select => ({
+            selects: args.selects.map((select: { question_key: string; title?: string; options: unknown }) => ({
               questionKey: select.question_key,
               ...(select.title === undefined ? {} : { title: select.title }),
               options: select.options,
@@ -1465,42 +1058,25 @@ export class ConversationManager {
         kind: 'execute',
         rawInput: args.title,
       }),
-    }))
+    }
+    return scope.registerTool(definition)
   }
 
-  private async collectReply(agent: Agent, events: readonly SessionEvent[]): Promise<Omit<ConversationReply, 'cards'>> {
-    const texts: string[] = []
-    const images: ConversationReply['images'] = []
-    for (const event of events) {
-      if (event.type !== 'assistant/message') continue
-      for (const block of event.data.message.content) {
-        if (block.type === 'text' && block.text.trim()) texts.push(block.text.trim())
-        if (block.type === 'image') {
-          const stored = await this.ctx.attachments.readImage(block.attachment)
-          images.push({
-            data: stored.data,
-            mediaType: stored.ref.mediaType,
-            ...(stored.ref.name === undefined ? {} : { name: stored.ref.name }),
-          })
-        }
-      }
+  /**
+   * Product-facing wording for one adapter-reported turn outcome. The adapter
+   * reports what the host committed (texts, images, a terminal error); the
+   * Chinese copy and the empty-turn sentinel are channel UX and stay here.
+   */
+  private replyFromOutput(output: HarnessTurnOutput): Omit<ConversationReply, 'cards'> {
+    const images = output.images
+    if (output.texts.length === 0 && output.error !== undefined) {
+      return { text: `处理失败（${output.error.code}），请稍后重试。`, images }
     }
-
-    const finalTurn = [...events].reverse().find(event => event.type === 'turn/end')
-    if (texts.length === 0 && finalTurn?.type === 'turn/end' && finalTurn.data.reason.kind === 'error') {
-      return { text: `处理失败（${finalTurn.data.reason.error.code}），请稍后重试。`, images }
-    }
-    if (texts.length === 0 && images.length === 0) {
+    if (output.texts.length === 0 && images.length === 0) {
       return { text: EMPTY_TURN_PLACEHOLDER, images }
     }
-    return { text: texts.join('\n\n'), images }
+    return { text: output.texts.join('\n\n'), images }
   }
 }
 
-/** The shared userQuestions service, or a teaching error when no provider exists. */
-function requireUserQuestions(service: Context['userQuestions'] | undefined): Context['userQuestions'] {
-  if (service === undefined) {
-    throw new UserQuestionError('no user-questions service is available in this agent', 'NO_PROVIDER')
-  }
-  return service
-}
+/** Collapse any thrown value into one short wire-safe diagnostic line. */

@@ -1,8 +1,6 @@
-import type { Context } from '@deepseek-ai/cordis'
-import type { ImageMediaType } from '@deepseek-ai/dsh-attachment'
-import type { ContentBlock } from '@deepseek-ai/dsh-llm'
 import type { BaseMessage, FileContent, ImageContent, MixedMsgItem, VideoContent } from '@wecom/aibot-node-sdk'
 import type { Config } from './config.js'
+import type { HarnessContentBlock, HarnessInboundHost } from './harness/port.js'
 import { saveInboundFile } from './inbound-file.js'
 import { sessionIdFor, withTimeout } from './util.js'
 
@@ -17,14 +15,15 @@ interface PendingInboundFile {
   quoted: boolean
 }
 
-/** Build durable DSH content blocks from one WeCom message. */
+/** Build harness message content from one WeCom message. */
 export async function inboundContent(
-  ctx: Context,
+  host: HarnessInboundHost,
   config: Config,
   client: WeComDownloadPort,
   message: BaseMessage,
   includeImages = true,
-): Promise<ContentBlock[]> {
+): Promise<HarnessContentBlock[]> {
+  const attachments = host.attachments
   const scope = message.chattype === 'group' ? 'WeCom group' : 'WeCom private chat'
   const textParts = [`[${scope} message from WeCom user ${shortId(message.from.userid)}]`]
   const images: ImageContent[] = []
@@ -32,17 +31,17 @@ export async function inboundContent(
   collectMessageContent(message, textParts, images, files)
   collectQuotedContent(message, textParts, images, files)
 
-  const selectedImages = images.slice(0, ctx.attachments.imageLimits.maxImagesPerMessage)
+  const selectedImages = images.slice(0, attachments.imageLimits.maxImagesPerMessage)
   if (selectedImages.length < images.length) {
     textParts.push(
       `[WeCom image omitted: only the first ${selectedImages.length} of ${images.length} images fit one message.]`,
     )
   }
-  const imageBlocks: ContentBlock[] = []
+  const imageBlocks: HarnessContentBlock[] = []
   let totalImageBytes = 0
   for (const image of selectedImages) {
-    const remaining = ctx.attachments.imageLimits.maxMessageImageBytes - totalImageBytes
-    const maxBytes = Math.min(ctx.attachments.imageLimits.maxImageBytes, remaining)
+    const remaining = attachments.imageLimits.maxMessageImageBytes - totalImageBytes
+    const maxBytes = Math.min(attachments.imageLimits.maxImageBytes, remaining)
     if (maxBytes <= 0) {
       textParts.push(
         `[WeCom image omitted: the message image byte budget was exhausted after ${imageBlocks.length} image(s).]`,
@@ -61,16 +60,16 @@ export async function inboundContent(
         throw new Error(`exceeds the ${maxBytes}-byte attachment limit`)
       }
       const mediaType = detectImageMediaType(downloaded.buffer)
-      const ref = await ctx.attachments.saveImage({
+      const ref = await attachments.saveImage({
         data: downloaded.buffer,
         mediaType,
         ...(downloaded.filename === undefined ? {} : { name: downloaded.filename }),
       })
-      totalImageBytes += ref.bytes
+      totalImageBytes += ref.bytes ?? 0
       if (includeImages) {
         imageBlocks.push({ type: 'image', attachment: ref })
       } else {
-        const label = downloaded.filename?.trim() || ref.mediaType
+        const label = downloaded.filename?.trim() || ref.mediaType || mediaType
         textParts.push([
           `[WeCom image received: ${label}.`,
           `Stored as Harness attachment ${String(ref.attachmentId)}.`,
@@ -184,8 +183,11 @@ function shortId(value: string): string {
   return value.length <= 8 ? value : value.slice(0, 8)
 }
 
-/** Detect the image formats accepted by Harness attachments from magic bytes. */
-export function detectImageMediaType(data: Uint8Array): ImageMediaType {
+/** Image formats the harness attachment store accepts, detected from magic bytes. */
+export type InboundImageMediaType = 'image/png' | 'image/jpeg' | 'image/gif' | 'image/webp'
+
+/** Detect one of the accepted image formats from magic bytes. */
+export function detectImageMediaType(data: Uint8Array): InboundImageMediaType {
   if (startsWith(data, [0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a])) return 'image/png'
   if (startsWith(data, [0xff, 0xd8, 0xff])) return 'image/jpeg'
   if (startsWith(data, [0x47, 0x49, 0x46, 0x38])) return 'image/gif'

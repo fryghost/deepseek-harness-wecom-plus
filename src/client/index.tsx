@@ -8,8 +8,16 @@
  */
 
 import { Component, useEffect, useState, useSyncExternalStore, type ReactNode } from 'react'
-import type { ClientContext } from '@deepseek-ai/dsh-client-runtime/client'
+// The old dedicated `ClientContext` export is gone: DSH's browser plugins now
+// type their apply() context as plain Cordis Context (aliased by convention).
+import type { Context as ClientContext } from '@deepseek-ai/cordis'
 import type {} from '@deepseek-ai/dsh-client-ui-settings/client'
+// Type-only side-effect imports that pull in the Context merges this plugin
+// relies on: ui-renderer owns the SlotRegistry (`ctx.slots`), client-connection
+// owns the `connection/reset` event. DSH's own browser plugins declare them the
+// same way.
+import type {} from '@deepseek-ai/dsh-client-ui-renderer/client'
+import type {} from '@deepseek-ai/dsh-client-connection/client'
 import type { PropsRuntime } from '@deepseek-ai/dsh-client-ui-slots'
 
 const ROUTE = '/_dsh/deepseek-harness-wecom-plus/settings'

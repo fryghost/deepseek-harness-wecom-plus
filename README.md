@@ -177,7 +177,7 @@ pnpm install
 pnpm run check
 ```
 
-`pnpm run check` runs host typecheck, client typecheck, tests, and build. The client typecheck/build pin their types to a **sibling `deepseek-harness` checkout** (`../deepseek-harness`, the same convention as deepseek-eyes); without the sibling, `pnpm test` still runs. Built `dist/` artifacts — including the Web plugin bundle `dist/client.js` — are committed so GitHub installs do not require executing a dependency build script.
+`pnpm run check` runs host typecheck, client typecheck, tests, and build. Every DSH type resolves from the published `@deepseek-ai/dsh-*` devDependencies — the client half pins the `@deepseek-ai/dsh-client-*` packages to the DSH release line this plugin targets — so no sibling `deepseek-harness` checkout is required and the whole check runs in CI. Built `dist/` artifacts — including the Web plugin bundle `dist/client.js` — are committed so GitHub installs do not require executing a dependency build script.
 
 ## License
 

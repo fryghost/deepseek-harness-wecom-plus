@@ -10,16 +10,16 @@
  * @module deepseek-harness-wecom-plus/questions
  */
 
-import {
-  UserQuestionError,
-  type AskUserQuestionAnswer,
-  type AskUserQuestionAnswerItem,
-  type AskUserQuestionItem,
-  type AskUserQuestionRequest,
-} from '@deepseek-ai/dsh-user-questions'
 import type { BaseMessage, EventMessageWith, TemplateCard, TemplateCardEventData } from '@wecom/aibot-node-sdk'
 import { buildTemplateCard, CARD_LIMITS } from './card.js'
 import type { Config } from './config.js'
+import {
+  HarnessQuestionError,
+  type HarnessQuestionAnswer,
+  type HarnessQuestionItem,
+  type HarnessQuestionRequest,
+  type HarnessQuestionResult,
+} from './harness/port.js'
 import { chatTarget } from './util.js'
 
 /** Push one question card into the active WeCom conversation. */
@@ -99,7 +99,7 @@ export function cardEventFacts(event: unknown): CardEventFacts {
  */
 interface PendingQuestion {
   questionId: string
-  question: AskUserQuestionItem
+  question: HarnessQuestionItem
   mode: 'buttons' | 'vote' | 'text'
   taskId: string | undefined
   /** The presented card, kept so a click can update it in place same-type. */
@@ -107,7 +107,7 @@ interface PendingQuestion {
   byKey?: Map<string, string>
   byId?: Map<string, string>
   submitKey?: string
-  resolve: (answer: AskUserQuestionAnswerItem) => void
+  resolve: (answer: HarnessQuestionAnswer) => void
   reject: (error: Error) => void
   clearTimer: () => void
   abort?: { signal: AbortSignal; handler: () => void }
@@ -125,12 +125,12 @@ export class WeComQuestionBridge {
 
   /** Present the questions to one conversation and wait for the human answers. */
   async present(
-    request: AskUserQuestionRequest,
+    request: HarnessQuestionRequest,
     target: string,
     cardSender?: QuestionCardSender,
     textSender?: QuestionTextSender,
-  ): Promise<AskUserQuestionAnswer> {
-    const answers: AskUserQuestionAnswerItem[] = []
+  ): Promise<HarnessQuestionResult> {
+    const answers: HarnessQuestionAnswer[] = []
     const sendCard = cardSender ?? this.sendCard
     const sendText = textSender ?? this.sendText
     for (const question of request.questions) {
@@ -214,7 +214,7 @@ export class WeComQuestionBridge {
   dispose(): void {
     for (const pending of this.pending.values()) {
       this.release(pending)
-      pending.reject(new UserQuestionError('the WeCom channel was disposed before the user answered', 'ASK_ABORTED'))
+      pending.reject(new HarnessQuestionError('the WeCom channel was disposed before the user answered', 'ASK_ABORTED'))
     }
     this.pending.clear()
   }
@@ -222,11 +222,11 @@ export class WeComQuestionBridge {
   /** Ask one question: the card carries the question, the Markdown only carries what does not fit. */
   private askOne(
     target: string,
-    question: AskUserQuestionItem,
+    question: HarnessQuestionItem,
     signal: AbortSignal | undefined,
     sendCard: QuestionCardSender,
     sendText: QuestionTextSender,
-  ): Promise<AskUserQuestionAnswerItem> {
+  ): Promise<HarnessQuestionAnswer> {
     const options = question.options ?? []
     // Card selection strategy — the Markdown message always carries the full
     // question and option details, the card is only the selector, so no card
@@ -272,12 +272,12 @@ export class WeComQuestionBridge {
           title: '请直接回复',
           desc: options.length > 0 ? '回复数字或选项名称' : '请用文字回答上面的问题',
         }, this.config.cardTaskIdPrefix)
-    return new Promise<AskUserQuestionAnswerItem>((resolve, reject) => {
+    return new Promise<HarnessQuestionAnswer>((resolve, reject) => {
       const timer = setTimeout(() => {
         const pending = this.pending.get(target)
         if (pending !== undefined) {
           this.pending.delete(target)
-          pending.reject(new UserQuestionError(
+          pending.reject(new HarnessQuestionError(
             `ask_user_question timed out after ${this.config.questionTimeoutMs}ms without an answer`,
             'ASK_TIMEOUT',
           ))
@@ -299,7 +299,7 @@ export class WeComQuestionBridge {
           if (this.pending.get(target) !== pending) return
           this.pending.delete(target)
           clearTimer()
-          reject(new UserQuestionError('ask_user_question was aborted before the user answered', 'ASK_ABORTED'))
+          reject(new HarnessQuestionError('ask_user_question was aborted before the user answered', 'ASK_ABORTED'))
         }
         pending.abort = { signal, handler }
         signal.addEventListener('abort', handler, { once: true })
@@ -330,7 +330,7 @@ export class WeComQuestionBridge {
   }
 
   /** Remove the entry, timer, and abort listener, then resolve. */
-  private settle(target: string, pending: PendingQuestion, answer: AskUserQuestionAnswerItem): void {
+  private settle(target: string, pending: PendingQuestion, answer: HarnessQuestionAnswer): void {
     if (this.pending.get(target) !== pending) return
     this.pending.delete(target)
     this.release(pending)
@@ -364,7 +364,7 @@ function plainTextOf(message: BaseMessage): string {
  * numbered option labels; an exact label match wins directly; anything else
  * answers as custom free text.
  */
-function parseQuestionReply(question: AskUserQuestionItem, text: string): AskUserQuestionAnswerItem {
+function parseQuestionReply(question: HarnessQuestionItem, text: string): HarnessQuestionAnswer {
   const options = question.options ?? []
   const normalized = text.trim()
   const id = question.id
@@ -380,7 +380,7 @@ function parseQuestionReply(question: AskUserQuestionItem, text: string): AskUse
 }
 
 /** Markdown explanation of one question: only the text that does not fit the card. */
-function questionMarkdown(question: AskUserQuestionItem, buttons: boolean, vote: boolean): string {
+function questionMarkdown(question: HarnessQuestionItem, buttons: boolean, vote: boolean): string {
   const lines = [
     question.header === undefined ? null : `### ${question.header}`,
     question.question,

@@ -2,8 +2,6 @@ import { Context } from '@deepseek-ai/cordis';
 import z from '@deepseek-ai/schemastery';
 import { BaseMessage, WSClientOptions, WsFrame, EventMessageWith, EnterChatEvent, TemplateCardEventData, WsFrameHeaders, ReplyMsgItem, TemplateCard, UploadMediaOptions, WeComMediaType } from '@wecom/aibot-node-sdk';
 import { EventEmitter } from 'node:events';
-import { ImageMediaType } from '@deepseek-ai/dsh-attachment';
-import { ContentBlock } from '@deepseek-ai/dsh-llm';
 import { IncomingMessage, ServerResponse } from 'node:http';
 import { SettingsNamespace } from '@deepseek-ai/dsh-settings';
 
@@ -142,6 +140,60 @@ interface Config {
 /** Runtime-validated plugin configuration. */
 declare const Config: z<Config>;
 
+/** One text block of model-visible content. */
+interface HarnessTextBlock {
+    type: 'text';
+    text: string;
+}
+/**
+ * Opaque host attachment reference. Message content carries it back to the
+ * harness unchanged, so this boundary never needs to know its shape.
+ */
+type HarnessAttachmentRef = unknown;
+/** Model-visible message content, in the harness message dialect. */
+type HarnessContentBlock = HarnessTextBlock | {
+    type: 'image';
+    attachment: HarnessAttachmentRef;
+};
+/** Attachment budgets the inbound converter plans against. */
+interface HarnessAttachmentLimits {
+    maxImagesPerMessage: number;
+    maxMessageImageBytes: number;
+    maxImageBytes: number;
+}
+/**
+ * One stored image, as the inbound converter reads it.
+ *
+ * The fields are optional because this is the host's own reference described as
+ * data (see `HarnessStoredImage`'s sibling trade-off in `HarnessToolDefinition`):
+ * the converter budgets against `bytes`, labels text fallbacks from
+ * `mediaType`/`name`, and passes the whole value through as the block's
+ * `attachment`. The adapter owns any conversion the host needs.
+ */
+interface HarnessStoredImage {
+    /** Host identity, rendered in diagnostics only. */
+    attachmentId?: unknown;
+    mediaType?: string;
+    bytes?: number;
+    name?: string;
+}
+/** The host attachment store, as the inbound converter needs it. */
+interface HarnessAttachmentPort {
+    readonly imageLimits: HarnessAttachmentLimits;
+    saveImage(input: {
+        data: Uint8Array;
+        mediaType: string;
+        name?: string;
+    }): Promise<HarnessStoredImage>;
+}
+/**
+ * The host view the inbound converter needs: nowhere else does it touch the
+ * host. Keeping this narrow is what lets the converter stay product code.
+ */
+interface HarnessInboundHost {
+    attachments: HarnessAttachmentPort;
+}
+
 /** Minimal official-SDK media download surface used by inbound conversion. */
 interface WeComDownloadPort {
     downloadFile(url: string, aesKey?: string): Promise<{
@@ -149,10 +201,12 @@ interface WeComDownloadPort {
         filename?: string;
     }>;
 }
-/** Build durable DSH content blocks from one WeCom message. */
-declare function inboundContent(ctx: Context, config: Config, client: WeComDownloadPort, message: BaseMessage, includeImages?: boolean): Promise<ContentBlock[]>;
-/** Detect the image formats accepted by Harness attachments from magic bytes. */
-declare function detectImageMediaType(data: Uint8Array): ImageMediaType;
+/** Build harness message content from one WeCom message. */
+declare function inboundContent(host: HarnessInboundHost, config: Config, client: WeComDownloadPort, message: BaseMessage, includeImages?: boolean): Promise<HarnessContentBlock[]>;
+/** Image formats the harness attachment store accepts, detected from magic bytes. */
+type InboundImageMediaType = 'image/png' | 'image/jpeg' | 'image/gif' | 'image/webp';
+/** Detect one of the accepted image formats from magic bytes. */
+declare function detectImageMediaType(data: Uint8Array): InboundImageMediaType;
 
 interface WeComClientPort extends WeComDownloadPort {
     readonly isConnected: boolean;

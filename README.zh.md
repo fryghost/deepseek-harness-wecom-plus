@@ -182,7 +182,7 @@ pnpm install
 pnpm run check
 ```
 
-`pnpm run check` = 宿主类型检查 + 客户端类型检查 + 测试 + 构建。客户端类型检查与构建需要**同级目录的 deepseek-harness 检出**（`../deepseek-harness`，与 deepseek-eyes 相同的约定）；没有检出时仍可运行 `pnpm test`。仓库提交构建后的 `dist/`（含网页插件 `dist/client.js`），因此从 GitHub 安装时不需要授权依赖执行构建脚本。
+`pnpm run check` = 宿主类型检查 + 客户端类型检查 + 测试 + 构建。所有 DSH 类型都从已发布的 `@deepseek-ai/dsh-*` devDependency 解析——客户端半侧把 `@deepseek-ai/dsh-client-*` 钉到本插件所对应的 DSH 发行线——因此不再需要同级目录的 deepseek-harness 检出，整条 check 在 CI 里始终会跑。仓库提交构建后的 `dist/`（含网页插件 `dist/client.js`），因此从 GitHub 安装时不需要授权依赖执行构建脚本。
 
 ## 许可证
 

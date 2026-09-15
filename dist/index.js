@@ -674,18 +674,744 @@ var Config = z.object({
   )
 });
 
-// src/conversations.ts
-import { realpath as realpath3 } from "fs/promises";
+// src/harness/dsh-rc2.ts
+import { realpath } from "fs/promises";
 import { createUserMessage } from "@deepseek-ai/dsh-llm";
 import { SessionId } from "@deepseek-ai/dsh-session";
 import { defineTool } from "@deepseek-ai/dsh-tools";
-import {
-  UserQuestionError as UserQuestionError2
-} from "@deepseek-ai/dsh-user-questions";
+import { UserQuestionError } from "@deepseek-ai/dsh-user-questions";
+
+// src/harness/port.ts
+function harnessSessionId(value) {
+  return value;
+}
+var HarnessQuestionError = class extends Error {
+  constructor(message, code) {
+    super(message);
+    this.code = code;
+    this.name = "HarnessQuestionError";
+  }
+  code;
+};
+
+// src/harness/dsh-rc2.ts
+var GENERATION_PROBE_LIMIT = 200;
+var GENERATION_VACANT_TOLERANCE = 10;
+function resolveSessionPreset(header, events) {
+  let preset = header.agentPreset;
+  for (const event of events) {
+    if (event.type === "agent-preset/selected") {
+      preset = event.data.agentPreset;
+    }
+  }
+  return preset ?? void 0;
+}
+function isNotFound(error) {
+  const message = error instanceof Error ? error.message : String(error);
+  const name2 = error instanceof Error ? error.name : "";
+  return name2 === "SessionPersistenceNotFoundError" || /not found/u.test(message);
+}
+function isAlreadyExists(error) {
+  const message = error instanceof Error ? error.message : String(error);
+  const name2 = error instanceof Error ? error.name : "";
+  return name2 === "SessionAlreadyExistsError" || /already exists|already has a persisted log/u.test(message);
+}
+async function canonicalWorkspacePath(path) {
+  try {
+    return await realpath(path);
+  } catch {
+    return path;
+  }
+}
+function sameCanonicalPath(a, b) {
+  return process.platform === "win32" ? a.toLowerCase() === b.toLowerCase() : a === b;
+}
+function wrapTool(definition) {
+  const { execute } = definition;
+  return {
+    ...definition,
+    execute: (args, exec) => execute(args, { signal: exec.signal })
+  };
+}
+function asAgent(ref) {
+  return ref;
+}
+function normalizeTurnEvent(event) {
+  if (event.type === "step/start") return { type: "step-start" };
+  if (event.type === "assistant/message") {
+    const text = event.data.message.content.filter((block) => block.type === "text").map((block) => block.text).join("");
+    return { type: "message", text, images: [] };
+  }
+  if (event.type === "turn/end") {
+    const reason = event.data.reason;
+    if (reason.kind === "error") return { type: "turn-end", reason: "error", message: reason.error.message };
+    if (reason.kind === "aborted") return { type: "turn-end", reason: "aborted" };
+    return { type: "turn-end", reason: "completed" };
+  }
+  if (event.type !== "assistant/chunk") return void 0;
+  const chunk = event.data.chunk;
+  if (chunk.type === "text-delta") return { type: "text-delta", text: chunk.text };
+  if (chunk.type === "reasoning-delta") return { type: "thought-delta", text: chunk.text };
+  if (chunk.type === "tool-call-delta" && chunk.name !== void 0) {
+    return { type: "tool-start", toolCallId: chunk.name, name: chunk.name };
+  }
+  return void 0;
+}
+function selectTurnEvents(agent, capture) {
+  const logged = agent?.session?.events;
+  const captured = capture?.events ?? [];
+  if (captured.some((event) => event.type === "assistant/message") || logged === void 0) return captured;
+  return logged.slice(capture?.offset ?? 0);
+}
+function createInProcessAdapter(host, options) {
+  return new DshInProcessAdapter(host, options);
+}
+var CAPABILITIES = {
+  streaming: "delta",
+  harnessCommands: true,
+  agentPresets: true,
+  sessionResume: true,
+  sessionList: true,
+  midTurnCancel: true,
+  workspacePerSession: true,
+  interactiveQuestions: true,
+  sessionToolServers: false,
+  systemPromptInjection: true
+};
+var DshInProcessAdapter = class {
+  constructor(ctx, options) {
+    this.ctx = ctx;
+    this.options = options;
+  }
+  ctx;
+  options;
+  log = (message, ...args) => {
+    console.error(message, ...args);
+  };
+  /** Resolved current generation per conversation base id (0 = the base session itself). */
+  generations = /* @__PURE__ */ new Map();
+  /**
+   * Durable per-session workspace. Session `meta.cwd` is immutable on the
+   * host, so switching workspaces goes through a new generation.
+   */
+  sessionCwds = /* @__PURE__ */ new Map();
+  /** Occupied session ids found by probing: 'visible' (listable) or 'hidden' (foreign format; resume migrates it). */
+  occupied = /* @__PURE__ */ new Map();
+  /** In-flight per-base generation probes. */
+  generationProbes = /* @__PURE__ */ new Map();
+  /** Diagnostics: size of the last host list() snapshot (advisory only, see initialize). */
+  lastListedCount = 0;
+  info = {
+    id: "dsh-in-process",
+    transport: "in-process Cordis services (ctx.agents / ctx.sessionPersistence)",
+    capabilities: CAPABILITIES
+  };
+  generationLimit = GENERATION_PROBE_LIMIT;
+  capabilities() {
+    return CAPABILITIES;
+  }
+  /**
+   * The host attachment store, narrowed to what the inbound converter uses.
+   *
+   * `saveImage` hands back the host's own reference untouched: the message
+   * block carries it back to the host later, so converting it here would only
+   * add a round trip. The media type is cast because the converter detects it
+   * from magic bytes and the host declares a narrower union.
+   */
+  attachments() {
+    const store = this.ctx.attachments;
+    return {
+      imageLimits: {
+        maxImagesPerMessage: store.imageLimits.maxImagesPerMessage,
+        maxMessageImageBytes: store.imageLimits.maxMessageImageBytes,
+        maxImageBytes: store.imageLimits.maxImageBytes
+      },
+      saveImage: async (input) => {
+        const saved = await store.saveImage({
+          data: input.data,
+          mediaType: input.mediaType,
+          ...input.name === void 0 ? {} : { name: input.name }
+        });
+        return saved;
+      }
+    };
+  }
+  /**
+   * Advisory only since v0.10.5: the host's list() no longer guarantees a
+   * full disk scan (dsh 0.1.5-rc.2 serves a lazily-populated index), and it
+   * has always skipped foreign-format logs — so the generation truth comes
+   * from per-id inspect() probing at conversation time (currentSession),
+   * never from this snapshot.
+   */
+  async initialize() {
+    try {
+      const headers = await this.ctx.sessionPersistence.list();
+      this.lastListedCount = headers.length;
+    } catch (error) {
+      this.lastListedCount = -1;
+      this.log("[wecom-plus] advisory session list failed: %s", String(error));
+    }
+    this.log(
+      "[wecom-plus] session scan: listed=%d (advisory; generations resolve per conversation via inspect)",
+      this.lastListedCount
+    );
+  }
+  scanSummary() {
+    return {
+      listedCount: this.lastListedCount,
+      occupied: Object.fromEntries(this.occupied),
+      generations: Object.fromEntries(this.generations)
+    };
+  }
+  sessionIdFor(baseKey, generation) {
+    return harnessSessionId(generation === 0 ? baseKey : `${baseKey}-n${generation}`);
+  }
+  /** Current session id, resolving the generation via per-id probing. */
+  async currentSession(baseKey) {
+    return this.sessionIdFor(baseKey, await this.currentGeneration(baseKey));
+  }
+  /**
+   * Resolve the conversation's current generation by probing the host per
+   * id. inspect() reads the disk directly, so it stays authoritative no
+   * matter what list() indexes or skips.
+   */
+  async currentGeneration(baseKey) {
+    const cached = this.generations.get(baseKey);
+    if (cached !== void 0) return cached;
+    const pending = this.generationProbes.get(baseKey);
+    if (pending !== void 0) return pending;
+    const probe = this.probeGenerations(baseKey).then((probed) => Promise.all([probed, this.listedGeneration(baseKey)])).then(([probed, listed]) => Math.max(probed, listed)).finally(() => this.generationProbes.delete(baseKey));
+    this.generationProbes.set(baseKey, probe);
+    const generation = await probe;
+    this.generations.set(baseKey, generation);
+    return generation;
+  }
+  setGeneration(baseKey, generation) {
+    this.generations.set(baseKey, generation);
+  }
+  /** Inspect one candidate id; a missing inspect capability counts as not-found. */
+  async inspectSession(session) {
+    const inspected = await this.inspectRaw(session);
+    const facts = {};
+    const cwd = inspected.meta?.cwd;
+    if (typeof cwd === "string" && cwd.length > 0) facts.cwd = cwd;
+    const preset = resolveSessionPreset(inspected.meta ?? {}, inspected.events ?? []);
+    if (preset !== void 0) facts.agentPreset = preset;
+    return facts;
+  }
+  /** Classify one candidate id: 'visible', 'hidden' (occupied; a resume migrates it), or 'vacant'. */
+  async probeSession(session) {
+    const id = String(session);
+    try {
+      const inspected = await this.inspectRaw(session);
+      this.occupied.set(id, "visible");
+      const cwd = inspected.meta?.cwd;
+      if (typeof cwd === "string" && cwd.length > 0) this.sessionCwds.set(id, cwd);
+      return "visible";
+    } catch (error) {
+      if (isNotFound(error)) return "vacant";
+      this.occupied.set(id, "hidden");
+      return "hidden";
+    }
+  }
+  isMissing(error) {
+    return isNotFound(error);
+  }
+  isCollision(error) {
+    return isAlreadyExists(error);
+  }
+  /** Current workspace of one session (cache → host → default). */
+  async workspaceOf(session) {
+    const id = String(session);
+    const cached = this.sessionCwds.get(id);
+    if (cached !== void 0) return cached;
+    if (this.occupied.get(id) === "visible") {
+      try {
+        const facts = await this.inspectSession(session);
+        if (facts.cwd !== void 0) {
+          this.sessionCwds.set(id, facts.cwd);
+          return facts.cwd;
+        }
+      } catch {
+      }
+    }
+    return this.options.defaultCwd;
+  }
+  noteSessionWorkspace(session, cwd) {
+    this.sessionCwds.set(String(session), cwd);
+  }
+  /**
+   * Occupancy state of one id, for the product-side create/resume path that
+   * has not moved behind the seam yet (next slice).
+   */
+  occupiedState(session) {
+    return this.occupied.get(String(session));
+  }
+  /** Record occupancy discovered by the product-side create/resume path. */
+  markOccupied(session, state) {
+    this.occupied.set(String(session), state);
+  }
+  /** Clear a wrong occupancy guess, letting a later probe reclassify the id. */
+  clearOccupied(session) {
+    this.occupied.delete(String(session));
+  }
+  /** Ids known to be occupied, for retarget walks. */
+  occupiedIds() {
+    return [...this.occupied.keys()];
+  }
+  /** Cached workspace without a host round-trip, when discovery already resolved it. */
+  cachedWorkspace(session) {
+    return this.sessionCwds.get(String(session));
+  }
+  /** Resolved generation without triggering a probe. */
+  generationOf(baseKey) {
+    return this.generations.get(baseKey);
+  }
+  /** Drop all cached discovery state and release owned sessions. */
+  dispose() {
+    for (const record of this.sessions.values()) void record.release();
+    this.sessions.clear();
+    this.creations.clear();
+    this.wiredScopes.clear();
+    this.sessionCwds.clear();
+    this.occupied.clear();
+    this.generationProbes.clear();
+    this.captures.clear();
+  }
+  // -------------------------------------------------------------- lifecycle
+  /** Live sessions this adapter owns or borrows, keyed by session id. */
+  sessions = /* @__PURE__ */ new Map();
+  /** In-flight creations, so concurrent messages on one conversation share an agent. */
+  creations = /* @__PURE__ */ new Map();
+  /** Scope wiring produced by the host's setup callback, consumed by `own`. */
+  wiredScopes = /* @__PURE__ */ new Map();
+  /**
+   * Resolve the session a conversation addresses, creating, resuming, or
+   * borrowing as the host requires.
+   *
+   * Every host-release hazard in this area lives here: whether `create` refuses
+   * an id that already holds a log, whether a log the host cannot read must be
+   * resumed rather than created, and whether the answer is a live agent that
+   * some other surface already owns.
+   */
+  async ensureSession(baseKey, options) {
+    const id = String(baseKey);
+    const existing = this.sessions.get(id);
+    if (existing !== void 0 && this.ctx.agents.get(SessionId(id)) === existing.agent) return existing.session;
+    if (existing !== void 0) {
+      this.sessions.delete(id);
+      await existing.release();
+    }
+    const pending = this.creations.get(id);
+    if (pending !== void 0) return (await pending).session;
+    const creation = this.openSession(id, options).then((record) => {
+      this.sessions.set(id, record);
+      return record;
+    }).finally(() => this.creations.delete(id));
+    this.creations.set(id, creation);
+    return (await creation).session;
+  }
+  async releaseSession(session) {
+    await this.releaseById(String(session.id));
+  }
+  async releaseById(session) {
+    const record = this.sessions.get(session);
+    if (record === void 0) return;
+    this.sessions.delete(session);
+    await record.release();
+  }
+  /**
+   * Cancel a running turn for one conversation base id.
+   *
+   * Synchronous by contract: it checks the base id and the cached generation,
+   * because a cancel may arrive before the generation probe has run.
+   */
+  cancelConversation(baseKey) {
+    const candidates = [baseKey, `${baseKey}-n${this.generations.get(baseKey) ?? 0}`];
+    for (const id of candidates) {
+      const agent = this.sessions.get(id)?.agent ?? this.ctx.agents.get(SessionId(id));
+      if (agent === void 0 || agent.status === "idle") continue;
+      agent.cancel({ kind: "user" });
+      return true;
+    }
+    return false;
+  }
+  /** Execute one harness-native command against a session's agent. */
+  async executeCommand(agent, line, signal) {
+    const live = asAgent(agent);
+    if (live === void 0) return void 0;
+    return await this.ctx.commands.execute(live, line, signal);
+  }
+  /** Best-effort sidebar grouping: attach a session to its workspace record. */
+  async alignWorkspace(session, cwd, allowCreate) {
+    try {
+      const registry = this.workspaceRegistry();
+      if (registry === void 0) return;
+      const canonical = await canonicalWorkspacePath(cwd);
+      const existing = registry.list().find((workspace2) => sameCanonicalPath(workspace2.path, canonical));
+      const workspace = existing ?? (allowCreate ? await registry.create(cwd) : void 0);
+      if (workspace === void 0) return;
+      await workspace.attachSession(SessionId(String(session)));
+    } catch (error) {
+      console.error("[wecom-plus] workspace alignment skipped: %s", String(error));
+    }
+  }
+  /** Find-or-create the host workspace record for one path, without attaching a session. */
+  async ensureWorkspaceRecord(cwd) {
+    try {
+      const registry = this.workspaceRegistry();
+      if (registry === void 0) return;
+      const canonical = await canonicalWorkspacePath(cwd);
+      const existing = registry.list().find((workspace) => sameCanonicalPath(workspace.path, canonical));
+      if (existing === void 0) await registry.create(cwd);
+    } catch (error) {
+      console.error("[wecom-plus] workspace record creation skipped: %s", String(error));
+    }
+  }
+  sameWorkspacePath(a, b) {
+    return sameCanonicalPath(a, b);
+  }
+  /** The agent preset for a new session: the configured override, else the host default. */
+  resolveAgentPreset() {
+    return this.options.agentPreset ?? this.ctx.agentPresets.defaultId;
+  }
+  workspaceRegistry() {
+    return this.ctx.get?.("workspaceRegistry");
+  }
+  async openSession(id, options) {
+    const sessionId = SessionId(id);
+    const live = this.ctx.agents.get(sessionId);
+    if (live !== void 0) return this.borrow(live, id, options);
+    const preset = this.resolveAgentPreset();
+    const selection = this.ctx.agentDefaultModel.currentSelection();
+    const agentOptions = { provider: selection.provider, model: selection.model };
+    if (this.occupied.get(id) === "visible") {
+      let facts = {};
+      try {
+        facts = await this.inspectSession(harnessSessionId(id));
+      } catch {
+      }
+      const resumedCwd = facts.cwd;
+      if (resumedCwd !== void 0) this.sessionCwds.set(id, resumedCwd);
+      try {
+        const handle2 = await this.ctx.agents.resume({
+          resumeSessionId: sessionId,
+          agentOptions,
+          setup: (agentCtx) => this.wire(agentCtx, id, options, facts.agentPreset ?? preset)
+        });
+        const record2 = this.own(handle2, id);
+        if (resumedCwd !== void 0) void this.alignWorkspace(harnessSessionId(id), resumedCwd, false);
+        return record2;
+      } catch (error) {
+        const raced = this.ctx.agents.get(sessionId);
+        if (raced !== void 0) return this.borrow(raced, id, options);
+        throw error;
+      }
+    }
+    if (this.occupied.get(id) === "hidden") {
+      return this.resumeHidden(id, sessionId, agentOptions, options);
+    }
+    const createdCwd = options.cwd ?? this.options.defaultCwd;
+    let handle;
+    try {
+      handle = await this.ctx.agents.create({
+        sessionId,
+        meta: { cwd: createdCwd, agentPreset: preset },
+        agentOptions,
+        setup: (agentCtx) => this.wire(agentCtx, id, options, preset)
+      });
+    } catch (error) {
+      const raced = this.ctx.agents.get(sessionId);
+      if (raced !== void 0) return this.borrow(raced, id, options);
+      if (isAlreadyExists(error)) {
+        this.occupied.set(id, "hidden");
+        if (options.collision === "skip") throw error;
+        return this.resumeHidden(id, sessionId, agentOptions, options);
+      }
+      throw error;
+    }
+    this.occupied.set(id, "visible");
+    this.sessionCwds.set(id, createdCwd);
+    const record = this.own(handle, id);
+    void this.alignWorkspace(harnessSessionId(id), createdCwd, options.allowCreate ?? false);
+    return record;
+  }
+  /** Resume a session occupied by a log the host only publishes on write. */
+  async resumeHidden(id, sessionId, agentOptions, options) {
+    try {
+      const handle = await this.ctx.agents.resume({
+        resumeSessionId: sessionId,
+        agentOptions,
+        setup: (agentCtx) => this.wire(agentCtx, id, options, this.resolveAgentPreset())
+      });
+      this.occupied.set(id, "visible");
+      try {
+        const migrated = await this.inspectSession(harnessSessionId(id));
+        if (migrated.cwd !== void 0) this.sessionCwds.set(id, migrated.cwd);
+      } catch {
+      }
+      return this.own(handle, id);
+    } catch (error) {
+      const raced = this.ctx.agents.get(sessionId);
+      if (raced !== void 0) return this.borrow(raced, id, options);
+      if (isNotFound(error)) this.occupied.delete(id);
+      throw error;
+    }
+  }
+  /** Mount the preset, then run the product's own per-session wiring. */
+  async wire(agentCtx, id, options, preset) {
+    const wired = this.wireScope(agentCtx, id);
+    this.wiredScopes.set(id, wired);
+    await this.ctx.agentPresets.mount(agentCtx, preset);
+    await options.setup?.(wired.scope);
+  }
+  /** Build the scope product code registers tools and prompt sections on. */
+  wireScope(agentCtx, id) {
+    const disposers = [];
+    const track = (dispose) => {
+      disposers.push(dispose);
+      return dispose;
+    };
+    const scope = {
+      mountPreset: async (preset) => {
+        await this.ctx.agentPresets.mount(agentCtx, preset);
+      },
+      registerTool: (definition) => track(agentCtx.tools.register(defineTool(wrapTool(definition)))),
+      appendSystemPrompt: (section) => track(agentCtx.systemPrompt.section(section)),
+      askHost: (request) => this.askHost(agentCtx, id, request)
+    };
+    return {
+      scope,
+      dispose: () => {
+        for (const dispose of disposers.reverse()) {
+          try {
+            dispose();
+          } catch {
+          }
+        }
+      }
+    };
+  }
+  /**
+   * Answer a question through the host's own service, which is what a turn
+   * continued from another surface (the Web UI) must do.
+   */
+  async askHost(agentCtx, id, request) {
+    const service = agentCtx.get("userQuestions");
+    if (service === void 0) {
+      throw new UserQuestionError("no user-questions service is available in this agent", "NO_PROVIDER");
+    }
+    const agent = this.ctx.agents.get(SessionId(id));
+    const answer = await service.ask({
+      questions: request.questions.map((question) => ({
+        id: question.id,
+        question: question.question,
+        ...question.header === void 0 ? {} : { header: question.header },
+        ...question.detail === void 0 ? {} : { detail: question.detail },
+        ...question.options === void 0 ? {} : { options: question.options },
+        ...question.multiSelect === void 0 ? {} : { multiSelect: question.multiSelect }
+      })),
+      ...request.signal === void 0 ? {} : { signal: request.signal },
+      ...agent === void 0 ? {} : { agent }
+    });
+    return {
+      answers: answer.answers.map((item) => ({
+        id: item.id,
+        selected: [...item.selected],
+        ...item.custom === void 0 ? {} : { custom: item.custom }
+      }))
+    };
+  }
+  /** Own a freshly created or resumed agent: disposal tears its scope down. */
+  own(handle, id) {
+    const wired = this.wiredScopes.get(id) ?? this.wireScope(handle.agent.ctx, id);
+    this.wiredScopes.delete(id);
+    return this.record(handle.agent, id, wired, () => handle.dispose());
+  }
+  /** Borrow an agent another surface already owns: release only unwires ours. */
+  borrow(agent, id, options) {
+    const wired = this.wireScope(agent.ctx, id);
+    void options.setup?.(wired.scope);
+    return this.record(agent, id, wired, async () => {
+      wired.dispose();
+    });
+  }
+  record(agent, id, wired, release) {
+    const adapter = this;
+    const session = {
+      id: harnessSessionId(id),
+      get workspace() {
+        return adapter.sessionCwds.get(id) ?? adapter.options.defaultCwd;
+      },
+      agent,
+      send(content) {
+        agent.followup(createUserMessage({ content, source: { kind: "user" } }));
+      },
+      cancel() {
+        agent.cancel({ kind: "user" });
+      },
+      whenIdle: () => agent.whenIdle(),
+      eventCount: () => agent.session?.events?.length,
+      isIdle: () => agent.status === "idle",
+      scope: wired.scope
+    };
+    return { agent, session, release };
+  }
+  // ------------------------------------------------------------------ turns
+  /** In-flight turn capture per session id, reset by beginTurn. */
+  captures = /* @__PURE__ */ new Map();
+  /**
+   * Subscribe to the host's session feed.
+   *
+   * Two channels, because they answer different questions: `activity` fires for
+   * *every* host event and exists so the caller's inactivity watchdog keeps
+   * treating any traffic as progress, while `event` carries only the normalized
+   * subset the product acts on. Unknown variants are dropped rather than
+   * thrown: the host documents `SessionEventMap` as merge-extensible and tells
+   * consumers to fall through instead of switching exhaustively, so a
+   * plugin-added or renamed variant must never break a turn.
+   */
+  subscribeTurns(handler) {
+    return this.ctx.on("session/event", (session, event) => {
+      const id = String(session.id);
+      const capture = this.captures.get(id);
+      if (capture !== void 0) {
+        if (capture.types.length < 50) capture.types.push(event.type);
+        if (event.type !== "assistant/chunk" && capture.events.length < 500) {
+          capture.events.push(event);
+        }
+      }
+      handler.activity(id);
+      const normalized = normalizeTurnEvent(event);
+      if (normalized !== void 0) handler.event(id, normalized);
+    });
+  }
+  /** Start capturing one turn; returns the durable event offset before it. */
+  beginTurn(ref) {
+    const offset = asAgent(ref)?.session?.events?.length;
+    this.captures.set(this.captureKey(ref), {
+      ...offset === void 0 ? {} : { offset },
+      types: [],
+      events: []
+    });
+    return offset;
+  }
+  /** Drop one turn's capture without collecting it. */
+  endTurn(ref) {
+    this.captures.delete(this.captureKey(ref));
+  }
+  /**
+   * Resolve one turn's committed output.
+   *
+   * The host changed which source is authoritative: dsh 0.1.5-rc.2 replaced
+   * `agent.session.events` with a projection and made the feed the source of
+   * truth, while legacy logs and agents borrowed from the Web surface only
+   * expose the durable log. So neither source is trusted unconditionally —
+   * the feed wins only when it actually carries the turn's assistant output.
+   */
+  async collectTurnOutput(ref) {
+    const capture = this.captures.get(this.captureKey(ref));
+    return this.extractOutput(selectTurnEvents(asAgent(ref), capture));
+  }
+  /** Facts for the empty-turn diagnostic; raw type names on purpose (shape drift). */
+  turnDiagnostics(ref) {
+    const agent = asAgent(ref);
+    const events = agent?.session?.events;
+    return {
+      ...events === void 0 ? {} : { eventCount: events.length },
+      sessionKeys: agent?.session === void 0 ? [] : Object.keys(agent.session),
+      eventTypes: this.captures.get(this.captureKey(ref))?.types ?? []
+    };
+  }
+  /** Whether the session's current model declares image input support. */
+  async supportsImageInput(ref) {
+    const agent = asAgent(ref);
+    const { provider, model } = agent?.options ?? {};
+    if (provider === void 0 || model === void 0) return false;
+    const info = await this.ctx.llm.resolveModelInfo(provider, model);
+    return info.inputModalities?.includes("image") ?? false;
+  }
+  /** Feed session id for one live agent; the feed and capture must agree on it. */
+  captureKey(ref) {
+    const session = asAgent(ref)?.session;
+    return session?.id === void 0 ? "" : String(session.id);
+  }
+  /** Extract committed text, images, and the terminal error from raw events. */
+  async extractOutput(events) {
+    const texts = [];
+    const images = [];
+    for (const event of events) {
+      if (event.type !== "assistant/message") continue;
+      for (const block of event.data.message.content) {
+        if (block.type === "text" && block.text.trim()) texts.push(block.text.trim());
+        if (block.type === "image") {
+          const stored = await this.ctx.attachments.readImage(block.attachment);
+          images.push({
+            data: stored.data,
+            mediaType: stored.ref.mediaType,
+            ...stored.ref.name === void 0 ? {} : { name: stored.ref.name }
+          });
+        }
+      }
+    }
+    const finalTurn = [...events].reverse().find((event) => event.type === "turn/end");
+    if (texts.length === 0 && finalTurn?.type === "turn/end" && finalTurn.data.reason.kind === "error") {
+      const { code, message } = finalTurn.data.reason.error;
+      return { texts, images, error: { code, message } };
+    }
+    return { texts, images };
+  }
+  /** One raw inspect() call, tolerating a host without the inspect capability. */
+  async inspectRaw(session) {
+    const persistence = this.ctx.sessionPersistence;
+    if (typeof persistence?.inspect !== "function") {
+      throw Object.assign(new Error("session persistence cannot inspect"), { name: "SessionPersistenceNotFoundError" });
+    }
+    return persistence.inspect(SessionId(String(session)));
+  }
+  async probeGenerations(baseKey) {
+    let highest = 0;
+    let vacantRun = 0;
+    await this.probeSession(this.sessionIdFor(baseKey, 0));
+    for (let generation = 1; generation <= GENERATION_PROBE_LIMIT; generation++) {
+      const state = await this.probeSession(this.sessionIdFor(baseKey, generation));
+      if (state === "vacant") {
+        vacantRun++;
+        if (vacantRun >= GENERATION_VACANT_TOLERANCE) break;
+        continue;
+      }
+      vacantRun = 0;
+      highest = generation;
+    }
+    return highest;
+  }
+  /**
+   * Cross-check against the host's list(). Advisory only (rc.2 serves a
+   * lazily-populated index), but once warm it catches ids the probe window
+   * or a refusal identity might have missed.
+   */
+  async listedGeneration(baseKey) {
+    try {
+      const headers = await this.ctx.sessionPersistence.list();
+      this.lastListedCount = headers.length;
+      const prefix = `${baseKey}-n`;
+      let max = 0;
+      for (const header of headers) {
+        const id = String(header.id);
+        if (!id.startsWith(prefix)) continue;
+        const candidate = Number(id.slice(prefix.length));
+        if (Number.isSafeInteger(candidate)) max = Math.max(max, candidate);
+      }
+      return max;
+    } catch {
+      return 0;
+    }
+  }
+};
 
 // src/inbound-file.ts
 import { createHash } from "crypto";
-import { chmod, mkdir, readFile, realpath, writeFile } from "fs/promises";
+import { chmod, mkdir, readFile, realpath as realpath2, writeFile } from "fs/promises";
 import { isAbsolute, join as join2, relative, sep } from "path";
 var MAX_STORED_FILENAME_BYTES = 180;
 function isExists(error) {
@@ -713,13 +1439,13 @@ async function saveInboundFile(root, conversationId, data, filename, maxBytes) {
     throw new Error(`WeCom file is ${data.byteLength} bytes; configured inbound limit is ${maxBytes} bytes`);
   }
   await mkdir(root, { recursive: true, mode: 448 });
-  const canonicalRoot = await realpath(root);
+  const canonicalRoot = await realpath2(root);
   await chmod(canonicalRoot, 448);
   const conversationKey = createHash("sha256").update(conversationId).digest("hex").slice(0, 32);
   const digest = createHash("sha256").update(data).digest("hex");
   const directory = join2(canonicalRoot, conversationKey, digest);
   await mkdir(directory, { recursive: true, mode: 448 });
-  const canonicalDirectory = await realpath(directory);
+  const canonicalDirectory = await realpath2(directory);
   if (isOutside(canonicalRoot, canonicalDirectory)) {
     throw new Error("wecom-channel: inbound file directory resolves outside its configured root");
   }
@@ -798,14 +1524,15 @@ var SeenMessageIds = class {
 };
 
 // src/inbound.ts
-async function inboundContent(ctx, config, client, message, includeImages = true) {
+async function inboundContent(host, config, client, message, includeImages = true) {
+  const attachments = host.attachments;
   const scope = message.chattype === "group" ? "WeCom group" : "WeCom private chat";
   const textParts = [`[${scope} message from WeCom user ${shortId(message.from.userid)}]`];
   const images = [];
   const files = [];
   collectMessageContent(message, textParts, images, files);
   collectQuotedContent(message, textParts, images, files);
-  const selectedImages = images.slice(0, ctx.attachments.imageLimits.maxImagesPerMessage);
+  const selectedImages = images.slice(0, attachments.imageLimits.maxImagesPerMessage);
   if (selectedImages.length < images.length) {
     textParts.push(
       `[WeCom image omitted: only the first ${selectedImages.length} of ${images.length} images fit one message.]`
@@ -814,8 +1541,8 @@ async function inboundContent(ctx, config, client, message, includeImages = true
   const imageBlocks = [];
   let totalImageBytes = 0;
   for (const image of selectedImages) {
-    const remaining = ctx.attachments.imageLimits.maxMessageImageBytes - totalImageBytes;
-    const maxBytes = Math.min(ctx.attachments.imageLimits.maxImageBytes, remaining);
+    const remaining = attachments.imageLimits.maxMessageImageBytes - totalImageBytes;
+    const maxBytes = Math.min(attachments.imageLimits.maxImageBytes, remaining);
     if (maxBytes <= 0) {
       textParts.push(
         `[WeCom image omitted: the message image byte budget was exhausted after ${imageBlocks.length} image(s).]`
@@ -832,16 +1559,16 @@ async function inboundContent(ctx, config, client, message, includeImages = true
         throw new Error(`exceeds the ${maxBytes}-byte attachment limit`);
       }
       const mediaType = detectImageMediaType(downloaded.buffer);
-      const ref = await ctx.attachments.saveImage({
+      const ref = await attachments.saveImage({
         data: downloaded.buffer,
         mediaType,
         ...downloaded.filename === void 0 ? {} : { name: downloaded.filename }
       });
-      totalImageBytes += ref.bytes;
+      totalImageBytes += ref.bytes ?? 0;
       if (includeImages) {
         imageBlocks.push({ type: "image", attachment: ref });
       } else {
-        const label = downloaded.filename?.trim() || ref.mediaType;
+        const label = downloaded.filename?.trim() || ref.mediaType || mediaType;
         textParts.push([
           `[WeCom image received: ${label}.`,
           `Stored as Harness attachment ${String(ref.attachmentId)}.`,
@@ -950,7 +1677,7 @@ function startsWith(data, prefix) {
 }
 
 // src/outbound-file.ts
-import { realpath as realpath2, stat } from "fs/promises";
+import { realpath as realpath3, stat } from "fs/promises";
 import { basename, isAbsolute as isAbsolute2, relative as relative2, resolve, sep as sep2 } from "path";
 function isMissing(error) {
   return typeof error === "object" && error !== null && "code" in error && error.code === "ENOENT";
@@ -963,7 +1690,7 @@ async function resolveOutboundFile(cwd, requestedPath, maxBytes) {
   if (requestedPath.trim().length === 0) throw new Error("wecom_send_file: path must not be empty");
   let root;
   try {
-    root = await realpath2(cwd);
+    root = await realpath3(cwd);
   } catch (error) {
     if (isMissing(error)) throw new Error(`wecom_send_file: configured cwd does not exist: ${JSON.stringify(cwd)}`);
     throw error;
@@ -975,7 +1702,7 @@ async function resolveOutboundFile(cwd, requestedPath, maxBytes) {
   const unresolved = isAbsolute2(requestedPath) ? requestedPath : resolve(root, requestedPath);
   let path;
   try {
-    path = await realpath2(unresolved);
+    path = await realpath3(unresolved);
   } catch (error) {
     if (isMissing(error)) {
       throw new Error(`wecom_send_file: file does not exist: ${JSON.stringify(requestedPath)}`);
@@ -994,9 +1721,6 @@ async function resolveOutboundFile(cwd, requestedPath, maxBytes) {
 }
 
 // src/questions.ts
-import {
-  UserQuestionError
-} from "@deepseek-ai/dsh-user-questions";
 var BUTTON_LABEL_MAX_CHARS = 6;
 var VOTE_SUBMIT_KEY = "q-submit";
 function selectedOptionIds(event) {
@@ -1130,7 +1854,7 @@ var WeComQuestionBridge = class {
   dispose() {
     for (const pending of this.pending.values()) {
       this.release(pending);
-      pending.reject(new UserQuestionError("the WeCom channel was disposed before the user answered", "ASK_ABORTED"));
+      pending.reject(new HarnessQuestionError("the WeCom channel was disposed before the user answered", "ASK_ABORTED"));
     }
     this.pending.clear();
   }
@@ -1167,7 +1891,7 @@ var WeComQuestionBridge = class {
         const pending2 = this.pending.get(target);
         if (pending2 !== void 0) {
           this.pending.delete(target);
-          pending2.reject(new UserQuestionError(
+          pending2.reject(new HarnessQuestionError(
             `ask_user_question timed out after ${this.config.questionTimeoutMs}ms without an answer`,
             "ASK_TIMEOUT"
           ));
@@ -1189,7 +1913,7 @@ var WeComQuestionBridge = class {
           if (this.pending.get(target) !== pending) return;
           this.pending.delete(target);
           clearTimer();
-          reject(new UserQuestionError("ask_user_question was aborted before the user answered", "ASK_ABORTED"));
+          reject(new HarnessQuestionError("ask_user_question was aborted before the user answered", "ASK_ABORTED"));
         };
         pending.abort = { signal, handler };
         signal.addEventListener("abort", handler, { once: true });
@@ -1266,195 +1990,73 @@ ${question.detail}`
 }
 
 // src/conversations.ts
-async function canonicalWorkspacePath(path) {
-  try {
-    return await realpath3(path);
-  } catch {
-    return path;
-  }
-}
-function sameCanonicalPath(a, b) {
-  return process.platform === "win32" ? a.toLowerCase() === b.toLowerCase() : a === b;
-}
-function resolveSessionPreset(header, events) {
-  let preset = header.agentPreset;
-  for (const event of events) {
-    if (event.type === "agent-preset/selected") {
-      preset = event.data.agentPreset;
-    }
-  }
-  return preset ?? void 0;
-}
-function isNotFound(error) {
-  const message = error instanceof Error ? error.message : String(error);
-  const name2 = error instanceof Error ? error.name : "";
-  return name2 === "SessionPersistenceNotFoundError" || /not found/u.test(message);
-}
-function isAlreadyExists(error) {
-  const message = error instanceof Error ? error.message : String(error);
-  const name2 = error instanceof Error ? error.name : "";
-  return name2 === "SessionAlreadyExistsError" || /already exists|already has a persisted log/u.test(message);
-}
 var EMPTY_TURN_PLACEHOLDER = "\u5904\u7406\u5B8C\u6210\uFF0C\u4F46\u6CA1\u6709\u751F\u6210\u53EF\u53D1\u9001\u7684\u5185\u5BB9\u3002";
 var MAX_CARD_LABEL_TASKS = 500;
-var GENERATION_PROBE_LIMIT = 200;
-var GENERATION_VACANT_TOLERANCE = 10;
 var DISPOSE_DRAIN_TIMEOUT_MS = 1e4;
 var ConversationManager = class {
-  constructor(ctx, config, sendFile, sendQuestionCard, sendQuestionText) {
-    this.ctx = ctx;
+  constructor(host, config, sendFile, sendQuestionCard, sendQuestionText) {
     this.config = config;
     this.sendFile = sendFile;
+    this.harness = createInProcessAdapter(host, {
+      defaultCwd: config.cwd,
+      ...config.agentPreset === void 0 ? {} : { agentPreset: config.agentPreset }
+    });
     this.questions = new WeComQuestionBridge(config, sendQuestionCard, sendQuestionText);
-    this.disposeSessionEvents = ctx.on("session/event", (session, event) => {
-      const active = this.activeStreams.get(String(session.id));
-      if (active === void 0) return;
-      active.lastEventAt = Date.now();
-      if (active.eventTypes.length < 50) active.eventTypes.push(event.type);
-      if (event.type !== "assistant/chunk" && active.events.length < 500) {
-        active.events.push(event);
-      }
-      if (event.type === "step/start") {
-        active.text = "";
-        active.activity = void 0;
-        return;
-      }
-      if (event.type !== "assistant/chunk") return;
-      const chunk = event.data.chunk;
-      if (chunk.type === "text-delta") {
-        active.activity = void 0;
-        active.text += chunk.text;
-        active.transport.pushText(chunk.text);
-      } else if (chunk.type === "tool-call-delta" && chunk.name !== void 0) {
-        active.transport.setActivity(`\u6B63\u5728\u6267\u884C\u5DE5\u5177 \`${chunk.name}\`\u2026`);
+    this.disposeSessionEvents = this.harness.subscribeTurns({
+      activity: (sessionId) => {
+        const active = this.activeStreams.get(sessionId);
+        if (active !== void 0) active.lastEventAt = Date.now();
+      },
+      event: (sessionId, event) => {
+        const active = this.activeStreams.get(sessionId);
+        if (active === void 0) return;
+        if (event.type === "step-start") {
+          active.text = "";
+          active.activity = void 0;
+          return;
+        }
+        if (event.type === "text-delta") {
+          active.activity = void 0;
+          active.text += event.text;
+          active.transport.pushText(event.text);
+          return;
+        }
+        if (event.type === "tool-start") {
+          active.transport.setActivity(`\u6B63\u5728\u6267\u884C\u5DE5\u5177 \`${event.name}\`\u2026`);
+        }
       }
     });
   }
-  ctx;
   config;
   sendFile;
-  bindings = /* @__PURE__ */ new Map();
-  creations = /* @__PURE__ */ new Map();
   queues = /* @__PURE__ */ new Map();
   activeTurns = /* @__PURE__ */ new Map();
   activeStreams = /* @__PURE__ */ new Map();
   pendingCards = /* @__PURE__ */ new Map();
   cardRegistry = /* @__PURE__ */ new Map();
   questions;
-  /** Resolved current generation per WeCom base id (0 = the base session itself). */
-  generations = /* @__PURE__ */ new Map();
-  /** Durable per-session workspace: session meta.cwd is immutable, so switching goes through a new generation. */
-  sessionCwds = /* @__PURE__ */ new Map();
-  /** Occupied session ids found by probing: 'visible' (listable) or 'hidden' (foreign format; resume migrates it). */
-  occupied = /* @__PURE__ */ new Map();
-  /** In-flight per-base generation probes. */
-  generationProbes = /* @__PURE__ */ new Map();
-  /** Diagnostics: size of the last host list() snapshot (advisory only, see initialize). */
-  lastListedCount = 0;
+  /**
+   * Harness seam. Owns session discovery, generation state, host error
+   * identities, and session-preset folding — the surfaces that change on host
+   * releases. Nothing below this line probes the host directly.
+   */
+  /**
+   * Harness seam. Declared only as port interfaces, never as a concrete
+   * adapter: this module is product code and must not know which transport —
+   * in-process today, ACP tomorrow — is behind them.
+   */
+  harness;
   disposeSessionEvents;
   /**
-   * Advisory only since v0.10.5: the host's list() no longer guarantees a
-   * full disk scan (dsh 0.1.5-rc.2 serves a lazily-populated index), and it
-   * has always skipped foreign-format logs — so the generation truth comes
-   * from per-id inspect() probing at conversation time (ensureGeneration),
-   * never from this snapshot.
+   * Advisory startup scan. The adapter owns the host call, its tolerance for
+   * a lazily-populated index, and its diagnostics.
    */
   async initialize() {
-    try {
-      const headers = await this.ctx.sessionPersistence.list();
-      this.lastListedCount = headers.length;
-    } catch (error) {
-      this.lastListedCount = -1;
-      console.error("[wecom-plus] advisory session list failed: %s", String(error));
-    }
-    console.error(
-      "[wecom-plus] session scan: listed=%d (advisory; generations resolve per conversation via inspect)",
-      this.lastListedCount
-    );
+    await this.harness.initialize();
   }
   /** What the generation scan currently sees; surfaced by the session-scan action. */
   scanSummary() {
-    return {
-      listedCount: this.lastListedCount,
-      occupied: Object.fromEntries(this.occupied),
-      generations: Object.fromEntries(this.generations)
-    };
-  }
-  /** Inspect one candidate id; a missing inspect capability counts as not-found. */
-  async inspectCandidate(id) {
-    const persistence = this.ctx.sessionPersistence;
-    if (typeof persistence?.inspect !== "function") {
-      throw Object.assign(new Error("session persistence cannot inspect"), { name: "SessionPersistenceNotFoundError" });
-    }
-    return persistence.inspect(SessionId(id));
-  }
-  /** Classify one candidate id: 'visible', 'hidden' (occupied; a resume migrates it), or 'vacant'. */
-  async probeOne(id) {
-    try {
-      const inspected = await this.inspectCandidate(id);
-      this.occupied.set(id, "visible");
-      const cwd = inspected.meta?.cwd;
-      if (typeof cwd === "string" && cwd.length > 0) this.sessionCwds.set(id, cwd);
-      return "visible";
-    } catch (error) {
-      if (isNotFound(error)) return "vacant";
-      this.occupied.set(id, "hidden");
-      return "hidden";
-    }
-  }
-  async probeGenerations(baseId) {
-    let highest = 0;
-    let vacantRun = 0;
-    await this.probeOne(baseId);
-    for (let generation = 1; generation <= GENERATION_PROBE_LIMIT; generation++) {
-      const state = await this.probeOne(`${baseId}-n${generation}`);
-      if (state === "vacant") {
-        vacantRun++;
-        if (vacantRun >= GENERATION_VACANT_TOLERANCE) break;
-        continue;
-      }
-      vacantRun = 0;
-      highest = generation;
-    }
-    return highest;
-  }
-  /**
-   * Resolve the conversation's current generation by probing the host per
-   * id. inspect() reads the disk directly, so it stays authoritative no
-   * matter what list() indexes or skips.
-   */
-  async ensureGeneration(baseId) {
-    const cached = this.generations.get(baseId);
-    if (cached !== void 0) return cached;
-    const pending = this.generationProbes.get(baseId);
-    if (pending !== void 0) return pending;
-    const probe = this.probeGenerations(baseId).then((probed) => Promise.all([probed, this.listedGeneration(baseId)])).then(([probed, listed]) => Math.max(probed, listed)).finally(() => this.generationProbes.delete(baseId));
-    this.generationProbes.set(baseId, probe);
-    const generation = await probe;
-    this.generations.set(baseId, generation);
-    return generation;
-  }
-  /**
-   * Cross-check against the host's list(). Advisory only (rc.2 serves a
-   * lazily-populated index), but once warm it catches ids the probe window
-   * or a refusal identity might have missed.
-   */
-  async listedGeneration(baseId) {
-    try {
-      const headers = await this.ctx.sessionPersistence.list();
-      this.lastListedCount = headers.length;
-      const prefix = `${baseId}-n`;
-      let max = 0;
-      for (const header of headers) {
-        const id = String(header.id);
-        if (!id.startsWith(prefix)) continue;
-        const candidate = Number(id.slice(prefix.length));
-        if (Number.isSafeInteger(candidate)) max = Math.max(max, candidate);
-      }
-      return max;
-    } catch {
-      return 0;
-    }
+    return this.harness.scanSummary();
   }
   /** Process one inbound message after earlier work in the same WeCom conversation. */
   process(message, client, transport) {
@@ -1556,7 +2158,7 @@ var ConversationManager = class {
     this.cancel(message);
     await this.enqueue(baseId, async () => {
       const id = await this.currentSessionId(baseId);
-      const nextCwd = cwd ?? await this.resolveWorkspace(id);
+      const nextCwd = cwd ?? await this.harness.workspaceOf(harnessSessionId(id));
       await this.advanceToWorkspace(baseId, nextCwd, cwd !== void 0);
     });
   }
@@ -1568,7 +2170,7 @@ var ConversationManager = class {
    */
   async retargetAll(cwd) {
     const bases = /* @__PURE__ */ new Set();
-    for (const id of this.occupied.keys()) {
+    for (const id of this.harness.occupiedIds()) {
       const base = id.replace(/-n[1-9][0-9]*$/u, "");
       if (base.startsWith("wecom-v2-")) bases.add(base);
     }
@@ -1576,8 +2178,8 @@ var ConversationManager = class {
       await this.enqueue(baseId, async () => {
         try {
           const currentId = await this.currentSessionId(baseId);
-          const currentCwd = this.sessionCwds.get(currentId) ?? this.config.cwd;
-          if (sameCanonicalPath(currentCwd, cwd)) return;
+          const currentCwd = this.harness.cachedWorkspace(currentId) ?? this.config.cwd;
+          if (this.harness.sameWorkspacePath(currentCwd, cwd)) return;
           this.cancelBase(baseId);
           await this.advanceToWorkspace(baseId, cwd, true);
         } catch (error) {
@@ -1593,21 +2195,17 @@ var ConversationManager = class {
   async advanceToWorkspace(baseId, nextCwd, allowCreate) {
     const id = await this.currentSessionId(baseId);
     this.pendingCards.delete(id);
-    const binding = this.bindings.get(id);
-    if (binding !== void 0) {
-      this.bindings.delete(id);
-      await binding.release();
-    }
-    let generation = await this.ensureGeneration(baseId);
-    for (let attempt = 0; attempt <= GENERATION_PROBE_LIMIT; attempt++) {
+    await this.harness.releaseById(id);
+    let generation = await this.harness.currentGeneration(baseId);
+    for (let attempt = 0; attempt <= this.harness.generationLimit; attempt++) {
       const candidate = generation + 1 + attempt;
       if (!Number.isSafeInteger(candidate)) throw new Error("WeCom conversation generation is exhausted");
       try {
-        await this.getOrCreate(this.sessionIdForGeneration(baseId, candidate), nextCwd, allowCreate, "skip");
-        this.generations.set(baseId, candidate);
+        await this.sessionFor(this.sessionIdForGeneration(baseId, candidate), nextCwd, allowCreate, "skip");
+        this.harness.setGeneration(baseId, candidate);
         return;
       } catch (error) {
-        if (!isAlreadyExists(error)) throw error;
+        if (!this.harness.isCollision(error)) throw error;
       }
     }
     throw new Error("WeCom conversation generation is exhausted");
@@ -1617,14 +2215,13 @@ var ConversationManager = class {
     const baseId = sessionIdFor(this.config.accountId, message);
     return this.enqueue(baseId, async () => {
       const id = await this.currentSessionId(baseId);
-      const binding = await this.getOrCreate(id);
-      const agent = binding.agent;
+      const session = await this.sessionFor(id);
       await withTimeout(
-        agent.whenIdle(),
+        session.whenIdle(),
         this.config.responseTimeoutMs,
         "DeepSeek Harness conversation availability"
       );
-      const start = agent.session?.events?.length ?? 0;
+      this.harness.beginTurn(session.agent);
       const capture = {
         transport: {
           pushText() {
@@ -1642,9 +2239,7 @@ var ConversationManager = class {
         },
         text: "",
         activity: void 0,
-        lastEventAt: Date.now(),
-        eventTypes: [],
-        events: []
+        lastEventAt: Date.now()
       };
       this.activeStreams.set(id, capture);
       const controller = new AbortController();
@@ -1653,17 +2248,18 @@ var ConversationManager = class {
       }, this.config.responseTimeoutMs);
       this.activeTurns.set(id, chatTarget(message));
       try {
-        const execution = await this.ctx.commands.execute(agent, line, controller.signal);
+        const execution = await this.harness.executeCommand(session.agent, line, controller.signal);
         if (execution === void 0) {
           this.takeCards(id);
           return { execution, response: void 0 };
         }
-        await withTimeout(agent.whenIdle(), this.config.responseTimeoutMs, "DeepSeek Harness command response");
-        const turnEvents = capture.events.some((event) => event.type === "assistant/message") || agent.session?.events === void 0 ? capture.events : (agent.session?.events ?? []).slice(start);
-        const response = turnEvents.some((event) => event.type === "assistant/message") ? this.finalizeReply(id, await this.collectReply(agent, turnEvents)) : (this.takeCards(id), void 0);
+        await withTimeout(session.whenIdle(), this.config.responseTimeoutMs, "DeepSeek Harness command response");
+        const output = await this.harness.collectTurnOutput(session.agent);
+        const response = output.texts.length > 0 || output.images.length > 0 ? this.finalizeReply(id, this.replyFromOutput(output)) : (this.takeCards(id), void 0);
         return { execution, response };
       } finally {
         clearTimeout(timer);
+        this.harness.endTurn(session.agent);
         this.activeStreams.delete(id);
         this.activeTurns.delete(id);
       }
@@ -1675,14 +2271,7 @@ var ConversationManager = class {
   }
   /** Cancel active work for one base id (synchronous best effort). */
   cancelBase(baseId) {
-    const candidates = [baseId, `${baseId}-n${this.generations.get(baseId) ?? 0}`];
-    for (const id of candidates) {
-      const agent = this.bindings.get(id)?.agent ?? this.ctx.agents.get(SessionId(id));
-      if (agent === void 0 || agent.status === "idle") continue;
-      agent.cancel({ kind: "user" });
-      return true;
-    }
-    return false;
+    return this.harness.cancelConversation(baseId);
   }
   /** Dispose every bridge-owned Agent after queued work settles (bounded: a running turn must not block a channel restart). */
   async dispose() {
@@ -1690,17 +2279,13 @@ var ConversationManager = class {
       Promise.allSettled(this.queues.values()),
       new Promise((resolve2) => setTimeout(resolve2, DISPOSE_DRAIN_TIMEOUT_MS))
     ]);
-    await Promise.allSettled([...this.bindings.values()].map((binding) => binding.release()));
     this.disposeSessionEvents();
     this.questions.dispose();
-    this.bindings.clear();
     this.activeTurns.clear();
     this.activeStreams.clear();
     this.pendingCards.clear();
     this.cardRegistry.clear();
-    this.sessionCwds.clear();
-    this.occupied.clear();
-    this.generationProbes.clear();
+    this.harness.dispose();
   }
   enqueue(baseId, operation) {
     const previous = this.queues.get(baseId) ?? Promise.resolve();
@@ -1718,48 +2303,53 @@ var ConversationManager = class {
     return current;
   }
   sessionIdForGeneration(baseId, generation) {
-    return generation === 0 ? baseId : `${baseId}-n${generation}`;
+    return String(this.harness.sessionIdFor(baseId, generation));
   }
   /** Current session id, resolving the generation via per-id probing. */
   async currentSessionId(baseId) {
-    return this.sessionIdForGeneration(baseId, await this.ensureGeneration(baseId));
+    return String(await this.harness.currentSession(baseId));
   }
   /** Human-readable dump of why a completed turn produced nothing. */
-  emptyTurnNote(stream, agent) {
-    const note = `\uFF08\u8BCA\u65AD\uFF1A\u6D41\u4E8B\u4EF6[${stream.eventTypes.join(",") || "\u65E0"}] \u6D41\u6587\u672C${stream.text.length}\u5B57 \u4F1A\u8BDD\u4E8B\u4EF6${String(agent.session?.events?.length)} session\u5B57\u6BB5[${Object.keys(agent.session ?? {}).join(",") || "\u65E0"}]\uFF09`;
+  emptyTurnNote(stream, session) {
+    const facts = this.harness.turnDiagnostics(session.agent);
+    const note = `\uFF08\u8BCA\u65AD\uFF1A\u6D41\u4E8B\u4EF6[${facts.eventTypes.join(",") || "\u65E0"}] \u6D41\u6587\u672C${stream.text.length}\u5B57 \u4F1A\u8BDD\u4E8B\u4EF6${String(facts.eventCount)} session\u5B57\u6BB5[${facts.sessionKeys.join(",") || "\u65E0"}]\uFF09`;
     console.error("[wecom-plus] empty turn: %s", note);
     return note;
   }
   async processNow(id, message, client, transport) {
-    const binding = await this.getOrCreate(id);
-    const agent = binding.agent;
-    const content = await inboundContent(this.ctx, this.config, client, message, await this.includeImages(agent));
-    await withTimeout(agent.whenIdle(), this.config.responseTimeoutMs, "DeepSeek Harness conversation availability");
-    const events = agent.session?.events ?? [];
-    const start = events.length;
+    const session = await this.sessionFor(id);
+    const content = await inboundContent(
+      { attachments: this.harness.attachments() },
+      this.config,
+      client,
+      message,
+      await this.includeImages(session)
+    );
+    await withTimeout(session.whenIdle(), this.config.responseTimeoutMs, "DeepSeek Harness conversation availability");
+    this.harness.beginTurn(session.agent);
     this.activeTurns.set(id, chatTarget(message));
-    const stream = { transport, text: "", activity: void 0, lastEventAt: Date.now(), eventTypes: [], events: [] };
+    const stream = { transport, text: "", activity: void 0, lastEventAt: Date.now() };
     this.activeStreams.set(id, stream);
     try {
-      agent.followup(createUserMessage({ content, source: { kind: "user" } }));
+      session.send(content);
       try {
-        await this.awaitTurnCompletion(agent, stream);
+        await this.awaitTurnCompletion(session, stream);
       } catch (error) {
-        agent.cancel({ kind: "user" });
-        await agent.whenIdle();
+        session.cancel();
+        await session.whenIdle();
         await transport.fail("\u751F\u6210\u8D85\u65F6\uFF08\u957F\u65F6\u95F4\u6CA1\u6709\u4EFB\u4F55\u8FDB\u5C55\uFF09\uFF0C\u5DF2\u53D6\u6D88\u672C\u6B21\u751F\u6210\uFF0C\u8BF7\u91CD\u65B0\u53D1\u9001\u3002");
         throw error;
       }
-      const fallbackEvents = (agent.session?.events ?? []).slice(start);
-      const turnEvents = stream.events.some((event) => event.type === "assistant/message") || agent.session?.events === void 0 ? stream.events : fallbackEvents;
-      const collected = await this.collectReply(agent, turnEvents);
+      const output = await this.harness.collectTurnOutput(session.agent);
+      const collected = this.replyFromOutput(output);
       if (collected.text.trim() === "" && collected.images.length === 0) {
+        const facts = this.harness.turnDiagnostics(session.agent);
         console.error(
           "[wecom-plus] empty turn: streamEvents=%s streamText=%d sessionEventCount=%s sessionKeys=%s",
-          JSON.stringify(stream.eventTypes),
+          JSON.stringify(facts.eventTypes),
           stream.text.length,
-          String(agent.session?.events?.length),
-          JSON.stringify(Object.keys(agent.session ?? {}))
+          String(facts.eventCount),
+          JSON.stringify(facts.sessionKeys)
         );
       }
       const reply = this.finalizeReply(id, {
@@ -1767,11 +2357,12 @@ var ConversationManager = class {
         images: collected.images
       });
       if (reply.text === "" || reply.text === EMPTY_TURN_PLACEHOLDER) {
-        reply.text += this.emptyTurnNote(stream, agent);
+        reply.text += this.emptyTurnNote(stream, session);
       }
       await transport.finish(reply);
       return reply;
     } finally {
+      this.harness.endTurn(session.agent);
       this.activeStreams.delete(id);
       this.activeTurns.delete(id);
     }
@@ -1784,7 +2375,7 @@ var ConversationManager = class {
    * emitting entirely — is cancelled, so the conversation queue cannot wedge
    * forever without killing legitimately long work.
    */
-  awaitTurnCompletion(agent, stream) {
+  awaitTurnCompletion(session, stream) {
     return new Promise((resolve2, reject) => {
       let settled = false;
       let timer;
@@ -1795,7 +2386,7 @@ var ConversationManager = class {
         if (outcome === true) resolve2();
         else reject(outcome);
       };
-      void agent.whenIdle().then(
+      void session.whenIdle().then(
         () => settle(true),
         (error) => settle(error instanceof Error ? error : new Error(String(error)))
       );
@@ -1803,7 +2394,7 @@ var ConversationManager = class {
         const remaining = stream.lastEventAt + this.config.responseTimeoutMs - Date.now();
         timer = setTimeout(() => {
           if (settled) return;
-          if (agent.status === "idle") return settle(true);
+          if (session.isIdle()) return settle(true);
           const idleFor = Date.now() - stream.lastEventAt;
           if (idleFor < this.config.responseTimeoutMs) return arm();
           settle(new Error(`DeepSeek Harness response stalled: no session event within ${this.config.responseTimeoutMs}ms`));
@@ -1813,16 +2404,15 @@ var ConversationManager = class {
     });
   }
   async processCardEventNow(id, message, selectedLabel, transport) {
-    const binding = await this.getOrCreate(id);
-    const agent = binding.agent;
-    const scope = message.chattype === "group" ? "WeCom group" : "WeCom private chat";
+    const session = await this.sessionFor(id);
+    const channelScope = message.chattype === "group" ? "WeCom group" : "WeCom private chat";
     const facts = cardEventFacts(message.event);
     const taskId = facts.taskId?.trim() || "\uFF08\u65E0\uFF09";
     const eventKey = facts.eventKey?.trim() || "\uFF08\u65E0\uFF09";
     const content = [{
       type: "text",
       text: [
-        `[${scope} template card button click from WeCom user ${message.from.userid}]`,
+        `[${channelScope} template card button click from WeCom user ${message.from.userid}]`,
         `task_id: ${taskId}`,
         `event_key: ${eventKey}`,
         ...selectedLabel === void 0 ? [] : [`selected option: ${selectedLabel}`],
@@ -1830,35 +2420,33 @@ var ConversationManager = class {
         "The user clicked a button (or submitted a selection) on a WeCom template card you sent earlier. Answer the click in your reply."
       ].join("\n")
     }];
-    await withTimeout(agent.whenIdle(), this.config.responseTimeoutMs, "DeepSeek Harness conversation availability");
-    const events = agent.session?.events ?? [];
-    const start = events.length;
+    await withTimeout(session.whenIdle(), this.config.responseTimeoutMs, "DeepSeek Harness conversation availability");
+    this.harness.beginTurn(session.agent);
     this.activeTurns.set(id, chatTarget(message));
-    const stream = { transport, text: "", activity: void 0, lastEventAt: Date.now(), eventTypes: [], events: [] };
+    const stream = { transport, text: "", activity: void 0, lastEventAt: Date.now() };
     this.activeStreams.set(id, stream);
     try {
-      agent.followup(createUserMessage({ content, source: { kind: "user" } }));
+      session.send(content);
       try {
-        await this.awaitTurnCompletion(agent, stream);
+        await this.awaitTurnCompletion(session, stream);
       } catch (error) {
-        agent.cancel({ kind: "user" });
-        await agent.whenIdle();
+        session.cancel();
+        await session.whenIdle();
         await transport.fail("\u751F\u6210\u8D85\u65F6\uFF08\u957F\u65F6\u95F4\u6CA1\u6709\u4EFB\u4F55\u8FDB\u5C55\uFF09\uFF0C\u5DF2\u53D6\u6D88\u672C\u6B21\u751F\u6210\uFF0C\u8BF7\u91CD\u65B0\u53D1\u9001\u3002");
         throw error;
       }
-      const fallbackEvents = (agent.session?.events ?? []).slice(start);
-      const turnEvents = stream.events.some((event) => event.type === "assistant/message") || agent.session?.events === void 0 ? stream.events : fallbackEvents;
-      const collected = await this.collectReply(agent, turnEvents);
+      const collected = this.replyFromOutput(await this.harness.collectTurnOutput(session.agent));
       const reply = this.finalizeReply(id, {
         text: collected.text.trim() || stream.text.trim(),
         images: collected.images
       });
       if (reply.text === "" || reply.text === EMPTY_TURN_PLACEHOLDER) {
-        reply.text += this.emptyTurnNote(stream, agent);
+        reply.text += this.emptyTurnNote(stream, session);
       }
       await transport.finish(reply);
       return reply;
     } finally {
+      this.harness.endTurn(session.agent);
       this.activeStreams.delete(id);
       this.activeTurns.delete(id);
     }
@@ -1880,148 +2468,29 @@ var ConversationManager = class {
     this.pendingCards.delete(id);
     return cards;
   }
-  async includeImages(agent) {
+  /** Product policy decides whether images are wanted; the adapter knows whether they are possible. */
+  async includeImages(session) {
     if (this.config.imageInputMode === "always") return true;
     if (this.config.imageInputMode === "never") return false;
-    const { provider, model } = agent.options;
-    if (provider === void 0 || model === void 0) return false;
-    const info = await this.ctx.llm.resolveModelInfo(provider, model);
-    return info.inputModalities?.includes("image") ?? false;
+    return this.harness.supportsImageInput(session.agent);
   }
-  /** Current workspace of one WeCom conversation (cache → persistence → default). */
+  /** Current workspace of one WeCom conversation (cache → host → default). */
   async workspaceOf(message) {
     const baseId = sessionIdFor(this.config.accountId, message);
-    return this.resolveWorkspace(await this.currentSessionId(baseId));
-  }
-  async resolveWorkspace(id) {
-    const cached = this.sessionCwds.get(id);
-    if (cached !== void 0) return cached;
-    if (this.occupied.get(id) === "visible") {
-      try {
-        const inspected = await this.inspectCandidate(id);
-        const cwd = inspected.meta?.cwd;
-        if (typeof cwd === "string" && cwd.length > 0) {
-          this.sessionCwds.set(id, cwd);
-          return cwd;
-        }
-      } catch {
-      }
-    }
-    return this.config.cwd;
-  }
-  async getOrCreate(id, cwd, allowCreate = false, collision = "resume") {
-    const sessionId = SessionId(id);
-    const existing = this.bindings.get(id);
-    if (existing !== void 0 && this.ctx.agents.get(sessionId) === existing.agent) return existing;
-    if (existing !== void 0) {
-      this.bindings.delete(id);
-      await existing.release();
-    }
-    const pending = this.creations.get(id);
-    if (pending !== void 0) return pending;
-    const creation = this.createOrResume(id, cwd, allowCreate, collision).finally(() => this.creations.delete(id));
-    this.creations.set(id, creation);
-    const binding = await creation;
-    this.bindings.set(id, binding);
-    return binding;
-  }
-  async createOrResume(id, cwd, allowCreate = false, collision = "resume") {
-    const sessionId = SessionId(id);
-    const live = this.ctx.agents.get(sessionId);
-    if (live !== void 0) return this.borrowAgent(live, id);
-    const current = this.ctx.agentDefaultModel.currentSelection();
-    const agentOptions = { provider: current.provider, model: current.model };
-    if (this.occupied.get(id) === "visible") {
-      const inspected = await this.inspectCandidate(id);
-      const agentPreset2 = resolveSessionPreset(inspected.meta, inspected.events ?? []) ?? this.resolveAgentPreset();
-      const inspectedCwd = inspected.meta?.cwd;
-      let resumedCwd;
-      if (typeof inspectedCwd === "string" && inspectedCwd.length > 0) {
-        resumedCwd = inspectedCwd;
-        this.sessionCwds.set(id, resumedCwd);
-      }
-      try {
-        const handle2 = await this.ctx.agents.resume({
-          resumeSessionId: sessionId,
-          agentOptions,
-          setup: (agentCtx) => this.setupAgent(agentCtx, agentPreset2, id)
-        });
-        if (resumedCwd !== void 0) void this.alignWorkspace(id, resumedCwd, false);
-        return this.ownAgent(handle2);
-      } catch (error) {
-        const raced = this.ctx.agents.get(sessionId);
-        if (raced !== void 0) return this.borrowAgent(raced, id);
-        throw error;
-      }
-    }
-    if (this.occupied.get(id) === "hidden") {
-      return this.resumeHidden(id, sessionId, agentOptions);
-    }
-    const agentPreset = this.resolveAgentPreset();
-    const createdCwd = cwd ?? this.config.cwd;
-    let handle;
-    try {
-      handle = await this.ctx.agents.create({
-        sessionId,
-        meta: { cwd: createdCwd, agentPreset },
-        agentOptions,
-        setup: (agentCtx) => this.setupAgent(agentCtx, agentPreset, id)
-      });
-    } catch (error) {
-      const raced = this.ctx.agents.get(sessionId);
-      if (raced !== void 0) return this.borrowAgent(raced, id);
-      if (isAlreadyExists(error)) {
-        this.occupied.set(id, "hidden");
-        if (collision === "skip") throw error;
-        return this.resumeHidden(id, sessionId, agentOptions);
-      }
-      throw error;
-    }
-    this.occupied.set(id, "visible");
-    this.sessionCwds.set(id, createdCwd);
-    void this.alignWorkspace(id, createdCwd, allowCreate);
-    return this.ownAgent(handle);
-  }
-  /** Resume a session occupied by a foreign-format log; migrating it on open. */
-  async resumeHidden(id, sessionId, agentOptions) {
-    try {
-      const handle = await this.ctx.agents.resume({
-        resumeSessionId: sessionId,
-        agentOptions,
-        setup: (agentCtx) => this.setupAgent(agentCtx, this.resolveAgentPreset(), id)
-      });
-      this.occupied.set(id, "visible");
-      try {
-        const migrated = await this.inspectCandidate(id);
-        const migratedCwd = migrated.meta.cwd;
-        if (typeof migratedCwd === "string" && migratedCwd.length > 0) this.sessionCwds.set(id, migratedCwd);
-      } catch {
-      }
-      return this.ownAgent(handle);
-    } catch (error) {
-      const raced = this.ctx.agents.get(sessionId);
-      if (raced !== void 0) return this.borrowAgent(raced, id);
-      if (isNotFound(error)) this.occupied.delete(id);
-      throw error;
-    }
+    return this.harness.workspaceOf(await this.harness.currentSession(baseId));
   }
   /**
-   * Best-effort sidebar grouping: attach the session to the host workspace
-   * record for its cwd, creating that record only when `allowCreate` (an
-   * explicit /ws switch). Never throws: grouping must not break messaging.
+   * Resolve the conversation's session. Creation, resumption, collision
+   * handling, and workspace alignment all live behind the harness seam; this
+   * only supplies the channel's own per-session wiring.
    */
-  async alignWorkspace(id, cwd, allowCreate) {
-    try {
-      const registry = this.ctx.get?.("workspaceRegistry");
-      if (registry === void 0) return;
-      const canonical = await canonicalWorkspacePath(cwd);
-      const existing = registry.list().find((workspace2) => sameCanonicalPath(workspace2.path, canonical));
-      const workspace = existing ?? (allowCreate ? await registry.create(cwd) : void 0);
-      if (workspace === void 0) return;
-      await workspace.attachSession(SessionId(id));
-    } catch (error) {
-      console.error("[wecom-plus] workspace alignment skipped: %s", String(error));
-    }
+  async sessionFor(id, cwd, allowCreate = false, collision = "resume") {
+    return this.harness.ensureSession(id, {
+      allowCreate,
+      collision,
+      setup: (scope) => this.setupAgent(scope, id),
+      ...cwd === void 0 ? {} : { cwd }
+    });
   }
   /**
    * Find-or-create the host workspace record for one candidate path (no
@@ -2029,46 +2498,17 @@ var ConversationManager = class {
    * before any session lands in it. Never throws.
    */
   async ensureWorkspaceRecord(cwd) {
-    try {
-      const registry = this.ctx.get?.("workspaceRegistry");
-      if (registry === void 0) return;
-      const canonical = await canonicalWorkspacePath(cwd);
-      const existing = registry.list().find((workspace) => sameCanonicalPath(workspace.path, canonical));
-      if (existing === void 0) await registry.create(cwd);
-    } catch (error) {
-      console.error("[wecom-plus] workspace record creation skipped: %s", String(error));
-    }
+    await this.harness.ensureWorkspaceRecord(cwd);
   }
-  ownAgent(handle) {
-    return { agent: handle.agent, release: () => handle.dispose() };
-  }
-  borrowAgent(agent, id) {
-    const disposeInstructions = this.registerWeComInstructions(agent.ctx, id);
-    const disposeFileTool = this.registerFileTool(agent.ctx, id);
-    const disposeCardTool = this.registerCardTool(agent.ctx, id);
-    const disposeQuestions = this.registerAskTool(agent.ctx, id);
-    let released = false;
-    return {
-      agent,
-      release: async () => {
-        if (released) return;
-        released = true;
-        disposeQuestions();
-        disposeCardTool();
-        disposeFileTool();
-        disposeInstructions();
-      }
-    };
-  }
-  resolveAgentPreset() {
-    return this.config.agentPreset ?? this.ctx.agentPresets.defaultId;
-  }
-  async setupAgent(agentCtx, agentPreset, id) {
-    await this.ctx.agentPresets.mount(agentCtx, agentPreset);
-    this.registerWeComInstructions(agentCtx, id);
-    this.registerFileTool(agentCtx, id);
-    this.registerCardTool(agentCtx, id);
-    this.registerAskTool(agentCtx, id);
+  /**
+   * Install the channel's prompt section and tools on one session scope. The
+   * agent preset is mounted by the adapter, which resolved it.
+   */
+  async setupAgent(scope, id) {
+    this.registerWeComInstructions(scope, id);
+    this.registerFileTool(scope, id);
+    this.registerCardTool(scope, id);
+    this.registerAskTool(scope, id);
   }
   /**
    * Register a channel-scoped `ask_user_question` tool that shadows the
@@ -2077,12 +2517,11 @@ var ConversationManager = class {
    * - WeCom-initiated turns present the question as Markdown + template card
    *   and settle it from card clicks or chat replies;
    * - any other turn (the user continued this same session from the Web UI)
-   *   delegates to the shared userQuestions service, so the Web question panel
+   *   delegates to the host's question service, so the Web question panel
    *   behaves exactly as before.
    */
-  registerAskTool(agentCtx, id) {
-    const userQuestions = agentCtx.get("userQuestions");
-    return agentCtx.tools.register(defineTool({
+  registerAskTool(scope, id) {
+    return scope.registerTool({
       name: "ask_user_question",
       description: "Ask the user a concise question when you need confirmation, a choice, or missing information before proceeding. Send one or more questions, each with a stable id that will be echoed in the answer. When the current turn comes from WeCom, each question renders as a Markdown message plus a WeCom template card: keep option labels SHORT (at most 6 characters \u2014 longer labels are visually truncated by the WeCom client, and the channel then falls back to numbered replies), and put the full explanation of each choice into the question text or the option descriptions instead.",
       parameters: {
@@ -2154,10 +2593,7 @@ var ConversationManager = class {
           })),
           signal: exec.signal
         };
-        const result = this.activeTurns.get(id) === void 0 ? await requireUserQuestions(userQuestions).ask({
-          ...request,
-          ...exec.agent === void 0 ? {} : { agent: exec.agent }
-        }) : await this.questions.present(
+        const result = this.activeTurns.get(id) === void 0 ? await scope.askHost(request) : await this.questions.present(
           request,
           this.activeTurns.get(id),
           // Route the question's messages through the turn's transport so
@@ -2174,22 +2610,23 @@ var ConversationManager = class {
           }))
         };
       }
-    }));
+    });
   }
-  registerWeComInstructions(agentCtx, id) {
-    return agentCtx.systemPrompt.section({
+  registerWeComInstructions(scope, id) {
+    const section = {
       name: "channel:wecom",
       order: 190,
       text: () => {
         if (!this.activeTurns.has(id)) return "";
-        const cwd = this.sessionCwds.get(id);
+        const cwd = this.harness.cachedWorkspace(id);
         return cwd === void 0 ? this.config.systemPrompt : `${this.config.systemPrompt}
 The workspace of this conversation is ${cwd}.`;
       }
-    });
+    };
+    return scope.appendSystemPrompt(section);
   }
-  registerFileTool(agentCtx, id) {
-    return agentCtx.tools.register(defineTool({
+  registerFileTool(scope, id) {
+    const definition = {
       name: "wecom_send_file",
       description: "Send one existing regular file from the configured workspace to the user who initiated the current WeCom turn. Use this when the WeCom user asks to receive or download a local file. The path may be absolute or relative to the workspace; paths outside the workspace and files over the configured size limit are rejected. Never use it for credentials or secrets.",
       parameters: {
@@ -2219,7 +2656,11 @@ The workspace of this conversation is ${cwd}.`;
           throw new Error("wecom_send_file: no active WeCom turn; this tool cannot send files from another channel");
         }
         exec.signal.throwIfAborted();
-        const file = await resolveOutboundFile(await this.resolveWorkspace(id), args.path, this.config.maxOutboundFileBytes);
+        const file = await resolveOutboundFile(
+          await this.harness.workspaceOf(harnessSessionId(id)),
+          args.path,
+          this.config.maxOutboundFileBytes
+        );
         exec.signal.throwIfAborted();
         await this.sendFile(target, file);
         return { name: file.name, bytes: file.bytes };
@@ -2231,10 +2672,11 @@ The workspace of this conversation is ${cwd}.`;
         rawInput: args.path,
         locations: [{ path: args.path }]
       })
-    }));
+    };
+    return scope.registerTool(definition);
   }
-  registerCardTool(agentCtx, id) {
-    return agentCtx.tools.register(defineTool({
+  registerCardTool(scope, id) {
+    const definition = {
       name: "wecom_send_card",
       description: "Send one WeCom template card to the user who initiated the current WeCom turn. The card is delivered as a second message right after the main Markdown reply, so one turn becomes one Markdown message plus one card. Prefer this tool when the user must choose among options or confirm/cancel an action: put the FULL option details in your Markdown reply and put SHORT labels (at most 6 characters, or the WeCom client visually truncates them) on the card buttons. Display text is truncated to the WeCom card limits (title 26, desc 30, subtitle 112 characters), so never duplicate the full reply inside the card. Only valid during an active WeCom turn.",
       parameters: {
@@ -2400,41 +2842,25 @@ The workspace of this conversation is ${cwd}.`;
         kind: "execute",
         rawInput: args.title
       })
-    }));
+    };
+    return scope.registerTool(definition);
   }
-  async collectReply(agent, events) {
-    const texts = [];
-    const images = [];
-    for (const event of events) {
-      if (event.type !== "assistant/message") continue;
-      for (const block of event.data.message.content) {
-        if (block.type === "text" && block.text.trim()) texts.push(block.text.trim());
-        if (block.type === "image") {
-          const stored = await this.ctx.attachments.readImage(block.attachment);
-          images.push({
-            data: stored.data,
-            mediaType: stored.ref.mediaType,
-            ...stored.ref.name === void 0 ? {} : { name: stored.ref.name }
-          });
-        }
-      }
+  /**
+   * Product-facing wording for one adapter-reported turn outcome. The adapter
+   * reports what the host committed (texts, images, a terminal error); the
+   * Chinese copy and the empty-turn sentinel are channel UX and stay here.
+   */
+  replyFromOutput(output) {
+    const images = output.images;
+    if (output.texts.length === 0 && output.error !== void 0) {
+      return { text: `\u5904\u7406\u5931\u8D25\uFF08${output.error.code}\uFF09\uFF0C\u8BF7\u7A0D\u540E\u91CD\u8BD5\u3002`, images };
     }
-    const finalTurn = [...events].reverse().find((event) => event.type === "turn/end");
-    if (texts.length === 0 && finalTurn?.type === "turn/end" && finalTurn.data.reason.kind === "error") {
-      return { text: `\u5904\u7406\u5931\u8D25\uFF08${finalTurn.data.reason.error.code}\uFF09\uFF0C\u8BF7\u7A0D\u540E\u91CD\u8BD5\u3002`, images };
-    }
-    if (texts.length === 0 && images.length === 0) {
+    if (output.texts.length === 0 && images.length === 0) {
       return { text: EMPTY_TURN_PLACEHOLDER, images };
     }
-    return { text: texts.join("\n\n"), images };
+    return { text: output.texts.join("\n\n"), images };
   }
 };
-function requireUserQuestions(service) {
-  if (service === void 0) {
-    throw new UserQuestionError2("no user-questions service is available in this agent", "NO_PROVIDER");
-  }
-  return service;
-}
 
 // src/settings-web.ts
 import { credentialRef } from "@deepseek-ai/dsh-credentials";
@@ -2443,7 +2869,7 @@ import {
 } from "@deepseek-ai/dsh-settings";
 
 // src/version.ts
-var PLUGIN_VERSION = "0.10.16";
+var PLUGIN_VERSION = "0.10.18";
 
 // src/settings-web.ts
 var SETTINGS_ROUTE = "/_dsh/deepseek-harness-wecom-plus/settings";

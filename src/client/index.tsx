@@ -193,6 +193,10 @@ export class WeComSettingsController {
   async setKey(value: string, settings: UserSettings, expectedRevision: number): Promise<boolean> {
     const trimmed = value.trim()
     if (trimmed.length === 0) return false
+    if (settings.botId.trim() === trimmed) {
+      this.set({ ...this.state, error: 'Bot ID 与 Secret 不能相同，请分别复制两项。', message: undefined })
+      return false
+    }
     ++this.generation
     this.set({ ...this.state, action: 'set-key', error: undefined, message: undefined })
     try {

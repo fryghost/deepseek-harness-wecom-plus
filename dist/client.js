@@ -136,6 +136,10 @@ var WeComSettingsController = class {
   async setKey(value, settings, expectedRevision) {
     const trimmed = value.trim();
     if (trimmed.length === 0) return false;
+    if (settings.botId.trim() === trimmed) {
+      this.set({ ...this.state, error: "Bot ID \u4E0E Secret \u4E0D\u80FD\u76F8\u540C\uFF0C\u8BF7\u5206\u522B\u590D\u5236\u4E24\u9879\u3002", message: void 0 });
+      return false;
+    }
     ++this.generation;
     this.set({ ...this.state, action: "set-key", error: void 0, message: void 0 });
     try {

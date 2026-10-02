@@ -140,6 +140,9 @@ export class WeComHarnessBridge {
   private client: WeComClientPort | undefined
   private stopping = false
   private lastError: string | undefined
+  private authError: string | undefined
+  private authenticated = false
+  private connectionFailed = false
   /** Task ids whose click was already processed; re-clicks are dropped. */
   private readonly consumedCardTasks = new Set<string>()
   /** Per-conversation pending workspace confirmation (switch/add). */
@@ -184,10 +187,10 @@ export class WeComHarnessBridge {
   /** Latest channel fact for configuration surfaces. */
   status(): { state: 'inactive' | 'connecting' | 'connected'; detail?: string } {
     const client = this.client
-    if (client === undefined) {
+    if (client === undefined || this.stopping || this.connectionFailed) {
       return { state: 'inactive', ...(this.lastError === undefined ? {} : { detail: this.lastError }) }
     }
-    if (client.isConnected) return { state: 'connected' }
+    if (this.authenticated && client.isConnected) return { state: 'connected' }
     return { state: 'connecting', ...(this.lastError === undefined ? {} : { detail: this.lastError }) }
   }
 
@@ -220,12 +223,22 @@ export class WeComHarnessBridge {
       )
       return
     }
+    if (this.config.botId.trim() === secret) {
+      this.lastError = 'Bot ID 与 Secret 完全相同，请从同一个智能机器人管理页面分别复制两项。'
+      this.log.error(this.lastError)
+      throw new Error(this.lastError)
+    }
     await this.conversations.initialize()
     const client = this.createClient(secret)
     this.client = client
     const ready = Promise.withResolvers<void>()
     let readySettled = false
     const resolveReady = (): void => {
+      if (this.stopping) return
+      this.authenticated = true
+      this.connectionFailed = false
+      this.authError = undefined
+      this.lastError = undefined
       if (readySettled) return
       readySettled = true
       ready.resolve()
@@ -239,13 +252,17 @@ export class WeComHarnessBridge {
     client.on('connected', () => this.log.info('WeCom WebSocket connected; authenticating'))
     client.on('authenticated', resolveReady)
     client.on('disconnected', reason => {
+      this.authenticated = false
       if (!this.stopping) this.log.warn('WeCom WebSocket disconnected: %s', reason)
     })
     client.on('reconnecting', attempt => this.log.warn('WeCom WebSocket reconnect attempt %d', attempt))
     client.on('error', error => {
-      this.lastError = error.message
+      if (/Authentication failed:/u.test(error.message)) this.authError = error.message
+      this.lastError = this.authError ?? error.message
       if (error instanceof WSAuthFailureError || error instanceof WSReconnectExhaustedError) {
-        rejectReady(error)
+        this.authenticated = false
+        this.connectionFailed = true
+        rejectReady(new Error(this.lastError))
       }
       if (!this.stopping) this.log.error('WeCom WebSocket error: %s', error.message)
     })
@@ -261,6 +278,7 @@ export class WeComHarnessBridge {
       await withTimeout(ready.promise, this.config.startupTimeoutMs, 'WeCom authentication')
       this.log.info('WeCom AI Bot authenticated for Bot ID %s', this.config.botId)
     } catch (error) {
+      this.lastError ??= error instanceof Error ? error.message : String(error)
       await this.stop()
       throw error
     }
@@ -270,6 +288,7 @@ export class WeComHarnessBridge {
   async stop(): Promise<void> {
     if (this.stopping) return
     this.stopping = true
+    this.authenticated = false
     this.client?.disconnect()
     await this.conversations.dispose()
   }

@@ -13,7 +13,7 @@ import type {
   WeComMediaType,
   WsFrameHeaders,
 } from '@wecom/aibot-node-sdk'
-import { EventType } from '@wecom/aibot-node-sdk'
+import { EventType, WSAuthFailureError } from '@wecom/aibot-node-sdk'
 import { WeComHarnessBridge } from '../src/bridge.js'
 import { SETTINGS_NS } from '../src/settings-web.js'
 import { sessionIdFor } from '../src/util.js'
@@ -115,7 +115,7 @@ class FakeClient {
     await this.emit('event.template_card_event', { headers: { req_id: `evreq-${body.msgid}` }, body })
   }
 
-  private async emit(event: string, ...args: unknown[]): Promise<void> {
+  async emit(event: string, ...args: unknown[]): Promise<void> {
     for (const handler of this.handlers.get(event) ?? []) await handler(...args as never[])
   }
 }
@@ -199,6 +199,53 @@ function textMessage(content: string, msgid = 'm1'): BaseMessage {
 }
 
 describe('WeComHarnessBridge', () => {
+  it('rejects identical Bot ID and Secret before opening a socket', async () => {
+    const factory = vi.fn()
+    const bridge = new WeComHarnessBridge(commandContext('test-bot'), testConfig(), factory as never)
+    await expect(bridge.start()).rejects.toThrow('Bot ID 与 Secret 完全相同')
+    expect(factory).not.toHaveBeenCalled()
+    expect(bridge.status()).toMatchObject({ state: 'inactive', detail: expect.stringContaining('完全相同') })
+    await bridge.stop()
+  })
+
+  it('requires authentication for connected status and clears errors after reconnect', async () => {
+    const client = new FakeClient()
+    client.connect = () => { client.isConnected = true; return client }
+    const bridge = new WeComHarnessBridge(commandContext('resolved-secret'), testConfig(), () => client as never)
+    const starting = bridge.start()
+    await vi.waitFor(() => expect(client.isConnected).toBe(true))
+    expect(bridge.status().state).toBe('connecting')
+    await client.emit('authenticated')
+    await starting
+    expect(bridge.status()).toEqual({ state: 'connected' })
+    await client.emit('disconnected', 'test disconnect')
+    await client.emit('error', new Error('Authentication failed: invalid bot_id or secret (code: 853000)'))
+    expect(bridge.status()).toMatchObject({ state: 'connecting', detail: expect.stringContaining('853000') })
+    await client.emit('authenticated')
+    expect(bridge.status()).toEqual({ state: 'connected' })
+    await client.emit('error', new Error('Authentication failed: invalid bot_id or secret (code: 853000)'))
+    await client.emit('error', new WSAuthFailureError(2))
+    expect(bridge.status()).toMatchObject({ state: 'inactive', detail: expect.stringContaining('853000') })
+    await bridge.stop()
+    expect(bridge.status().state).toBe('inactive')
+  })
+
+  it('preserves the server authentication error when the SDK exhausts retries', async () => {
+    const client = new FakeClient()
+    client.connect = () => {
+      client.isConnected = true
+      queueMicrotask(() => {
+        void client.emit('error', new Error('Authentication failed: invalid bot_id or secret (code: 853000)'))
+        void client.emit('error', new WSAuthFailureError(2))
+      })
+      return client
+    }
+    const bridge = new WeComHarnessBridge(commandContext('resolved-secret'), testConfig(), () => client as never)
+    await expect(bridge.start()).rejects.toThrow('853000')
+    expect(bridge.status()).toMatchObject({ state: 'inactive', detail: expect.stringContaining('invalid bot_id or secret') })
+    expect(client.isConnected).toBe(false)
+  })
+
   it('resolves the secret, authenticates, and replies to a live command', async () => {
     const client = new FakeClient()
     const factory = vi.fn((options: WSClientOptions) => {

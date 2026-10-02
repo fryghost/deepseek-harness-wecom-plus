@@ -73,6 +73,17 @@ function backendWithCli(cli: Record<string, unknown>) {
 }
 
 describe('WeCom settings web backend', () => {
+  it('rejects a Secret identical to Bot ID without overwriting credentials or restarting', async () => {
+    const restart = vi.fn()
+    const { instance, set } = backend(testConfig(), true, undefined, restart)
+    const { res, captured } = mockResponse()
+    await instance.handle(mockRequest('POST', { action: 'set-key', value: 'test-bot' }), res)
+    expect(captured.status).toBe(400)
+    expect(captured.body.error?.message).toContain('不能相同')
+    expect(set).not.toHaveBeenCalled()
+    expect(restart).not.toHaveBeenCalled()
+  })
+
   it('serves a settings snapshot without any credential value', async () => {
     const { instance } = backend()
     const { res, captured } = mockResponse()

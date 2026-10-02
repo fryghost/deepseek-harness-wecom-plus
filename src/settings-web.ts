@@ -392,6 +392,9 @@ export class WeComWebBackend {
    */
   private async setKey(value: string): Promise<WeComSettingsSnapshot> {
     const config = descriptorOf(this.ctx).value as unknown as Config
+    if (config.botId.trim() && value.trim() === config.botId.trim()) {
+      throw new Error('Bot ID 与 Secret 不能相同。请从同一个智能机器人管理页面分别复制两项。')
+    }
     await this.ctx.credentials.set(credentialRef(config.secretRef), value)
     this.onCredentialChange?.()
     return this.snapshot()

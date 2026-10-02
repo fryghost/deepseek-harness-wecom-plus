@@ -259,6 +259,9 @@ declare class WeComHarnessBridge {
     private client;
     private stopping;
     private lastError;
+    private authError;
+    private authenticated;
+    private connectionFailed;
     /** Task ids whose click was already processed; re-clicks are dropped. */
     private readonly consumedCardTasks;
     /** Per-conversation pending workspace confirmation (switch/add). */

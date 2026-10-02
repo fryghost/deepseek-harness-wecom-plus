@@ -155,6 +155,8 @@ pnpm dsh plugin --profile web add /absolute/path/to/deepseek-harness-wecom-plus
 
 ## 验证
 
+插件的连接与鉴权日志会直接输出到启动 DSH 的终端，设置页仅在鉴权成功后显示「已连接」。`Max auth failure attempts exceeded (2)` 表示连续两次鉴权失败；页面会保留此前企微返回的具体原因。例如 `853000 / invalid bot_id or secret` 表示 Bot ID 或 Secret 不正确，请从同一个智能机器人管理页面分别复制两项并「保存连接」。两项完全相同时，插件会直接提示并拦截。Secret 不会显示在日志或设置查询结果中。
+
 日志出现 `WeCom AI Bot authenticated` 后，在企微中向机器人发送 `/bot-ping`，应收到：
 
 ```text

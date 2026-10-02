@@ -20,6 +20,7 @@ describe('DSH 0.2 profile composition', () => {
     const home = await mkdtemp(join(tmpdir(), 'wecom-profile-'))
     const dir = join(home, 'profiles', 'test')
     let ctx: Awaited<ReturnType<typeof boot>> | undefined
+    const output = vi.spyOn(console, 'info').mockImplementation(() => {})
     try {
       initProfile(dir, ['test-bundle'])
       const bundle = join(dir, 'node_modules', 'test-bundle')
@@ -46,6 +47,8 @@ describe('DSH 0.2 profile composition', () => {
         Object.assign(root.loader.builtins, { editor: ConfigEditor, settings: Settings, wecom: WeCom })
       })
       ctx = await start()
+      ctx.logger(WeCom.name).info('terminal exporter check')
+      expect(output).toHaveBeenCalledWith('[wecom-plus] %s', 'terminal exporter check')
       const descriptor = () => ctx!.settings.describe().find(row => row.ns === SETTINGS_NS)!
       const entry = [...ctx.loader.entries()].find(row => row.options.id === SETTINGS_NS)!
       const fiber = entry.fiber
@@ -59,10 +62,14 @@ describe('DSH 0.2 profile composition', () => {
       expect(await readFile(profile.patchPath, 'utf8')).toContain('新版设置已保存')
       await expect(ctx.settings.update(SETTINGS_NS, { questionTimeoutMs: 1 })).rejects.toThrow()
       await ctx.fiber.dispose()
+      output.mockClear()
+      ctx.logger(WeCom.name).info('disposed exporter check')
+      expect(output).not.toHaveBeenCalled()
       ctx = await start()
       expect(descriptor().value).toMatchObject({ welcomeText: '新版设置已保存', workspaces: [home] })
     } finally {
       await ctx?.fiber.dispose()
+      output.mockRestore()
       await rm(home, { recursive: true, force: true })
     }
   })

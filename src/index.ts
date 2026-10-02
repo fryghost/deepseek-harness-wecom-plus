@@ -1,6 +1,7 @@
 /** WeCom AI Bot channel bundle for DeepSeek Harness. */
 
 import type { Context, Volatile } from '@deepseek-ai/cordis'
+import { format } from 'node:util'
 import z from '@deepseek-ai/schemastery'
 import type {} from '@deepseek-ai/dsh-settings'
 import { WeComCliService } from './cli.js'
@@ -38,6 +39,14 @@ export { SETTINGS_NS, SETTINGS_ROUTE, parseRequest, WeComWebBackend } from './se
  * dormant channel — never a failed plugin mount.
  */
 export async function apply(ctx: Context, config: Volatile<WeComConfig>): Promise<void> {
+  // DSH buffers Cordis logs without necessarily exporting them to the terminal.
+  // Export only this channel's non-debug records, with plugin-owned disposal.
+  ctx.logger.exporter({
+    levels: { default: 2 },
+    export: ({ name: scope, type, args }) => {
+      if (scope === name && type !== 'debug') console[type]('[wecom-plus] %s', format(...args))
+    },
+  })
   const log = ctx.logger(name)
   const cli = new WeComCliService()
   const current = (): WeComConfig => PlainConfig(structuredClone(config.get()) as WeComConfig)

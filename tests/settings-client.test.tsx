@@ -65,6 +65,19 @@ const secretInput = () => inputs().find(input => input.props.type === 'password'
 const saveConnection = () => renderer!.root.findAllByType('button').find(button => /保存连接|保存 Secret/.test(button.children.join('')))!
 
 describe('settings connection form', () => {
+  it('rejects identical fields before making writes and retains both inputs', async () => {
+    const requests = await mount()
+    act(() => {
+      botInput().props.onChange({ target: { value: 'test-bot' } })
+      secretInput().props.onChange({ target: { value: 'test-bot' } })
+    })
+    await act(async () => { saveConnection().props.onClick() })
+    expect(requests).toEqual([])
+    expect(botInput().props.value).toBe('test-bot')
+    expect(secretInput().props.value).toBe('test-bot')
+    expect(JSON.stringify(renderer!.toJSON())).toContain('不能相同')
+  })
+
   it('also saves a pasted Secret when the bottom Save and Apply button is used', async () => {
     const requests = await mount()
     act(() => {

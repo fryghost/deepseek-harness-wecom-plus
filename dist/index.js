@@ -1,4 +1,5 @@
 // src/index.ts
+import { format } from "util";
 import z2 from "@deepseek-ai/schemastery";
 
 // src/cli.ts
@@ -2886,7 +2887,7 @@ import {
 } from "@deepseek-ai/dsh-settings";
 
 // src/version.ts
-var PLUGIN_VERSION = "0.10.20";
+var PLUGIN_VERSION = "0.10.21";
 
 // src/settings-web.ts
 var SETTINGS_ROUTE = "/_dsh/deepseek-harness-wecom-plus/settings";
@@ -3137,6 +3138,9 @@ var WeComWebBackend = class {
    */
   async setKey(value) {
     const config = descriptorOf(this.ctx).value;
+    if (config.botId.trim() && value.trim() === config.botId.trim()) {
+      throw new Error("Bot ID \u4E0E Secret \u4E0D\u80FD\u76F8\u540C\u3002\u8BF7\u4ECE\u540C\u4E00\u4E2A\u667A\u80FD\u673A\u5668\u4EBA\u7BA1\u7406\u9875\u9762\u5206\u522B\u590D\u5236\u4E24\u9879\u3002");
+    }
     await this.ctx.credentials.set(credentialRef(config.secretRef), value);
     this.onCredentialChange?.();
     return this.snapshot();
@@ -3265,6 +3269,9 @@ var WeComHarnessBridge = class {
   client;
   stopping = false;
   lastError;
+  authError;
+  authenticated = false;
+  connectionFailed = false;
   /** Task ids whose click was already processed; re-clicks are dropped. */
   consumedCardTasks = /* @__PURE__ */ new Set();
   /** Per-conversation pending workspace confirmation (switch/add). */
@@ -3278,10 +3285,10 @@ var WeComHarnessBridge = class {
   /** Latest channel fact for configuration surfaces. */
   status() {
     const client = this.client;
-    if (client === void 0) {
+    if (client === void 0 || this.stopping || this.connectionFailed) {
       return { state: "inactive", ...this.lastError === void 0 ? {} : { detail: this.lastError } };
     }
-    if (client.isConnected) return { state: "connected" };
+    if (this.authenticated && client.isConnected) return { state: "connected" };
     return { state: "connecting", ...this.lastError === void 0 ? {} : { detail: this.lastError } };
   }
   /** Read-only conversation-scan diagnostics for the Settings self-check. */
@@ -3311,12 +3318,22 @@ var WeComHarnessBridge = class {
       );
       return;
     }
+    if (this.config.botId.trim() === secret) {
+      this.lastError = "Bot ID \u4E0E Secret \u5B8C\u5168\u76F8\u540C\uFF0C\u8BF7\u4ECE\u540C\u4E00\u4E2A\u667A\u80FD\u673A\u5668\u4EBA\u7BA1\u7406\u9875\u9762\u5206\u522B\u590D\u5236\u4E24\u9879\u3002";
+      this.log.error(this.lastError);
+      throw new Error(this.lastError);
+    }
     await this.conversations.initialize();
     const client = this.createClient(secret);
     this.client = client;
     const ready = Promise.withResolvers();
     let readySettled = false;
     const resolveReady = () => {
+      if (this.stopping) return;
+      this.authenticated = true;
+      this.connectionFailed = false;
+      this.authError = void 0;
+      this.lastError = void 0;
       if (readySettled) return;
       readySettled = true;
       ready.resolve();
@@ -3329,13 +3346,17 @@ var WeComHarnessBridge = class {
     client.on("connected", () => this.log.info("WeCom WebSocket connected; authenticating"));
     client.on("authenticated", resolveReady);
     client.on("disconnected", (reason) => {
+      this.authenticated = false;
       if (!this.stopping) this.log.warn("WeCom WebSocket disconnected: %s", reason);
     });
     client.on("reconnecting", (attempt) => this.log.warn("WeCom WebSocket reconnect attempt %d", attempt));
     client.on("error", (error) => {
-      this.lastError = error.message;
+      if (/Authentication failed:/u.test(error.message)) this.authError = error.message;
+      this.lastError = this.authError ?? error.message;
       if (error instanceof WSAuthFailureError || error instanceof WSReconnectExhaustedError) {
-        rejectReady(error);
+        this.authenticated = false;
+        this.connectionFailed = true;
+        rejectReady(new Error(this.lastError));
       }
       if (!this.stopping) this.log.error("WeCom WebSocket error: %s", error.message);
     });
@@ -3350,6 +3371,7 @@ var WeComHarnessBridge = class {
       await withTimeout(ready.promise, this.config.startupTimeoutMs, "WeCom authentication");
       this.log.info("WeCom AI Bot authenticated for Bot ID %s", this.config.botId);
     } catch (error) {
+      this.lastError ??= error instanceof Error ? error.message : String(error);
       await this.stop();
       throw error;
     }
@@ -3358,6 +3380,7 @@ var WeComHarnessBridge = class {
   async stop() {
     if (this.stopping) return;
     this.stopping = true;
+    this.authenticated = false;
     this.client?.disconnect();
     await this.conversations.dispose();
   }
@@ -4468,6 +4491,12 @@ var inject = [
   "systemPrompt"
 ];
 async function apply(ctx, config) {
+  ctx.logger.exporter({
+    levels: { default: 2 },
+    export: ({ name: scope, type, args }) => {
+      if (scope === name && type !== "debug") console[type]("[wecom-plus] %s", format(...args));
+    }
+  });
   const log = ctx.logger(name);
   const cli = new WeComCliService();
   const current = () => Config(structuredClone(config.get()));

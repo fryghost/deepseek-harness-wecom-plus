@@ -17,7 +17,7 @@ import { EventType } from '@wecom/aibot-node-sdk'
 import { WeComHarnessBridge } from '../src/bridge.js'
 import { SETTINGS_NS } from '../src/settings-web.js'
 import { sessionIdFor } from '../src/util.js'
-import { testConfig } from './fixtures.js'
+import { testConfig, testSession } from './fixtures.js'
 
 interface SentReply {
   content: string
@@ -143,7 +143,7 @@ function agentContext(
   const agent = {
     status: 'idle',
     options: { provider: 'deepseek', model: 'deepseek-chat' },
-    session: { events },
+    session: testSession(events),
     followup: vi.fn(() => {
       events.push({
         type: 'assistant/message',
@@ -601,7 +601,7 @@ describe('WeComHarnessBridge', () => {
     const agent = {
       status: 'idle',
       options: { provider: 'deepseek', model: 'deepseek-chat' },
-      session: { events },
+      session: testSession(events),
       followup: vi.fn(() => {
         if (askTool === undefined) throw new Error('ask_user_question was not registered')
         events.push({
@@ -741,7 +741,7 @@ describe('WeComHarnessBridge', () => {
     await bridge.start()
     await client.message(textMessage('/GOAL Keep API Names', 'm-goal'))
 
-    expect(execute).toHaveBeenCalledWith(expect.anything(), '/goal Keep API Names', expect.any(AbortSignal))
+    expect(execute).toHaveBeenCalledWith(expect.anything(), '/goal Keep API Names', [], expect.any(AbortSignal))
     expect(client.replies[0]?.content).toBe('目标已更新。')
     await bridge.stop()
   })
@@ -774,19 +774,18 @@ describe('WeComHarnessBridge', () => {
     const events: unknown[] = []
     let idle = true
     const waiters: Array<() => void> = []
-    let sessionEvent: ((session: { id: string }, event: unknown) => void) | undefined
+    let streamEvent: ((payload: unknown) => void) | undefined
     const config = testConfig({ streamHeartbeatMs: 100 })
     const message = textMessage('busy work', 'm-heartbeat')
     const agent = {
       get status(): string { return idle ? 'idle' : 'running' },
       options: { provider: 'deepseek', model: 'deepseek-chat' },
-      session: { events },
+      session: testSession(events),
       followup: vi.fn(() => {
         idle = false
         // A tool call starts streaming, then the tool executes silently.
-        sessionEvent?.({ id: sessionIdFor(config.accountId, message) }, {
-          type: 'assistant/chunk',
-          data: { chunk: { type: 'tool-call-delta', name: 'bash' } },
+        streamEvent?.({ agent: { session: { id: sessionIdFor(config.accountId, message) } },
+          frame: { type: 'chunk', chunk: { type: 'tool-call-delta', id: 'call-bash', name: 'bash' } },
         })
       }),
       whenIdle: vi.fn(() => idle
@@ -800,7 +799,7 @@ describe('WeComHarnessBridge', () => {
     const ctx = {
       logger: vi.fn(() => ({ info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() })),
       on: vi.fn((event: string, handler: (session: { id: string }, ev: unknown) => void) => {
-        if (event === 'session/event') sessionEvent = handler
+        if (event === 'agent/assistant-stream') streamEvent = handler as unknown as (payload: unknown) => void
         return vi.fn()
       }),
       credentials: { resolve: vi.fn(async () => ({ value: 'resolved-secret', source: 'test' })) },

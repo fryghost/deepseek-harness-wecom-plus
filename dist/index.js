@@ -1,3 +1,6 @@
+// src/index.ts
+import z2 from "@deepseek-ai/schemastery";
+
 // src/cli.ts
 import { spawn } from "child_process";
 var MIN_CLI_VERSION = "1.1.0";
@@ -650,10 +653,8 @@ var Config = z.object({
   // Turn INACTIVITY limit: a running turn is cancelled only after this much
   // time with no session events (text deltas, tool calls, step boundaries).
   // A long turn that keeps producing events is never killed, no matter how
-  // long it runs in total. NOTE: since dsh 0.1.5-rc.2 no events are emitted
-  // between request/header and assistant/message, so on rc.2+ this limit
-  // effectively bounds the whole silent generation — raise it for
-  // long-running tasks.
+  // long it runs in total. DSH 0.2 transient assistant-stream frames also
+  // count as progress between request/header and assistant/message.
   responseTimeoutMs: z.number().step(1).min(1).default(9e5),
   // Streaming-bubble heartbeat: when nothing streams for this long, re-send a
   // frame with animated dots and elapsed time so the bubble visibly stays
@@ -748,19 +749,24 @@ function normalizeTurnEvent(event) {
     if (reason.kind === "aborted") return { type: "turn-end", reason: "aborted" };
     return { type: "turn-end", reason: "completed" };
   }
-  if (event.type !== "assistant/chunk") return void 0;
-  const chunk = event.data.chunk;
+  return void 0;
+}
+function normalizeChunk(chunk) {
   if (chunk.type === "text-delta") return { type: "text-delta", text: chunk.text };
   if (chunk.type === "reasoning-delta") return { type: "thought-delta", text: chunk.text };
   if (chunk.type === "tool-call-delta" && chunk.name !== void 0) {
-    return { type: "tool-start", toolCallId: chunk.name, name: chunk.name };
+    return { type: "tool-start", toolCallId: chunk.id, name: chunk.name };
   }
   return void 0;
 }
+function sessionEvents(agent) {
+  return agent?.session?.snapshotEvents();
+}
 function selectTurnEvents(agent, capture) {
-  const logged = agent?.session?.events;
   const captured = capture?.events ?? [];
-  if (captured.some((event) => event.type === "assistant/message") || logged === void 0) return captured;
+  if (captured.some((event) => event.type === "assistant/message")) return captured;
+  const logged = sessionEvents(agent);
+  if (logged === void 0) return captured;
   return logged.slice(capture?.offset ?? 0);
 }
 function createInProcessAdapter(host, options) {
@@ -1040,7 +1046,7 @@ var DshInProcessAdapter = class {
   async executeCommand(agent, line, signal) {
     const live = asAgent(agent);
     if (live === void 0) return void 0;
-    return await this.ctx.commands.execute(live, line, signal);
+    return await this.ctx.commands.execute(live, line, [], signal);
   }
   /** Best-effort sidebar grouping: attach a session to its workspace record. */
   async alignWorkspace(session, cwd, allowCreate) {
@@ -1084,7 +1090,7 @@ var DshInProcessAdapter = class {
     if (live !== void 0) return this.borrow(live, id, options);
     const preset = this.resolveAgentPreset();
     const selection = this.ctx.agentDefaultModel.currentSelection();
-    const agentOptions = { provider: selection.provider, model: selection.model };
+    const agentOptions = { ...selection };
     if (this.occupied.get(id) === "visible") {
       let facts = {};
       try {
@@ -1251,7 +1257,7 @@ var DshInProcessAdapter = class {
         agent.cancel({ kind: "user" });
       },
       whenIdle: () => agent.whenIdle(),
-      eventCount: () => agent.session?.events?.length,
+      eventCount: () => agent.session?.seq,
       isIdle: () => agent.status === "idle",
       scope: wired.scope
     };
@@ -1272,12 +1278,12 @@ var DshInProcessAdapter = class {
    * plugin-added or renamed variant must never break a turn.
    */
   subscribeTurns(handler) {
-    return this.ctx.on("session/event", (session, event) => {
+    const disposeEvents = this.ctx.on("session/event", (session, event) => {
       const id = String(session.id);
       const capture = this.captures.get(id);
       if (capture !== void 0) {
         if (capture.types.length < 50) capture.types.push(event.type);
-        if (event.type !== "assistant/chunk" && capture.events.length < 500) {
+        if (capture.events.length < 500) {
           capture.events.push(event);
         }
       }
@@ -1285,10 +1291,23 @@ var DshInProcessAdapter = class {
       const normalized = normalizeTurnEvent(event);
       if (normalized !== void 0) handler.event(id, normalized);
     });
+    const disposeStream = this.ctx.on("agent/assistant-stream", ({ agent, frame }) => {
+      const id = String(agent.session.id);
+      handler.activity(id);
+      if (frame.type !== "chunk") return;
+      const capture = this.captures.get(id);
+      if (capture !== void 0 && capture.types.length < 50) capture.types.push("agent/assistant-stream");
+      const normalized = normalizeChunk(frame.chunk);
+      if (normalized !== void 0) handler.event(id, normalized);
+    });
+    return () => {
+      disposeStream();
+      disposeEvents();
+    };
   }
   /** Start capturing one turn; returns the durable event offset before it. */
   beginTurn(ref) {
-    const offset = asAgent(ref)?.session?.events?.length;
+    const offset = asAgent(ref)?.session?.seq;
     this.captures.set(this.captureKey(ref), {
       ...offset === void 0 ? {} : { offset },
       types: [],
@@ -1303,11 +1322,9 @@ var DshInProcessAdapter = class {
   /**
    * Resolve one turn's committed output.
    *
-   * The host changed which source is authoritative: dsh 0.1.5-rc.2 replaced
-   * `agent.session.events` with a projection and made the feed the source of
-   * truth, while legacy logs and agents borrowed from the Web surface only
-   * expose the durable log. So neither source is trusted unconditionally —
-   * the feed wins only when it actually carries the turn's assistant output.
+   * DSH 0.2 publishes transient deltas on agent/assistant-stream and commits
+   * final messages on session/event. Prefer those committed feed messages;
+   * retain the snapshot fallback for an agent borrowed from the Web surface.
    */
   async collectTurnOutput(ref) {
     const capture = this.captures.get(this.captureKey(ref));
@@ -1316,9 +1333,9 @@ var DshInProcessAdapter = class {
   /** Facts for the empty-turn diagnostic; raw type names on purpose (shape drift). */
   turnDiagnostics(ref) {
     const agent = asAgent(ref);
-    const events = agent?.session?.events;
+    const eventCount = agent?.session?.seq;
     return {
-      ...events === void 0 ? {} : { eventCount: events.length },
+      ...eventCount === void 0 ? {} : { eventCount },
       sessionKeys: agent?.session === void 0 ? [] : Object.keys(agent.session),
       eventTypes: this.captures.get(this.captureKey(ref))?.types ?? []
     };
@@ -1397,7 +1414,7 @@ var DshInProcessAdapter = class {
       const prefix = `${baseKey}-n`;
       let max = 0;
       for (const header of headers) {
-        const id = String(header.id);
+        const id = String(header.header.id);
         if (!id.startsWith(prefix)) continue;
         const candidate = Number(id.slice(prefix.length));
         if (Number.isSafeInteger(candidate)) max = Math.max(max, candidate);
@@ -2869,12 +2886,12 @@ import {
 } from "@deepseek-ai/dsh-settings";
 
 // src/version.ts
-var PLUGIN_VERSION = "0.10.18";
+var PLUGIN_VERSION = "0.10.19";
 
 // src/settings-web.ts
 var SETTINGS_ROUTE = "/_dsh/deepseek-harness-wecom-plus/settings";
 var NAMESPACE_PATTERN = /^[a-z][a-z0-9]*(?:-[a-z0-9]+)*$/;
-var SETTINGS_NS = "deepseek-harness-wecom-plus";
+var SETTINGS_NS = "wecom-channel";
 if (!NAMESPACE_PATTERN.test(SETTINGS_NS)) {
   throw new TypeError(`settings namespace "${SETTINGS_NS}" must match ${String(NAMESPACE_PATTERN)}`);
 }
@@ -4437,31 +4454,7 @@ function workspaceSamePath(a, b) {
 }
 
 // src/index.ts
-var FIBER_DISPOSED = 4;
-var FIBER_UNLOADING = 5;
-function isUnloading(ctx) {
-  const state = ctx.fiber?.state ?? 0;
-  return state === FIBER_UNLOADING || state === FIBER_DISPOSED;
-}
-function installSettingsSection(ctx, ns, schema, entry, hooks) {
-  ctx.inject(["settings"], (sctx) => {
-    const scope = sctx.settings.register(ns, schema, {
-      base: entry,
-      ...hooks.validate === void 0 ? {} : { validate: hooks.validate }
-    });
-    hooks.setSource(() => scope.get());
-    sctx.effect(() => () => {
-      if (isUnloading(ctx)) return;
-      hooks.setSource(() => entry);
-      hooks.onChange();
-    });
-    hooks.onChange();
-    scope.watch(() => {
-      if (isUnloading(ctx)) return;
-      hooks.onChange();
-    });
-  });
-}
+var Config2 = new z2(Config.toJSON()).required().volatile();
 var name = "deepseek-harness-wecom-plus";
 var inject = [
   "agentDefaultModel",
@@ -4477,7 +4470,7 @@ var inject = [
 async function apply(ctx, config) {
   const log = ctx.logger(name);
   const cli = new WeComCliService();
-  let current = () => config;
+  const current = () => Config(structuredClone(config.get()));
   let bridge;
   let restarting;
   let lastResolved;
@@ -4494,7 +4487,7 @@ async function apply(ctx, config) {
     if (disposed) return;
     let resolved;
     try {
-      resolved = Config(current());
+      resolved = current();
     } catch (error) {
       log.error("WeCom channel configuration is invalid and stays inactive: %s", String(error));
       return;
@@ -4540,16 +4533,11 @@ async function apply(ctx, config) {
     ctx,
     new WeComWebBackend(ctx, channelStatus, cli, () => bridge?.scan(), () => scheduleRestart(true))
   );
-  installSettingsSection(ctx, SETTINGS_NS, Config, Config(config), {
-    setSource: (source) => {
-      current = source;
-    },
-    onChange: () => {
-      scheduleRestart();
-    },
-    validate: (value) => {
-      Config(value);
-    }
+  ctx.inject(["settings"], (settingsCtx) => {
+    settingsCtx.effect(() => settingsCtx.settings.configure({ auto: false }, ctx.fiber));
+    settingsCtx.on("settings/document-updated", (ns) => {
+      if (ns === SETTINGS_NS) scheduleRestart();
+    });
   });
   await ctx.effect(async function* () {
     yield async () => {
@@ -4561,9 +4549,8 @@ async function apply(ctx, config) {
   }, "deepseek-harness-wecom-plus.websocket");
   scheduleRestart();
 }
-var src_default = { name, inject, Config, apply };
 export {
-  Config,
+  Config2 as Config,
   SETTINGS_NS,
   SETTINGS_ROUTE,
   SeenMessageIds,
@@ -4571,7 +4558,6 @@ export {
   WeComWebBackend,
   apply,
   chatTarget,
-  src_default as default,
   detectImageMediaType,
   inboundContent,
   inject,

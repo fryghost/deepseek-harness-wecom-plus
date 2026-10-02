@@ -12,18 +12,18 @@
 
 import { realpath } from 'node:fs/promises'
 import type { Context } from '@deepseek-ai/cordis'
-import type { Agent, AgentHandle } from '@deepseek-ai/dsh-agent'
+import type { Agent, AgentHandle, AgentOptions } from '@deepseek-ai/dsh-agent'
 // Type-only Context merges this adapter depends on: the host declares its
 // services on the shared cordis Context interface, so whichever module reads a
 // service must carry its merge import — including after the read moves here.
-// `dsh-agent-presets` also contributes the `agent-preset/selected` session
+// `dsh-agent-preset-registry` contributes the `agent-preset/selected` session
 // event variant that preset recovery folds.
 import type {} from '@deepseek-ai/dsh-agent-default-model'
-import type {} from '@deepseek-ai/dsh-agent-presets'
+import type {} from '@deepseek-ai/dsh-agent-preset-registry'
 import type {} from '@deepseek-ai/dsh-commands'
 import type {} from '@deepseek-ai/dsh-session-persistence'
 import type {} from '@deepseek-ai/dsh-system-prompt'
-import { createUserMessage } from '@deepseek-ai/dsh-llm'
+import { createUserMessage, type StreamChunk } from '@deepseek-ai/dsh-llm'
 import { SessionId, type SessionEvent } from '@deepseek-ai/dsh-session'
 import { defineTool } from '@deepseek-ai/dsh-tools'
 import { UserQuestionError } from '@deepseek-ai/dsh-user-questions'
@@ -91,7 +91,7 @@ function resolveSessionPreset(
 
 /**
  * The session coordinator's stable rejection signals. peer-range hosts
- * (≥0.1.0-rc.6) throw plain errors whose name is generic — the message text
+ * can throw plain errors whose name is generic — the message text
  * is the only stable signal — so match both, message first.
  */
 function isNotFound(error: unknown): boolean {
@@ -198,26 +198,32 @@ function normalizeTurnEvent(event: SessionEvent): HarnessTurnEvent | undefined {
     if (reason.kind === 'aborted') return { type: 'turn-end', reason: 'aborted' }
     return { type: 'turn-end', reason: 'completed' }
   }
-  if (event.type !== 'assistant/chunk') return undefined
-  const chunk = event.data.chunk
+  return undefined
+}
+
+function normalizeChunk(chunk: StreamChunk): HarnessTurnEvent | undefined {
   if (chunk.type === 'text-delta') return { type: 'text-delta', text: chunk.text }
   if (chunk.type === 'reasoning-delta') return { type: 'thought-delta', text: chunk.text }
   if (chunk.type === 'tool-call-delta' && chunk.name !== undefined) {
-    return { type: 'tool-start', toolCallId: chunk.name, name: chunk.name }
+    return { type: 'tool-start', toolCallId: chunk.id, name: chunk.name }
   }
   return undefined
 }
 
 /**
  * The feed capture when it carries the turn's assistant output; the durable log
- * slice otherwise. Neither source is authoritative on every host: rc.2 serves
- * the feed and projects the log, while legacy logs and agents borrowed from the
- * Web surface are only readable through the log.
+ * slice otherwise. The feed avoids reading history; the snapshot preserves
+ * existing recovery logic for an agent borrowed from the Web surface.
  */
+function sessionEvents(agent: Agent | undefined): readonly SessionEvent[] | undefined {
+  return agent?.session?.snapshotEvents()
+}
+
 function selectTurnEvents(agent: Agent | undefined, capture: TurnCapture | undefined): readonly SessionEvent[] {
-  const logged = agent?.session?.events
   const captured = capture?.events ?? []
-  if (captured.some(event => event.type === 'assistant/message') || logged === undefined) return captured
+  if (captured.some(event => event.type === 'assistant/message')) return captured
+  const logged = sessionEvents(agent)
+  if (logged === undefined) return captured
   return logged.slice(capture?.offset ?? 0)
 }
 
@@ -575,7 +581,7 @@ export class DshInProcessAdapter implements HarnessPort, HarnessTurnPort, Harnes
   ): Promise<HarnessCommandExecution | undefined> {
     const live = asAgent(agent)
     if (live === undefined) return undefined
-    return await this.ctx.commands.execute(live, line, signal) as HarnessCommandExecution
+    return await this.ctx.commands.execute(live, line, [], signal) as HarnessCommandExecution
   }
 
   /** Best-effort sidebar grouping: attach a session to its workspace record. */
@@ -626,7 +632,7 @@ export class DshInProcessAdapter implements HarnessPort, HarnessTurnPort, Harnes
 
     const preset = this.resolveAgentPreset()
     const selection = this.ctx.agentDefaultModel.currentSelection()
-    const agentOptions = { provider: selection.provider, model: selection.model }
+    const agentOptions: AgentOptions = { ...selection }
 
     if (this.occupied.get(id) === 'visible') {
       let facts: HarnessSessionFacts = {}
@@ -696,7 +702,7 @@ export class DshInProcessAdapter implements HarnessPort, HarnessTurnPort, Harnes
   private async resumeHidden(
     id: string,
     sessionId: SessionId,
-    agentOptions: { provider?: string; model?: string },
+    agentOptions: AgentOptions,
     options: HarnessSessionOptions,
   ): Promise<SessionRecord> {
     try {
@@ -830,7 +836,7 @@ export class DshInProcessAdapter implements HarnessPort, HarnessTurnPort, Harnes
         agent.cancel({ kind: 'user' })
       },
       whenIdle: () => agent.whenIdle(),
-      eventCount: () => agent.session?.events?.length,
+      eventCount: () => agent.session?.seq,
       isIdle: () => agent.status === 'idle',
       scope: wired.scope,
     }
@@ -854,14 +860,14 @@ export class DshInProcessAdapter implements HarnessPort, HarnessTurnPort, Harnes
    * plugin-added or renamed variant must never break a turn.
    */
   subscribeTurns(handler: TurnFeedHandler): () => void {
-    return this.ctx.on('session/event', (session, event) => {
+    const disposeEvents = this.ctx.on('session/event', (session, event) => {
       const id = String(session.id)
       const capture = this.captures.get(id)
       if (capture !== undefined) {
         if (capture.types.length < 50) capture.types.push(event.type)
         // Chunk deltas would drown the bounded buffer and truncate the turn's
         // tail (assistant/message, turn/end) on streaming-heavy turns.
-        if (event.type !== 'assistant/chunk' && capture.events.length < 500) {
+        if (capture.events.length < 500) {
           capture.events.push(event as SessionEvent)
         }
       }
@@ -869,11 +875,21 @@ export class DshInProcessAdapter implements HarnessPort, HarnessTurnPort, Harnes
       const normalized = normalizeTurnEvent(event as SessionEvent)
       if (normalized !== undefined) handler.event(id, normalized)
     })
+    const disposeStream = this.ctx.on('agent/assistant-stream', ({ agent, frame }) => {
+      const id = String(agent.session.id)
+      handler.activity(id)
+      if (frame.type !== 'chunk') return
+      const capture = this.captures.get(id)
+      if (capture !== undefined && capture.types.length < 50) capture.types.push('agent/assistant-stream')
+      const normalized = normalizeChunk(frame.chunk)
+      if (normalized !== undefined) handler.event(id, normalized)
+    })
+    return () => { disposeStream(); disposeEvents() }
   }
 
   /** Start capturing one turn; returns the durable event offset before it. */
   beginTurn(ref: HarnessAgentRef): number | undefined {
-    const offset = asAgent(ref)?.session?.events?.length
+    const offset = asAgent(ref)?.session?.seq
     this.captures.set(this.captureKey(ref), {
       ...(offset === undefined ? {} : { offset }),
       types: [],
@@ -890,11 +906,9 @@ export class DshInProcessAdapter implements HarnessPort, HarnessTurnPort, Harnes
   /**
    * Resolve one turn's committed output.
    *
-   * The host changed which source is authoritative: dsh 0.1.5-rc.2 replaced
-   * `agent.session.events` with a projection and made the feed the source of
-   * truth, while legacy logs and agents borrowed from the Web surface only
-   * expose the durable log. So neither source is trusted unconditionally —
-   * the feed wins only when it actually carries the turn's assistant output.
+   * DSH 0.2 publishes transient deltas on agent/assistant-stream and commits
+   * final messages on session/event. Prefer those committed feed messages;
+   * retain the snapshot fallback for an agent borrowed from the Web surface.
    */
   async collectTurnOutput(ref: HarnessAgentRef): Promise<HarnessTurnOutput> {
     const capture = this.captures.get(this.captureKey(ref))
@@ -904,9 +918,9 @@ export class DshInProcessAdapter implements HarnessPort, HarnessTurnPort, Harnes
   /** Facts for the empty-turn diagnostic; raw type names on purpose (shape drift). */
   turnDiagnostics(ref: HarnessAgentRef): HarnessSessionDiagnostics {
     const agent = asAgent(ref)
-    const events = agent?.session?.events
+    const eventCount = agent?.session?.seq
     return {
-      ...(events === undefined ? {} : { eventCount: events.length }),
+      ...(eventCount === undefined ? {} : { eventCount }),
       sessionKeys: agent?.session === undefined ? [] : Object.keys(agent.session),
       eventTypes: this.captures.get(this.captureKey(ref))?.types ?? [],
     }
@@ -995,7 +1009,7 @@ export class DshInProcessAdapter implements HarnessPort, HarnessTurnPort, Harnes
       const prefix = `${baseKey}-n`
       let max = 0
       for (const header of headers) {
-        const id = String(header.id)
+        const id = String(header.header.id)
         if (!id.startsWith(prefix)) continue
         const candidate = Number(id.slice(prefix.length))
         if (Number.isSafeInteger(candidate)) max = Math.max(max, candidate)

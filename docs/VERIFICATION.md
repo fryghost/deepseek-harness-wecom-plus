@@ -1,4 +1,4 @@
-# WeCom 插件验收清单（v0.5.6）
+# WeCom 插件验收清单（DSH v0.2.0-rc.2）
 
 > 一条命令更新 → 按顺序过一遍 → 任何一步不符，把企微截图 + 终端日志（含 `[wecom-plus]` 行）发回。
 
@@ -6,16 +6,18 @@
 
 ```powershell
 cd D:\deepseek\ds-harness-wecom
-git push origin main
+pnpm install
+pnpm run check
 
 cd D:\deepseek\deepseek-harness
-pnpm dsh plugin --profile web remove deepseek-harness-wecom-plus
-pnpm dsh plugin --profile web add github:fryghost/deepseek-harness-wecom-plus
+pnpm dsh plugin --profile web add D:\deepseek\ds-harness-wecom
 pnpm dsh web
 ```
 
 - 验收点 A：DSH 正常打开（网页 3080 可访问，无 fatal 报错）；
 - 验收点 B：打开 设置 → WeCom 企微，右上角状态为「已连接（WeCom AI Bot authenticated）」。
+
+自动检查覆盖前后端类型检查、构建、会话/流式/卡片回归测试和真实 DSH Loader/profile 的配置保存与重启恢复。下面的企微收发验收仍需已配置的机器人及实际聊天环境。旧 `settings.yaml` 配置迁移见 [README.zh.md](../README.zh.md)。
 
 ## 1. 基础连通
 

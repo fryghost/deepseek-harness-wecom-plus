@@ -3,7 +3,7 @@ import { readFile, stat } from 'node:fs/promises'
 import { isAbsolute } from 'node:path'
 import type { Context } from '@deepseek-ai/cordis'
 import { credentialRef } from '@deepseek-ai/dsh-credentials'
-import { SettingsConflictError, type SettingsProvider } from '@deepseek-ai/dsh-settings'
+import { SettingsConflictError, type SettingsForms } from '@deepseek-ai/dsh-settings'
 import {
   generateReqId,
   WSAuthFailureError,
@@ -951,7 +951,7 @@ export class WeComHarnessBridge {
 
   /** Persist the workspace candidate list through the settings service. */
   private async persistWorkspaces(next: readonly string[]): Promise<void> {
-    const settings = this.ctx.get('settings') as SettingsProvider | undefined
+    const settings = this.ctx.get('settings') as SettingsForms | undefined
     if (settings === undefined) throw new Error('settings service is not available')
     if (!settings.writable) throw new Error('settings provider is read-only')
     const apply = async (): Promise<void> => {

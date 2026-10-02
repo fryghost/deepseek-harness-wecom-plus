@@ -9,8 +9,10 @@
  */
 
 import { describe, expect, it, vi } from 'vitest'
+import type { AssistantStreamFrame } from '@deepseek-ai/dsh-agent'
 import { DshInProcessAdapter } from '../src/harness/dsh-rc2.js'
 import { harnessSessionId } from '../src/harness/port.js'
+import { testSession } from './fixtures.js'
 
 type FeedHandler = (session: { id: string }, event: unknown) => void
 
@@ -29,13 +31,19 @@ function notFound(): Error {
 /** Minimal host context plus the captured session event feed. */
 function fakeHost(options: {
   inspect?: (id: string) => Promise<unknown>
-  list?: () => Promise<Array<{ id: string }>>
+  list?: () => Promise<Array<{ header: { id: string } }>>
   readImage?: (attachment: unknown) => Promise<unknown>
   modelInfo?: (provider: string, model: string) => Promise<unknown>
 } = {}) {
   const handlers: FeedHandler[] = []
+  const streamHandlers: Array<(payload: unknown) => void> = []
   const ctx = {
     on: vi.fn((_name: string, handler: FeedHandler) => {
+      if (_name === 'agent/assistant-stream') {
+        const streamHandler = handler as unknown as (payload: unknown) => void
+        streamHandlers.push(streamHandler)
+        return () => { streamHandlers.splice(streamHandlers.indexOf(streamHandler), 1) }
+      }
       handlers.push(handler)
       return () => {
         const at = handlers.indexOf(handler)
@@ -58,15 +66,23 @@ function fakeHost(options: {
   }
   return {
     ctx: ctx as never,
+    emitStream: (id: string, frame: AssistantStreamFrame): void => {
+      for (const handler of [...streamHandlers]) handler({ agent: { session: { id } }, frame })
+    },
     emit: (id: string, event: unknown): void => {
-      for (const handler of [...handlers]) handler({ id }, event)
+      if ((event as { type: string }).type === 'assistant/chunk') {
+        const chunk = (event as { data: { chunk: unknown } }).data.chunk
+        for (const handler of [...streamHandlers]) handler({ agent: { session: { id } }, frame: { type: 'chunk', chunk } })
+      } else {
+        for (const handler of [...handlers]) handler({ id }, event)
+      }
     },
   }
 }
 
 /** One live agent stand-in: the adapter only reads session identity, the log, and options. */
 function fakeAgent(id: string, events: unknown[], options: Record<string, string> = {}): never {
-  return { session: { id, events }, options } as never
+  return { session: testSession(events, id), options } as never
 }
 
 function adapterFor(host: ReturnType<typeof fakeHost>): DshInProcessAdapter {
@@ -83,6 +99,30 @@ function withFeed(adapter: DshInProcessAdapter): DshInProcessAdapter {
 }
 
 describe('harness port contract', () => {
+  it('uses snapshot headers to discover a generation beyond the probe gap', async () => {
+    const adapter = adapterFor(fakeHost({
+      inspect: async () => { throw notFound() },
+      list: async () => [{ header: { id: 'conv-n42' } }],
+    }))
+    expect(await adapter.currentGeneration('conv')).toBe(42)
+  })
+
+  it('streams transient frames with call identity and releases both subscriptions', () => {
+    const host = fakeHost()
+    const adapter = adapterFor(host)
+    const activity = vi.fn()
+    const event = vi.fn()
+    const dispose = adapter.subscribeTurns({ activity, event })
+    host.emitStream('s1', {
+      type: 'chunk', attemptId: 'attempt-1' as never, revision: 1, index: 0, time: 100,
+      chunk: { type: 'tool-call-delta', index: 0, id: 'call-1' as never, name: 'bash', argumentsDelta: '' },
+    })
+    expect(event).toHaveBeenCalledWith('s1', { type: 'tool-start', toolCallId: 'call-1', name: 'bash' })
+    dispose()
+    host.emitStream('s1', { type: 'start', attemptId: 'attempt-2' as never, revision: 2, turn: 1, step: 2 })
+    host.emit('s1', { type: 'step/start', data: {} })
+    expect(activity).toHaveBeenCalledTimes(1)
+  })
   it('declares the in-process capability matrix, including the ACP gaps', () => {
     const adapter = adapterFor(fakeHost())
     expect(adapter.info.id).toBe('dsh-in-process')
@@ -229,9 +269,9 @@ describe('harness port contract', () => {
     host.emit('s1', { type: 'assistant/chunk', data: { chunk: { type: 'text-delta', text: 'x' } } })
     host.emit('s1', { type: 'step/start', data: {} })
     const facts = adapter.turnDiagnostics(agent)
-    expect(facts.eventTypes).toEqual(['assistant/chunk', 'step/start'])
+    expect(facts.eventTypes).toEqual(['agent/assistant-stream', 'step/start'])
     expect(facts.eventCount).toBe(0)
-    expect(facts.sessionKeys).toContain('events')
+    expect(facts.sessionKeys).toContain('snapshotEvents')
     adapter.endTurn(agent)
     expect(adapter.turnDiagnostics(agent).eventTypes).toEqual([])
   })
@@ -265,7 +305,7 @@ function sessionHost(options: { workspaces?: Array<{ path: string }>; registry?:
   }
   const agent = {
     status: 'idle',
-    session: { id: 'conv-1', events: [] },
+    session: testSession([], 'conv-1'),
     ctx: agentCtx,
     options: { provider: 'deepseek-official', model: 'deepseek-v4-flash' },
     followup: vi.fn(),
@@ -346,8 +386,9 @@ describe('harness lifecycle contract', () => {
   it('runs a harness command through the host and passes the outcome back', async () => {
     const host = sessionHost()
     const adapter = new DshInProcessAdapter(host.ctx, { defaultCwd: '/tmp/ws' })
-    const outcome = await adapter.executeCommand(host.agent, '/status', new AbortController().signal)
-    expect(host.execute).toHaveBeenCalledOnce()
+    const signal = new AbortController().signal
+    const outcome = await adapter.executeCommand(host.agent, '/status', signal)
+    expect(host.execute).toHaveBeenCalledWith(host.agent, '/status', [], signal)
     expect(outcome).toEqual({ result: { kind: 'success', text: 'ok' } })
   })
 

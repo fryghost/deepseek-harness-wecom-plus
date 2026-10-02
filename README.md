@@ -46,7 +46,7 @@ An out-of-tree [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harnes
 
 - Node.js 22.19 or later
 - pnpm 10.33.4
-- DeepSeek Harness 0.1.0-rc.6 or later
+- DeepSeek Harness 0.2.0-rc.2 (the verified version; targets 0.2.x, no longer supports 0.1.x)
 - A WeCom AI Bot with long connection enabled and a Bot ID/Secret
 
 ## Install from GitHub
@@ -71,7 +71,7 @@ After installing and restarting DSH, open **Settings → WeCom 企微** and conf
 - **workspaces**: maintain the candidate workspace list (the default workspace comes from the `cwd` config and is shown read-only). In WeCom, `/ws` lists the candidates, `/ws <number>` switches (starting a new conversation), and `/ws add <absolute path>` adds one;
 - the page shows the live connection state (inactive / connecting / connected) and the latest error.
 
-Saved values land in the DSH settings document (`settings.yaml`) and survive restarts. The plugin row in `~/.dsh/profiles/web/cordis.patch.yml` remains the composition **baseline** (UI-saved values override it):
+Saved values go directly into the active profile's `cordis.patch.yml` and survive restarts. DSH updates volatile Config in place, and the plugin reconnects on a committed change. Keep the plugin entry ID as `wecom-channel`: the Settings page and `/ws add` use it to locate configuration. You can also edit `~/.dsh/profiles/web/cordis.patch.yml` manually:
 
 ```yaml
 - id: wecom-channel
@@ -97,6 +97,8 @@ Saved values land in the DSH settings document (`settings.yaml`) and survive res
     maxOutboundFileBytes: 20971520
     welcomeText: 您好，我是 DeepSeek Harness 助手。
 ```
+
+When upgrading from 0.1.x, merge fields from the old `settings.yaml` section `deepseek-harness-wecom-plus` into `wecom-channel.config` above, or save them again in the Settings page. DSH may rename the old document to `settings.yaml.imported` at startup; keep it as a backup. The new settings service uses plugin entry IDs and cannot automatically map this old custom namespace. Secret storage remains in the credentials service.
 
 `imageInputMode` defaults to `auto`: image-capable models receive a durable image block, while text-only models receive attachment metadata instead of failing the turn. Use `always` only with a route known to accept images, or `never` to force the text fallback.
 

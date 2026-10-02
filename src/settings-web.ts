@@ -18,7 +18,7 @@ import {
   SettingsConflictError,
   type SettingsDescriptor,
   type SettingsNamespace,
-  type SettingsProvider,
+  type SettingsForms,
 } from '@deepseek-ai/dsh-settings'
 import type { CliAuthStart, CliAuthStatus, CliInstallResult, CliProbeResult } from './cli.js'
 import type { WeComCliService } from './cli.js'
@@ -31,7 +31,7 @@ export const SETTINGS_ROUTE = '/_dsh/deepseek-harness-wecom-plus/settings'
 const NAMESPACE_PATTERN = /^[a-z][a-z0-9]*(?:-[a-z0-9]+)*$/
 
 /** The settings namespace this plugin owns. */
-export const SETTINGS_NS: SettingsNamespace = 'deepseek-harness-wecom-plus' as SettingsNamespace
+export const SETTINGS_NS: SettingsNamespace = 'wecom-channel' as SettingsNamespace
 if (!NAMESPACE_PATTERN.test(SETTINGS_NS)) {
   throw new TypeError(`settings namespace "${SETTINGS_NS}" must match ${String(NAMESPACE_PATTERN)}`)
 }
@@ -166,7 +166,7 @@ function descriptorOf(ctx: Context): SettingsDescriptor {
   return descriptor
 }
 
-function requireSettings(ctx: Context): SettingsProvider {
+function requireSettings(ctx: Context): SettingsForms {
   const settings = ctx.get('settings')
   if (settings === undefined) throw new Error('settings service is not available')
   return settings

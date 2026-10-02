@@ -1,4 +1,4 @@
-import { Context } from '@deepseek-ai/cordis';
+import { Context, Volatile } from '@deepseek-ai/cordis';
 import z from '@deepseek-ai/schemastery';
 import { BaseMessage, WSClientOptions, WsFrame, EventMessageWith, EnterChatEvent, TemplateCardEventData, WsFrameHeaders, ReplyMsgItem, TemplateCard, UploadMediaOptions, WeComMediaType } from '@wecom/aibot-node-sdk';
 import { EventEmitter } from 'node:events';
@@ -96,7 +96,7 @@ type ImageInputMode = 'auto' | 'always' | 'never';
  */
 type CardMode = 'auto' | 'tool' | 'off';
 /** WeCom AI Bot channel configuration. */
-interface Config {
+interface Config$1 {
     botId: string;
     secretRef: string;
     accountId: string;
@@ -138,7 +138,7 @@ interface Config {
     systemPrompt: string;
 }
 /** Runtime-validated plugin configuration. */
-declare const Config: z<Config>;
+declare const Config$1: z<Config$1>;
 
 /** One text block of model-visible content. */
 interface HarnessTextBlock {
@@ -202,7 +202,7 @@ interface WeComDownloadPort {
     }>;
 }
 /** Build harness message content from one WeCom message. */
-declare function inboundContent(host: HarnessInboundHost, config: Config, client: WeComDownloadPort, message: BaseMessage, includeImages?: boolean): Promise<HarnessContentBlock[]>;
+declare function inboundContent(host: HarnessInboundHost, config: Config$1, client: WeComDownloadPort, message: BaseMessage, includeImages?: boolean): Promise<HarnessContentBlock[]>;
 /** Image formats the harness attachment store accepts, detected from magic bytes. */
 type InboundImageMediaType = 'image/png' | 'image/jpeg' | 'image/gif' | 'image/webp';
 /** Detect one of the accepted image formats from magic bytes. */
@@ -269,7 +269,7 @@ declare class WeComHarnessBridge {
      * overlay keeps the new candidate visible and keeps dedupe honest.
      */
     private readonly workspaceOverlay;
-    constructor(ctx: Context, config: Config, clientFactory?: WeComClientFactory, cli?: WeComCliService | undefined);
+    constructor(ctx: Context, config: Config$1, clientFactory?: WeComClientFactory, cli?: WeComCliService | undefined);
     /** Latest channel fact for configuration surfaces. */
     status(): {
         state: 'inactive' | 'connecting' | 'connected';
@@ -407,9 +407,9 @@ interface WeComChannelStatus {
 /** UI-editable subset of the full channel configuration. */
 interface WeComUserSettings {
     botId: string;
-    cardMode: Config['cardMode'];
-    singlePolicy: Config['singlePolicy'];
-    groupPolicy: Config['groupPolicy'];
+    cardMode: Config$1['cardMode'];
+    singlePolicy: Config$1['singlePolicy'];
+    groupPolicy: Config$1['groupPolicy'];
     welcomeText: string;
     /** The default workspace: first /ws candidate and where new conversations land. */
     cwd: string;
@@ -516,22 +516,17 @@ declare class WeComWebBackend {
 
 /** WeCom AI Bot channel bundle for DeepSeek Harness. */
 
+declare const Config: z<NoInfer<Config$1>, NoInfer<Config$1>, "volatile-defined">;
 declare const name = "deepseek-harness-wecom-plus";
 declare const inject: string[];
 
 /**
  * Mount the WeCom long connection and tie its lifecycle to the Cordis plugin
- * lifecycle. The composition entry doubles as the settings base layer: edits
- * saved through the Web Settings page override it and restart the channel
+ * lifecycle. Edits saved through the Web Settings page update the profile's
+ * volatile configuration and restart the channel
  * live, while a channel failure is always contained to a loud log line and a
  * dormant channel — never a failed plugin mount.
  */
-declare function apply(ctx: Context, config: Config): Promise<void>;
-declare const _default: {
-    name: string;
-    inject: string[];
-    Config: z<Config>;
-    apply: typeof apply;
-};
+declare function apply(ctx: Context, config: Volatile<Config$1>): Promise<void>;
 
-export { Config, Config as ConfigType, SETTINGS_NS, SETTINGS_ROUTE, SeenMessageIds, WeComHarnessBridge, WeComWebBackend, apply, chatTarget, _default as default, detectImageMediaType, inboundContent, inject, name, parseRequest, sessionIdFor, truncateUtf8 };
+export { Config, Config$1 as ConfigType, SETTINGS_NS, SETTINGS_ROUTE, SeenMessageIds, WeComHarnessBridge, WeComWebBackend, apply, chatTarget, detectImageMediaType, inboundContent, inject, name, parseRequest, sessionIdFor, truncateUtf8 };

@@ -1,5 +1,10 @@
 import type { Config } from '../src/config.js'
 
+/** New DSH Session surface; the backing log remains mutable for test driving. */
+export function testSession(events: unknown[], id = 'test-session') {
+  return { id, get seq() { return events.length }, snapshotEvents: () => [...events] }
+}
+
 /** Complete deterministic plugin config for unit tests. */
 export function testConfig(overrides: Partial<Config> = {}): Config {
   return {

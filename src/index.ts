@@ -1,58 +1,16 @@
 /** WeCom AI Bot channel bundle for DeepSeek Harness. */
 
-import type { Context } from '@deepseek-ai/cordis'
-import type z from '@deepseek-ai/schemastery'
-import type { SettingsNamespace } from '@deepseek-ai/dsh-settings'
+import type { Context, Volatile } from '@deepseek-ai/cordis'
+import z from '@deepseek-ai/schemastery'
+import type {} from '@deepseek-ai/dsh-settings'
 import { WeComCliService } from './cli.js'
 import { WeComHarnessBridge } from './bridge.js'
-import { Config, type Config as WeComConfig } from './config.js'
+import { Config as PlainConfig, type Config as WeComConfig } from './config.js'
 import { installWeComSettingsWeb, SETTINGS_NS, WeComWebBackend, type WeComChannelStatus } from './settings-web.js'
 
-// dsh 0.1.2-alpha.1 removed the installSettingsSection/settingsNamespace
-// helpers. The settings service itself never changed, so this inlines what
-// the wrapper did (ported from its pre-0.1.2-alpha.1 source): an inject,
-// a register, a watch, and an unload-aware fallback effect.
-const FIBER_DISPOSED = 4
-const FIBER_UNLOADING = 5
-
-function isUnloading(ctx: Context): boolean {
-  const state: number = (ctx as { fiber?: { state?: number } }).fiber?.state ?? 0
-  return state === FIBER_UNLOADING || state === FIBER_DISPOSED
-}
-
-interface SettingsSectionHooks<T> {
-  setSource: (source: () => T) => void
-  onChange: () => void
-  validate?: (value: T) => void
-}
-
-function installSettingsSection<T>(
-  ctx: Context,
-  ns: SettingsNamespace,
-  schema: z<T>,
-  entry: T,
-  hooks: SettingsSectionHooks<T>,
-): void {
-  ctx.inject(['settings'], (sctx) => {
-    const scope = sctx.settings.register(ns, schema, {
-      base: entry,
-      ...(hooks.validate === undefined ? {} : { validate: hooks.validate }),
-    })
-    hooks.setSource(() => scope.get())
-    sctx.effect(() => () => {
-      // settings provider detaching → fall back to composition entry and re-judge;
-      // consumer's own unload → fallback is pointless and onChange harmful.
-      if (isUnloading(ctx)) return
-      hooks.setSource(() => entry)
-      hooks.onChange()
-    })
-    hooks.onChange()
-    scope.watch(() => {
-      if (isUnloading(ctx)) return
-      hooks.onChange()
-    })
-  })
-}
+// DSH 0.2 forms edit volatile Cordis configuration directly. Keep product
+// configuration plain; only the Loader-facing schema owns the live reference.
+export const Config = new z(PlainConfig.toJSON()).required().volatile()
 
 export const name = 'deepseek-harness-wecom-plus'
 export const inject = [
@@ -66,7 +24,6 @@ export const inject = [
   'sessionPersistence',
   'systemPrompt',
 ]
-export { Config }
 export type { WeComConfig as ConfigType }
 export { WeComHarnessBridge }
 export { detectImageMediaType, inboundContent } from './inbound.js'
@@ -75,15 +32,15 @@ export { SETTINGS_NS, SETTINGS_ROUTE, parseRequest, WeComWebBackend } from './se
 
 /**
  * Mount the WeCom long connection and tie its lifecycle to the Cordis plugin
- * lifecycle. The composition entry doubles as the settings base layer: edits
- * saved through the Web Settings page override it and restart the channel
+ * lifecycle. Edits saved through the Web Settings page update the profile's
+ * volatile configuration and restart the channel
  * live, while a channel failure is always contained to a loud log line and a
  * dormant channel — never a failed plugin mount.
  */
-export async function apply(ctx: Context, config: WeComConfig): Promise<void> {
+export async function apply(ctx: Context, config: Volatile<WeComConfig>): Promise<void> {
   const log = ctx.logger(name)
   const cli = new WeComCliService()
-  let current: () => WeComConfig = () => config
+  const current = (): WeComConfig => PlainConfig(structuredClone(config.get()) as WeComConfig)
   let bridge: WeComHarnessBridge | undefined
   let restarting: Promise<void> | undefined
   let lastResolved: string | undefined
@@ -111,7 +68,7 @@ export async function apply(ctx: Context, config: WeComConfig): Promise<void> {
     if (disposed) return
     let resolved: WeComConfig
     try {
-      resolved = Config(current())
+      resolved = current()
     } catch (error) {
       log.error('WeCom channel configuration is invalid and stays inactive: %s', String(error))
       return
@@ -168,18 +125,11 @@ export async function apply(ctx: Context, config: WeComConfig): Promise<void> {
     new WeComWebBackend(ctx, channelStatus, cli, () => bridge?.scan(), () => scheduleRestart(true)),
   )
 
-  // The resolved composition entry doubles as the settings base layer; stored
-  // sections override it, and every committed change restarts the channel.
-  installSettingsSection(ctx, SETTINGS_NS, Config, Config(config), {
-    setSource: (source) => {
-      current = source
-    },
-    onChange: () => {
-      scheduleRestart()
-    },
-    validate: (value) => {
-      Config(value)
-    },
+  ctx.inject(['settings'], (settingsCtx) => {
+    settingsCtx.effect(() => settingsCtx.settings.configure({ auto: false }, ctx.fiber))
+    settingsCtx.on('settings/document-updated', (ns) => {
+      if (ns === SETTINGS_NS) scheduleRestart()
+    })
   })
 
   await ctx.effect(async function* () {
@@ -195,5 +145,3 @@ export async function apply(ctx: Context, config: WeComConfig): Promise<void> {
   // the explicit call below owns the initial channel start everywhere.
   scheduleRestart()
 }
-
-export default { name, inject, Config, apply }

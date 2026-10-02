@@ -49,7 +49,7 @@
 
 - Node.js 22.19 或更高版本
 - pnpm 10.33.4
-- DeepSeek Harness 0.1.0-rc.6 或更高版本
+- DeepSeek Harness 0.2.0-rc.2（当前验证版本；支持 0.2.x，不再支持 0.1.x）
 - 已开启长连接并取得 Bot ID、Secret 的企微智能机器人
 
 ## 安装
@@ -76,7 +76,7 @@ pnpm dsh plugin --profile web add /absolute/path/to/deepseek-harness-wecom-plus
 - **工作区**：维护候选工作区列表（默认工作区来自配置 `cwd`，只读展示）。在企微里发送 `/ws` 可查看、用编号切换（切换会开启新对话），`/ws add <绝对路径>` 也可新增；
 - 页面实时显示连接状态（未激活 / 连接中 / 已连接）与最近错误。
 
-保存的动作写入 DSH 设置文件（settings.yaml），重启后依然生效。也可以在 `~/.dsh/profiles/web/cordis.patch.yml` 里以组合配置作为**基线**覆盖（界面保存的值优先于基线）：
+保存的动作直接写入当前 profile 的 `cordis.patch.yml`，重启后依然生效。新版 DSH 用 volatile Config 原位更新配置，插件收到变更后热重连。插件配置行的 ID 请保留为 `wecom-channel`，设置页和 `/ws add` 通过这个 ID 定位配置。也可以手动编辑 `~/.dsh/profiles/web/cordis.patch.yml`：
 
 ```yaml
 - id: wecom-channel
@@ -102,6 +102,8 @@ pnpm dsh plugin --profile web add /absolute/path/to/deepseek-harness-wecom-plus
     maxOutboundFileBytes: 20971520
     welcomeText: 您好，我是 DeepSeek Harness 助手。
 ```
+
+从 0.1.x 升级时，如果之前通过设置页保存过配置，请把旧 `settings.yaml`（新版 DSH 启动后可能重命名为 `settings.yaml.imported`）中 `deepseek-harness-wecom-plus` 节的字段合并到上面的 `wecom-channel.config`，或在新设置页重新保存。新版设置服务按插件行 ID 管理配置，无法自动识别这个旧自定义命名空间；保留原文件作为备份。Secret 仍由凭据服务管理，无需写入配置。
 
 `imageInputMode` 默认为 `auto`：支持视觉的模型会收到持久图片块；纯文本模型会收到附件元数据，避免整轮失败。只有确认模型支持图片时才使用 `always`；使用 `never` 可强制文本降级。
 

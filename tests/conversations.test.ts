@@ -7,7 +7,7 @@ import type { TemplateCard } from '@wecom/aibot-node-sdk'
 import type { ToolDefinition } from '@deepseek-ai/dsh-tools'
 import { ConversationManager } from '../src/conversations.js'
 import { sessionIdFor } from '../src/util.js'
-import { testConfig } from './fixtures.js'
+import { testConfig, testSession } from './fixtures.js'
 
 const downloadPort = { downloadFile: vi.fn() as never }
 
@@ -47,7 +47,7 @@ function watchdogHarness() {
   const agent = {
     get status(): string { return idle ? 'idle' : 'running' },
     options: { provider: 'deepseek', model: 'deepseek-chat' },
-    session: { events },
+    session: testSession(events),
     followup: vi.fn(() => { idle = false }),
     whenIdle: vi.fn(() => idle
       ? Promise.resolve()
@@ -58,10 +58,12 @@ function watchdogHarness() {
     }),
   }
   let sessionEvent: ((session: { id: string }, event: unknown) => void) | undefined
+  let streamEvent: ((payload: unknown) => void) | undefined
   const register = vi.fn(() => vi.fn())
   const ctx = {
     on: vi.fn((_event: string, handler: (session: { id: string }, event: unknown) => void) => {
-      sessionEvent = handler
+      if (_event === 'session/event') sessionEvent = handler
+      if (_event === 'agent/assistant-stream') streamEvent = handler as unknown as (payload: unknown) => void
       return vi.fn()
     }),
     sessionPersistence: { list: vi.fn(async () => []) },
@@ -82,7 +84,11 @@ function watchdogHarness() {
   return {
     agent,
     ctx,
-    emit: (sessionId: string, event: unknown): void => sessionEvent?.({ id: sessionId }, event),
+    emit: (sessionId: string, event: unknown): void => {
+      if ((event as { type: string }).type === 'assistant/chunk') {
+        streamEvent?.({ agent: { session: { id: sessionId } }, frame: { type: 'chunk', chunk: (event as { data: { chunk: unknown } }).data.chunk } })
+      } else sessionEvent?.({ id: sessionId }, event)
+    },
     finishTurn(text: string): void {
       events.push({ type: 'assistant/message', data: { message: { content: [{ type: 'text', text }] } } })
       events.push({ type: 'turn/end', data: { reason: { kind: 'stop' } } })
@@ -116,7 +122,7 @@ describe('ConversationManager', () => {
     const agent = {
       status: 'idle',
       options: { provider: 'deepseek', model: 'deepseek-chat' },
-      session: { events },
+      session: testSession(events),
       followup: vi.fn(() => {
         promptDuringTurn = promptText?.() ?? ''
         events.push({
@@ -173,7 +179,7 @@ describe('ConversationManager', () => {
     const agent = {
       status: 'idle',
       options: { provider: 'deepseek', model: 'deepseek-chat' },
-      session: { events },
+      session: testSession(events),
       followup: vi.fn(() => {
         events.push({
           type: 'assistant/message',
@@ -202,7 +208,7 @@ describe('ConversationManager', () => {
     })
     const ctx = {
       on: vi.fn(() => vi.fn()),
-      sessionPersistence: { list: vi.fn(async () => [{ id }]), inspect },
+      sessionPersistence: { list: vi.fn(async () => [{ header: { id } }]), inspect },
       agentDefaultModel: { currentSelection: vi.fn(() => ({ provider: 'deepseek', model: 'deepseek-chat' })) },
       agentPresets: { defaultId: 'standard', mount },
       llm: { resolveModelInfo: vi.fn(async () => ({ inputModalities: ['text'] })) },
@@ -233,7 +239,7 @@ describe('ConversationManager', () => {
     const agent = {
       status: 'idle',
       options: { provider: 'deepseek', model: 'deepseek-chat' },
-      session: { events },
+      session: testSession(events),
       followup: vi.fn(() => {
         events.push({
           type: 'assistant/message',
@@ -271,7 +277,7 @@ describe('ConversationManager', () => {
     })
     const ctx = {
       on: vi.fn(() => vi.fn()),
-      sessionPersistence: { list: vi.fn(async () => [{ id: `${baseId}-n10` }]), inspect },
+      sessionPersistence: { list: vi.fn(async () => [{ header: { id: `${baseId}-n10` } }]), inspect },
       agentDefaultModel: { currentSelection: vi.fn(() => ({ provider: 'deepseek', model: 'deepseek-chat' })) },
       agentPresets: { defaultId: 'standard', mount: vi.fn(async () => ({ id: 'standard' })) },
       llm: { resolveModelInfo: vi.fn(async () => ({ inputModalities: ['text'] })) },
@@ -304,7 +310,7 @@ describe('ConversationManager', () => {
     const agent = {
       status: 'idle',
       options: { provider: 'deepseek', model: 'deepseek-chat' },
-      session: { events },
+      session: testSession(events),
       followup: vi.fn(() => {
         events.push({
           type: 'assistant/message',
@@ -334,7 +340,7 @@ describe('ConversationManager', () => {
     })
     const ctx = {
       on: vi.fn(() => vi.fn()),
-      sessionPersistence: { list: vi.fn(async () => [{ id: `${baseId}-n10` }]), inspect },
+      sessionPersistence: { list: vi.fn(async () => [{ header: { id: `${baseId}-n10` } }]), inspect },
       agentDefaultModel: { currentSelection: vi.fn(() => ({ provider: 'deepseek', model: 'deepseek-chat' })) },
       agentPresets: { defaultId: 'standard', mount: vi.fn(async () => ({ id: 'standard' })) },
       llm: { resolveModelInfo: vi.fn(async () => ({ inputModalities: ['text'] })) },
@@ -362,7 +368,7 @@ describe('ConversationManager', () => {
     const agent = {
       status: 'idle',
       options: { provider: 'deepseek', model: 'deepseek-chat' },
-      session: { events },
+      session: testSession(events),
       followup: vi.fn(() => {
         events.push({
           type: 'assistant/message',
@@ -396,7 +402,7 @@ describe('ConversationManager', () => {
     })
     const ctx = {
       on: vi.fn(() => vi.fn()),
-      sessionPersistence: { list: vi.fn(async () => [{ id: `${baseId}-n10` }]), inspect },
+      sessionPersistence: { list: vi.fn(async () => [{ header: { id: `${baseId}-n10` } }]), inspect },
       agentDefaultModel: { currentSelection: vi.fn(() => ({ provider: 'deepseek', model: 'deepseek-chat' })) },
       agentPresets: { defaultId: 'standard', mount: vi.fn(async () => ({ id: 'standard' })) },
       llm: { resolveModelInfo: vi.fn(async () => ({ inputModalities: ['text'] })) },
@@ -428,7 +434,7 @@ describe('ConversationManager', () => {
       id,
       status: 'idle',
       options: { provider: 'deepseek', model: 'deepseek-chat' },
-      session: { events },
+      session: testSession(events),
       ctx: mockAgentCtx(section, register),
       followup: vi.fn(() => {
         events.push({
@@ -458,7 +464,7 @@ describe('ConversationManager', () => {
     const create = vi.fn()
     const ctx = {
       on: vi.fn(() => vi.fn()),
-      sessionPersistence: { list: vi.fn(async () => [{ id }]), inspect },
+      sessionPersistence: { list: vi.fn(async () => [{ header: { id } }]), inspect },
       agentDefaultModel: { currentSelection: vi.fn() },
       agentPresets: { defaultId: 'standard', mount: vi.fn() },
       llm: { resolveModelInfo: vi.fn(async () => ({ inputModalities: ['text'] })) },
@@ -490,7 +496,7 @@ describe('ConversationManager', () => {
     const agent = {
       status: 'idle',
       options: { provider: 'deepseek', model: 'deepseek-chat' },
-      session: { events },
+      session: testSession(events),
       followup: vi.fn(() => {
         if (fileTool === undefined) throw new Error('wecom_send_file was not registered')
         runningUpload = fileTool.execute(
@@ -563,7 +569,7 @@ describe('ConversationManager', () => {
       const agent = {
         status: 'idle',
         options: { provider: 'deepseek', model: 'deepseek-chat' },
-        session: { events },
+        session: testSession(events),
         followup: vi.fn(() => {
           events.push({
             type: 'assistant/message',
@@ -634,7 +640,7 @@ describe('ConversationManager', () => {
       return {
         status: 'idle',
         options: { provider: 'deepseek', model: 'deepseek-chat' },
-        session: { events },
+        session: testSession(events),
         followup: vi.fn(() => {
           events.push({
             type: 'assistant/message',
@@ -655,7 +661,7 @@ describe('ConversationManager', () => {
       on: vi.fn(() => vi.fn()),
       get: vi.fn((name: string) => name === 'workspaceRegistry' ? options.registry : undefined),
       sessionPersistence: {
-        list: vi.fn(async () => options.persisted ?? []),
+        list: vi.fn(async () => (options.persisted ?? []).map(header => ({ header }))),
         inspect: vi.fn(async (probed: unknown) => {
           const id = String(probed)
           if (!(options.persisted ?? []).some(header => String(header.id) === id)) {
@@ -831,7 +837,7 @@ describe('ConversationManager', () => {
     const agent = {
       status: 'idle',
       options: { provider: 'deepseek', model: 'deepseek-chat' },
-      session: { events },
+      session: testSession(events),
       followup: vi.fn(() => {
         if (fileTool === undefined) throw new Error('wecom_send_file was not registered')
         runningUpload = fileTool.execute({ path: 'hello.txt' }, { signal: new AbortController().signal } as never)
@@ -890,7 +896,7 @@ describe('ConversationManager', () => {
     const agent = {
       status: 'idle',
       options: { provider: 'deepseek', model: 'deepseek-chat' },
-      session: { events },
+      session: testSession(events),
       followup: vi.fn(() => {
         if (cardTool === undefined) throw new Error('wecom_send_card was not registered')
         runningCard = Promise.all([
@@ -982,7 +988,7 @@ describe('ConversationManager', () => {
     const agent = {
       status: 'idle',
       options: { provider: 'deepseek', model: 'deepseek-chat' },
-      session: { events },
+      session: testSession(events),
       followup: vi.fn(() => {
         events.push({
           type: 'assistant/message',
@@ -1034,7 +1040,7 @@ describe('ConversationManager', () => {
     const agent = {
       status: 'idle',
       options: { provider: 'deepseek', model: 'deepseek-chat' },
-      session: { events },
+      session: testSession(events),
       followup: vi.fn(() => {
         // Step 1: the full question list. Then a tool step, then step 2's
         // closing line — the final WeCom message must keep step 1's content.
@@ -1083,7 +1089,7 @@ describe('ConversationManager', () => {
     const agent = {
       status: 'idle',
       options: { provider: 'deepseek', model: 'deepseek-chat' },
-      session: { events },
+      session: testSession(events),
       followup: vi.fn((message: unknown) => {
         followedUp = message
         events.push({
@@ -1156,13 +1162,14 @@ describe('ConversationManager', () => {
     const sessionId = sessionIdFor(config.accountId, message)
     const events: unknown[] = []
     const emit = (session: unknown, event: unknown): void => {
-      const listener = listeners['session/event']
-      if (typeof listener === 'function') (listener as (s: unknown, e: unknown) => void)(session, event)
+      const chunk = (event as { data: { chunk: unknown } }).data.chunk
+      const listener = listeners['agent/assistant-stream']
+      if (typeof listener === 'function') (listener as (payload: unknown) => void)({ agent: { session }, frame: { type: 'chunk', chunk } })
     }
     const agent = {
       status: 'idle',
       options: { provider: 'deepseek', model: 'deepseek-chat' },
-      session: { events },
+      session: testSession(events),
       followup: vi.fn(() => {
         emit({ id: sessionId }, { type: 'assistant/chunk', data: { chunk: { type: 'text-delta', index: 0, text: 'Hello' } } })
         emit({ id: sessionId }, { type: 'assistant/chunk', data: { chunk: { type: 'tool-call-delta', index: 0, name: 'bash' } } })
@@ -1222,7 +1229,7 @@ describe('ConversationManager', () => {
     const agent = {
       status: 'idle',
       options: { provider: 'deepseek', model: 'deepseek-chat' },
-      session: { events },
+      session: testSession(events),
       followup: vi.fn(() => {
         if (askTool === undefined) throw new Error('ask_user_question was not registered')
         runningAsk = askTool.execute({

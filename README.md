@@ -66,7 +66,7 @@ pnpm dsh plugin --profile web add /absolute/path/to/deepseek-harness-wecom-plus
 After installing and restarting DSH, open **Settings → WeCom 企微** and configure everything in the UI:
 
 - **Bot ID**: paste the bot id from the WeCom admin console's Smart Bot page;
-- **Secret**: paste it into the credential input and press "保存 Secret" — the value goes through the DSH credentials seam (write-only, never returned to the browser);
+- **Secret**: fill in Bot ID and Secret, then press "保存连接" to save both settings and the credential. "保存并应用" also saves a pasted Secret. Credentials are write-only and never returned to the browser;
 - **card mode / single-chat policy / group policy / welcome text**: dropdowns that apply **live** — saving restarts the channel immediately, no DSH restart needed;
 - **workspaces**: maintain the candidate workspace list (the default workspace comes from the `cwd` config and is shown read-only). In WeCom, `/ws` lists the candidates, `/ws <number>` switches (starting a new conversation), and `/ws add <absolute path>` adds one;
 - the page shows the live connection state (inactive / connecting / connected) and the latest error.

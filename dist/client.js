@@ -75,7 +75,7 @@ var WeComSettingsController = class {
     }
   }
   refreshIfLoaded() {
-    if (this.state.status === "idle" || this.state.action === "save") return;
+    if (this.state.status === "idle" || this.state.action !== void 0) return;
     void this.load();
   }
   /**
@@ -118,6 +118,7 @@ var WeComSettingsController = class {
     this.clearStatusPoll();
   }
   async save(value, expectedRevision) {
+    ++this.generation;
     this.set({ ...this.state, action: "save", error: void 0, message: void 0 });
     try {
       const snapshot = await apiRequest({
@@ -132,11 +133,18 @@ var WeComSettingsController = class {
     }
   }
   /** Store one pasted Secret through the credentials seam; the value never comes back out. */
-  async setKey(value) {
+  async setKey(value, settings, expectedRevision) {
     const trimmed = value.trim();
-    if (trimmed.length === 0) return;
+    if (trimmed.length === 0) return false;
+    ++this.generation;
     this.set({ ...this.state, action: "set-key", error: void 0, message: void 0 });
     try {
+      const saved = await apiRequest({
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ action: "save", expectedRevision, value: { ...settings, botId: settings.botId.trim() } })
+      });
+      this.set({ ...this.state, snapshot: saved });
       const snapshot = await apiRequest({
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -144,11 +152,14 @@ var WeComSettingsController = class {
       });
       this.set({ status: "ready", snapshot, message: "keySaved", action: void 0 });
       this.scheduleStatusPoll();
+      return true;
     } catch (error) {
       this.set({ ...this.state, action: void 0, error: error instanceof Error ? error.message : String(error) });
+      return false;
     }
   }
   async clearKey() {
+    ++this.generation;
     this.set({ ...this.state, action: "clear-key", error: void 0, message: void 0 });
     try {
       const snapshot = await apiRequest({
@@ -350,7 +361,7 @@ function LoadedSettings({ controller }) {
   }, [controller, state.status]);
   (0, import_react.useEffect)(() => {
     if (snapshot !== void 0) setDraft(snapshot.settings.value);
-  }, [snapshot]);
+  }, [snapshot?.settings.revision]);
   if (state.status === "idle" || state.status === "loading" && snapshot === void 0) {
     return /* @__PURE__ */ (0, import_jsx_runtime.jsx)("div", { className: "wc-settings", children: /* @__PURE__ */ (0, import_jsx_runtime.jsx)("div", { className: "wc-loading", children: "\u52A0\u8F7D\u4E2D\u2026" }) });
   }
@@ -365,6 +376,11 @@ function LoadedSettings({ controller }) {
   const update = (key, value) => setDraft((current) => current === void 0 ? current : { ...current, [key]: value });
   const busy = state.action !== void 0;
   const channel = snapshot.channel;
+  const saveConnection = () => {
+    void controller.setKey(keyDraft, draft, snapshot.settings.revision).then((saved) => {
+      if (saved) setKeyDraft("");
+    });
+  };
   const addWorkspace = () => {
     const candidate = wsDraft.trim().replace(/^["'“”‘’]+/u, "").replace(/["'“”‘’]+$/u, "").trim().replace(/(?<![A-Za-z]:)[\\/]+$/u, "");
     if (candidate.length === 0) return;
@@ -414,7 +430,7 @@ function LoadedSettings({ controller }) {
     channel.state !== "inactive" && channel.detail !== void 0 ? /* @__PURE__ */ (0, import_jsx_runtime.jsx)("div", { className: "wc-alert warning", children: channel.detail }) : null,
     state.error === void 0 ? null : /* @__PURE__ */ (0, import_jsx_runtime.jsx)("div", { className: "wc-alert error", children: state.error }),
     state.message === "saved" ? /* @__PURE__ */ (0, import_jsx_runtime.jsx)("div", { className: "wc-alert success", children: "\u8BBE\u7F6E\u5DF2\u4FDD\u5B58\uFF0C\u901A\u9053\u5DF2\u6309\u65B0\u914D\u7F6E\u91CD\u8FDE\u3002" }) : null,
-    state.message === "keySaved" ? /* @__PURE__ */ (0, import_jsx_runtime.jsx)("div", { className: "wc-alert success", children: "Secret \u5DF2\u4FDD\u5B58\u3002" }) : null,
+    state.message === "keySaved" ? /* @__PURE__ */ (0, import_jsx_runtime.jsx)("div", { className: "wc-alert success", children: "\u8FDE\u63A5\u8BBE\u7F6E\u4E0E Secret \u5DF2\u4FDD\u5B58\u3002" }) : null,
     state.message === "keyCleared" ? /* @__PURE__ */ (0, import_jsx_runtime.jsx)("div", { className: "wc-alert success", children: "Secret \u5DF2\u6E05\u9664\u3002" }) : null,
     /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("section", { className: "wc-panel", children: [
       /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", { className: "wc-panel-title", children: [
@@ -446,11 +462,9 @@ function LoadedSettings({ controller }) {
           {
             type: "button",
             className: "wc-button primary",
-            disabled: busy || !snapshot.credential.writable || keyDraft.trim().length === 0,
-            onClick: () => {
-              void controller.setKey(keyDraft).then(() => setKeyDraft(""));
-            },
-            children: state.action === "set-key" ? "\u4FDD\u5B58\u4E2D\u2026" : "\u4FDD\u5B58 Secret"
+            disabled: busy || !snapshot.writable || !snapshot.credential.writable || keyDraft.trim().length === 0,
+            onClick: saveConnection,
+            children: state.action === "set-key" ? "\u4FDD\u5B58\u4E2D\u2026" : "\u4FDD\u5B58\u8FDE\u63A5"
           }
         ),
         snapshot.credential.configured ? /* @__PURE__ */ (0, import_jsx_runtime.jsx)(
@@ -559,8 +573,9 @@ function LoadedSettings({ controller }) {
     ] }),
     /* @__PURE__ */ (0, import_jsx_runtime.jsx)(CliCard, { controller, initial: snapshot.cli }),
     /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", { className: "wc-save-row", children: [
-      /* @__PURE__ */ (0, import_jsx_runtime.jsx)("button", { type: "button", className: "wc-button primary", disabled: !snapshot.writable || busy, onClick: () => {
-        void controller.save(draft, snapshot.settings.revision);
+      /* @__PURE__ */ (0, import_jsx_runtime.jsx)("button", { type: "button", className: "wc-button primary", disabled: !snapshot.writable || busy || keyDraft.trim().length > 0 && !snapshot.credential.writable, onClick: () => {
+        if (keyDraft.trim().length > 0) saveConnection();
+        else void controller.save(draft, snapshot.settings.revision);
       }, children: state.action === "save" ? "\u4FDD\u5B58\u4E2D\u2026" : "\u4FDD\u5B58\u5E76\u5E94\u7528" }),
       /* @__PURE__ */ (0, import_jsx_runtime.jsx)("button", { type: "button", className: "wc-button", disabled: busy, onClick: () => {
         void controller.load();

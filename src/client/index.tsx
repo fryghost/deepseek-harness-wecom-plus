@@ -123,7 +123,7 @@ export class WeComSettingsController {
   }
 
   refreshIfLoaded(): void {
-    if (this.state.status === 'idle' || this.state.action === 'save') return
+    if (this.state.status === 'idle' || this.state.action !== undefined) return
     void this.load()
   }
 
@@ -171,6 +171,7 @@ export class WeComSettingsController {
   }
 
   async save(value: UserSettings, expectedRevision: number): Promise<void> {
+    ++this.generation
     this.set({ ...this.state, action: 'save', error: undefined, message: undefined })
     try {
       const snapshot = await apiRequest<Snapshot>({
@@ -189,11 +190,20 @@ export class WeComSettingsController {
   }
 
   /** Store one pasted Secret through the credentials seam; the value never comes back out. */
-  async setKey(value: string): Promise<void> {
+  async setKey(value: string, settings: UserSettings, expectedRevision: number): Promise<boolean> {
     const trimmed = value.trim()
-    if (trimmed.length === 0) return
+    if (trimmed.length === 0) return false
+    ++this.generation
     this.set({ ...this.state, action: 'set-key', error: undefined, message: undefined })
     try {
+      // Bot ID is ordinary configuration, Secret is a credential. Commit both
+      // through their own host services while one visible action owns the form.
+      const saved = await apiRequest<Snapshot>({
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ action: 'save', expectedRevision, value: { ...settings, botId: settings.botId.trim() } }),
+      })
+      this.set({ ...this.state, snapshot: saved })
       const snapshot = await apiRequest<Snapshot>({
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -201,12 +211,15 @@ export class WeComSettingsController {
       })
       this.set({ status: 'ready', snapshot, message: 'keySaved', action: undefined })
       this.scheduleStatusPoll()
+      return true
     } catch (error) {
       this.set({ ...this.state, action: undefined, error: error instanceof Error ? error.message : String(error) })
+      return false
     }
   }
 
   async clearKey(): Promise<void> {
+    ++this.generation
     this.set({ ...this.state, action: 'clear-key', error: undefined, message: undefined })
     try {
       const snapshot = await apiRequest<Snapshot>({
@@ -481,7 +494,9 @@ function LoadedSettings({ controller }: SettingsInjected) {
   useEffect(() => { if (state.status === 'idle') void controller.load() }, [controller, state.status])
   useEffect(() => {
     if (snapshot !== undefined) setDraft(snapshot.settings.value)
-  }, [snapshot])
+    // Credential writes and channel polls do not change the settings revision.
+    // They must never replace the user's unsaved Bot ID or other form fields.
+  }, [snapshot?.settings.revision])
 
   if (state.status === 'idle' || (state.status === 'loading' && snapshot === undefined)) {
     return <div className="wc-settings"><div className="wc-loading">加载中…</div></div>
@@ -499,6 +514,11 @@ function LoadedSettings({ controller }: SettingsInjected) {
     setDraft(current => current === undefined ? current : { ...current, [key]: value })
   const busy = state.action !== undefined
   const channel = snapshot.channel
+  const saveConnection = (): void => {
+    void controller.setKey(keyDraft, draft, snapshot.settings.revision).then(saved => {
+      if (saved) setKeyDraft('')
+    })
+  }
 
   const addWorkspace = (): void => {
     // Explorer's "copy as path" wraps the value in quotes; strip those and any
@@ -571,7 +591,7 @@ function LoadedSettings({ controller }: SettingsInjected) {
         : null}
       {state.error === undefined ? null : <div className="wc-alert error">{state.error}</div>}
       {state.message === 'saved' ? <div className="wc-alert success">设置已保存，通道已按新配置重连。</div> : null}
-      {state.message === 'keySaved' ? <div className="wc-alert success">Secret 已保存。</div> : null}
+      {state.message === 'keySaved' ? <div className="wc-alert success">连接设置与 Secret 已保存。</div> : null}
       {state.message === 'keyCleared' ? <div className="wc-alert success">Secret 已清除。</div> : null}
 
       <section className="wc-panel">
@@ -603,10 +623,10 @@ function LoadedSettings({ controller }: SettingsInjected) {
           <button
             type="button"
             className="wc-button primary"
-            disabled={busy || !snapshot.credential.writable || keyDraft.trim().length === 0}
-            onClick={() => { void controller.setKey(keyDraft).then(() => setKeyDraft('')) }}
+            disabled={busy || !snapshot.writable || !snapshot.credential.writable || keyDraft.trim().length === 0}
+            onClick={saveConnection}
           >
-            {state.action === 'set-key' ? '保存中…' : '保存 Secret'}
+            {state.action === 'set-key' ? '保存中…' : '保存连接'}
           </button>
           {snapshot.credential.configured
             ? (
@@ -725,7 +745,10 @@ function LoadedSettings({ controller }: SettingsInjected) {
       <CliCard controller={controller} initial={snapshot.cli} />
 
       <div className="wc-save-row">
-        <button type="button" className="wc-button primary" disabled={!snapshot.writable || busy} onClick={() => { void controller.save(draft, snapshot.settings.revision) }}>
+        <button type="button" className="wc-button primary" disabled={!snapshot.writable || busy || (keyDraft.trim().length > 0 && !snapshot.credential.writable)} onClick={() => {
+          if (keyDraft.trim().length > 0) saveConnection()
+          else void controller.save(draft, snapshot.settings.revision)
+        }}>
           {state.action === 'save' ? '保存中…' : '保存并应用'}
         </button>
         <button type="button" className="wc-button" disabled={busy} onClick={() => { void controller.load() }}>重新加载</button>

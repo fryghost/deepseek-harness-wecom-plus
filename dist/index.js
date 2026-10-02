@@ -854,6 +854,12 @@ var DshInProcessAdapter = class {
     try {
       const headers = await this.ctx.sessionPersistence.list();
       this.lastListedCount = headers.length;
+      for (const { header } of headers) {
+        const id = String(header.id);
+        if (!id.startsWith("wecom-v2-")) continue;
+        this.occupied.set(id, "visible");
+        if (typeof header.cwd === "string") this.sessionCwds.set(id, header.cwd);
+      }
     } catch (error) {
       this.lastListedCount = -1;
       this.log("[wecom-plus] advisory session list failed: %s", String(error));
@@ -1382,6 +1388,11 @@ var DshInProcessAdapter = class {
   /** One raw inspect() call, tolerating a host without the inspect capability. */
   async inspectRaw(session) {
     const persistence = this.ctx.sessionPersistence;
+    if (typeof persistence?.stat === "function") {
+      const snapshot = await persistence.stat(SessionId(String(session)));
+      if (snapshot !== void 0) return { meta: snapshot.header };
+      throw Object.assign(new Error("session not found"), { name: "SessionPersistenceNotFoundError" });
+    }
     if (typeof persistence?.inspect !== "function") {
       throw Object.assign(new Error("session persistence cannot inspect"), { name: "SessionPersistenceNotFoundError" });
     }
@@ -2887,7 +2898,7 @@ import {
 } from "@deepseek-ai/dsh-settings";
 
 // src/version.ts
-var PLUGIN_VERSION = "0.10.21";
+var PLUGIN_VERSION = "0.10.22";
 
 // src/settings-web.ts
 var SETTINGS_ROUTE = "/_dsh/deepseek-harness-wecom-plus/settings";

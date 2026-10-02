@@ -347,6 +347,14 @@ export class DshInProcessAdapter implements HarnessPort, HarnessTurnPort, Harnes
     try {
       const headers = await this.ctx.sessionPersistence.list()
       this.lastListedCount = headers.length
+      // Restarts have no in-memory conversation cache. Retargeting must also
+      // include persisted conversations returned by the host's current index.
+      for (const { header } of headers) {
+        const id = String(header.id)
+        if (!id.startsWith('wecom-v2-')) continue
+        this.occupied.set(id, 'visible')
+        if (typeof header.cwd === 'string') this.sessionCwds.set(id, header.cwd)
+      }
     } catch (error) {
       this.lastListedCount = -1
       this.log('[wecom-plus] advisory session list failed: %s', String(error))
@@ -971,6 +979,12 @@ export class DshInProcessAdapter implements HarnessPort, HarnessTurnPort, Harnes
   private async inspectRaw(session: HarnessSessionId): Promise<InspectedSession> {
     const persistence = this.ctx.sessionPersistence as unknown as {
       inspect?: (id: SessionId) => Promise<InspectedSession>
+      stat?: (id: SessionId) => Promise<{ header: InspectedSession['meta'] } | undefined>
+    }
+    if (typeof persistence?.stat === 'function') {
+      const snapshot = await persistence.stat(SessionId(String(session)))
+      if (snapshot !== undefined) return { meta: snapshot.header }
+      throw Object.assign(new Error('session not found'), { name: 'SessionPersistenceNotFoundError' })
     }
     if (typeof persistence?.inspect !== 'function') {
       throw Object.assign(new Error('session persistence cannot inspect'), { name: 'SessionPersistenceNotFoundError' })

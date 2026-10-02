@@ -725,6 +725,22 @@ describe('ConversationManager', () => {
     await manager.dispose()
   })
 
+  it('retargets a persisted conversation after a fresh bridge starts using the DSH stat API', async () => {
+    const config = testConfig()
+    const baseId = sessionIdFor(config.accountId, textMessage('u-cold-retarget', 'm-cold'))
+    const { ctx, created } = rotatingHarness(config, { persisted: [{ id: baseId }] })
+    const persistence = (ctx as unknown as { sessionPersistence: Record<string, unknown> }).sessionPersistence
+    persistence.inspect = undefined
+    persistence.stat = vi.fn(async (id: unknown) => String(id) === baseId
+      ? { header: { id: baseId, cwd: '/tmp/previous-workspace', agentPreset: 'standard' } }
+      : undefined)
+    const manager = new ConversationManager(ctx, config, vi.fn(async () => undefined), vi.fn(async () => undefined), vi.fn(async () => undefined))
+    await manager.initialize()
+    await manager.retargetAll('/tmp/new-default')
+    expect(created).toEqual([{ sessionId: `${baseId}-n1`, cwd: '/tmp/new-default' }])
+    await manager.dispose()
+  })
+
   it('switches the workspace through a new generation and carries it across /new', async () => {
     const config = testConfig()
     const baseId = sessionIdFor(config.accountId, textMessage('u-ws', 'm-ws'))
